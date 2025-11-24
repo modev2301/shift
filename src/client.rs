@@ -746,7 +746,7 @@ impl ClientTransferManager {
             let pb = multi_progress.add(ProgressBar::new(file_size));
             pb.set_style(
                 indicatif::ProgressStyle::default_bar()
-                    .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+                    .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}) ({eta})")
                     .unwrap()
                     .progress_chars("#>-")
             );
@@ -811,7 +811,7 @@ impl ClientTransferManager {
             // TCP buffer tuning for maximum throughput
             // Set explicit buffer sizes (2MB send, 2MB receive) for better throughput
             // Use socket2 to set socket options
-            use socket2::{SockRef, Domain, Type, Protocol};
+            use socket2::SockRef;
             let std_stream = stream.into_std().map_err(|e| {
                 TransferError::NetworkError(format!("Failed to convert to std stream on connection {}: {}", i, e))
             })?;
@@ -819,8 +819,9 @@ impl ClientTransferManager {
             let socket = socket2::Socket::from(std_stream);
             let sock_ref = SockRef::from(&socket);
             
-            // Set send and receive buffer sizes (2MB each)
-            const TCP_BUFFER_SIZE: i32 = 2 * 1024 * 1024; // 2MB
+            // Set send and receive buffer sizes (50MB each for high-bandwidth networks)
+            // For 10Gbps with 10ms RTT: BDP = 12.5MB, use 4x BDP = 50MB
+            const TCP_BUFFER_SIZE: i32 = 50 * 1024 * 1024; // 50MB
             if let Err(e) = sock_ref.set_send_buffer_size(TCP_BUFFER_SIZE as usize) {
                 tracing::warn!("Failed to set SO_SNDBUF on connection {}: {} (using OS default)", i, e);
             } else {
@@ -870,8 +871,6 @@ impl ClientTransferManager {
         use crate::zero_copy::ZeroCopyReader;
         use std::sync::Arc;
         use std::time::Instant;
-        use tokio::net::TcpStream;
-        use tokio::sync::Semaphore;
 
         tracing::info!("Starting file transfer for {}", self.file_path.display());
         tracing::info!("File size: {} bytes", self.file_size);
@@ -949,7 +948,7 @@ impl ClientTransferManager {
 
         // 4. Create channels for each connection (distribute chunks across connections)
         // Each connection gets its own channel for true parallelism
-        const CHANNEL_BUFFER_SIZE: usize = 512;
+        const CHANNEL_BUFFER_SIZE: usize = 16;
         let mut writer_handles = Vec::new();
         let mut chunk_txs = Vec::new();
         
@@ -957,10 +956,14 @@ impl ClientTransferManager {
         for (conn_idx, (_, mut conn_writer)) in additional_connections.into_iter().enumerate() {
             let (chunk_tx, mut chunk_rx) = mpsc::channel::<Message>(CHANNEL_BUFFER_SIZE);
             chunk_txs.push(chunk_tx);
+            let progress_bar_clone = self.progress_bar.clone();
             
             let writer_handle = tokio::spawn(async move {
                 let mut error_count = 0;
                 let mut chunks_sent = 0u64;
+                let mut last_flush = std::time::Instant::now();
+                const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+                
                 while let Some(chunk_msg) = chunk_rx.recv().await {
                     match chunk_msg {
                         Message::EndOfStream { .. } => {
@@ -977,7 +980,9 @@ impl ClientTransferManager {
                             tracing::debug!("EndOfStream sent on connection {}", conn_idx);
                             // Connection will be closed by server after ACK
                         }
-                        Message::FileChunk { .. } => {
+                        Message::FileChunk { ref data, .. } => {
+                            let chunk_size = data.len();
+                            
                             if let Err(e) = chunk_msg.write_to_stream(&mut conn_writer).await {
                                 tracing::error!("Failed to write chunk on connection {}: {}", conn_idx, e);
                                 error_count += 1;
@@ -989,12 +994,17 @@ impl ClientTransferManager {
                                 error_count = 0;
                                 chunks_sent += 1;
                                 
-                                // Batch flushes
-                                const FLUSH_BATCH_SIZE: u64 = 50;
-                                if chunks_sent % FLUSH_BATCH_SIZE == 0 {
+                                // Update progress bar after actual network send
+                                if let Some(ref pb) = progress_bar_clone {
+                                    pb.inc(chunk_size as u64);
+                                }
+                                
+                                // Time-based flushing for smoother network behavior
+                                if last_flush.elapsed() >= FLUSH_INTERVAL {
                                     if let Err(e) = conn_writer.flush().await {
-                                        tracing::warn!("Failed to flush batch on connection {}: {}", conn_idx, e);
+                                        tracing::warn!("Failed to flush on connection {}: {}", conn_idx, e);
                                     }
+                                    last_flush = std::time::Instant::now();
                                 }
                             }
                         }
@@ -1014,6 +1024,7 @@ impl ClientTransferManager {
         // First connection is used for handshake and ACK reading, also needs a writer for chunks
         let (chunk_tx_main, mut chunk_rx_main) = mpsc::channel::<Message>(CHANNEL_BUFFER_SIZE);
         chunk_txs.push(chunk_tx_main.clone());
+        let progress_bar_main = self.progress_bar.clone();
         
         let writer_handle_main = {
             let mut writer_main = writer;
@@ -1021,6 +1032,9 @@ impl ClientTransferManager {
                 let mut error_count = 0;
                 let mut eos_sent = false;
                 let mut chunks_sent = 0u64;
+                let mut last_flush = std::time::Instant::now();
+                const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+                
                 while let Some(chunk_msg) = chunk_rx_main.recv().await {
                     match chunk_msg {
                         Message::EndOfStream { .. } => {
@@ -1035,7 +1049,9 @@ impl ClientTransferManager {
                             eos_sent = true;
                             tracing::debug!("EndOfStream sent on main connection");
                         }
-                        Message::FileChunk { .. } => {
+                        Message::FileChunk { ref data, .. } => {
+                            let chunk_size = data.len();
+                            
                             if let Err(e) = chunk_msg.write_to_stream(&mut writer_main).await {
                                 tracing::error!("Failed to write chunk to stream: {}", e);
                                 error_count += 1;
@@ -1047,11 +1063,17 @@ impl ClientTransferManager {
                                 error_count = 0;
                                 chunks_sent += 1;
                                 
-                                const FLUSH_BATCH_SIZE: u64 = 50;
-                                if chunks_sent % FLUSH_BATCH_SIZE == 0 {
+                                // Update progress bar after actual network send
+                                if let Some(ref pb) = progress_bar_main {
+                                    pb.inc(chunk_size as u64);
+                                }
+                                
+                                // Time-based flushing for smoother network behavior
+                                if last_flush.elapsed() >= FLUSH_INTERVAL {
                                     if let Err(e) = writer_main.flush().await {
-                                        tracing::warn!("Failed to flush batch: {}", e);
+                                        tracing::warn!("Failed to flush: {}", e);
                                     }
+                                    last_flush = std::time::Instant::now();
                                 }
                             }
                         }
@@ -1135,147 +1157,125 @@ impl ClientTransferManager {
         };
 
         // 7. Read chunks and process in parallel (compression), then queue for sending
-        let mut chunk_id = 0u64;
-        let mut tasks: Vec<tokio::task::JoinHandle<Result<(), TransferError>>> = Vec::new();
-        let start_time = Instant::now();
-        let progress_bar = self.progress_bar.clone();
+        // Use bounded channel with shared receiver for better concurrency (no semaphore lock contention)
+        let (work_tx, work_rx) = mpsc::channel::<(u64, Bytes, bool)>(self.parallel_streams);
+        let work_rx = Arc::new(tokio::sync::Mutex::new(work_rx));
         let session_id = self.session_id.clone();
         let enable_compression = self.config.enable_compression;
-        let semaphore = Arc::new(Semaphore::new(self.parallel_streams));
-        let file_size = self.file_size; // Capture for progress bar calculation
+        let chunk_txs_clone = chunk_txs.clone();
+        
+        // Spawn worker pool for chunk processing
+        let mut worker_handles = Vec::new();
+        for _worker_id in 0..self.parallel_streams {
+            let work_rx = Arc::clone(&work_rx);
+            let session_id = session_id.clone();
+            let enable_compression = enable_compression;
+            let chunk_txs = chunk_txs_clone.clone();
+            
+            let handle = tokio::spawn(async move {
+                loop {
+                    let work = {
+                        let mut rx = work_rx.lock().await;
+                        rx.recv().await
+                    };
+                    
+                    match work {
+                        Some((chunk_id, data, is_last)) => {
+                            // Distribute chunks across connections using round-robin
+                            let connection_idx = (chunk_id as usize) % chunk_txs.len();
+                            let chunk_tx = &chunk_txs[connection_idx];
+                            
+                            // Create chunk
+                            let mut chunk = FileChunk::new(
+                                chunk_id,
+                                session_id.clone(),
+                                data,
+                                is_last,
+                                chunk_id,
+                            );
+                            
+                            // Compress if enabled
+                            if enable_compression {
+                                if let Err(e) = chunk.compress() {
+                                    tracing::warn!("Compression failed for chunk {}: {}", chunk_id, e);
+                                }
+                            } else {
+                                // Compression disabled - still need to calculate checksum
+                                let mut checksum = crate::simd::SimdChecksum::new();
+                                chunk.checksum = checksum.calculate_crc32(&chunk.data[..]);
+                            }
+                            
+                            // Create chunk message
+                            let chunk_msg = Message::FileChunk {
+                                chunk_id,
+                                session_id: session_id.clone(),
+                                data: chunk.data,
+                                is_last,
+                                is_compressed: chunk.is_compressed,
+                                checksum: chunk.checksum,
+                                original_size: chunk.original_size,
+                                sequence_number: chunk_id,
+                                retry_count: 0,
+                            };
+                            
+                            // Queue for sending
+                            if let Err(e) = chunk_tx.send(chunk_msg).await {
+                                tracing::error!("Failed to queue chunk {}: {}", chunk_id, e);
+                                return Err(TransferError::NetworkError(format!("Channel closed: {}", e)));
+                            }
+                        }
+                        None => break, // Channel closed
+                    }
+                }
+                Ok::<(), TransferError>(())
+            });
+            worker_handles.push(handle);
+        }
+        
+        // Read chunks and send to worker pool
+        let mut chunk_id = 0u64;
+        let start_time = Instant::now();
+        let total_chunks = (self.file_size + self.chunk_size as u64 - 1) / self.chunk_size as u64;
 
         tracing::info!("Starting to read and process {} chunks...", total_chunks);
-
-        // Track total chunks for progress batching
-        let total_chunks_for_progress = total_chunks;
         
-        // Read chunks using mmap reader
+        // Read chunks using mmap reader and send to worker pool
         while let Ok(Some(data)) = match &mut file_reader {
             FileReader::Mmap(reader) => reader.read_chunk(self.chunk_size),
         } {
             let is_last = chunk_id + 1 >= total_chunks;
-
-            // Distribute chunks across connections using round-robin
-            // This provides true parallelism - each connection operates independently
-            let connection_idx = (chunk_id as usize) % chunk_txs.len();
-            let chunk_tx_clone = chunk_txs[connection_idx].clone();
             
-            // Prepare for parallel processing
-            let session_id_clone = session_id.clone();
-            let progress_bar_clone = progress_bar.clone();
-            let semaphore_clone = Arc::clone(&semaphore);
-            let chunk_id_clone = chunk_id;
-            let file_size_for_progress = file_size; // Capture file_size for progress calculation
-
-            // Spawn task to compress and queue chunk
-            let task = tokio::spawn(async move {
-                // Acquire permit for parallel processing
-                let _permit = semaphore_clone.acquire().await.unwrap();
-
-                // Create chunk
-                let mut chunk = FileChunk::new(
-                    chunk_id_clone,
-                    session_id_clone.clone(),
-                    data,
-                    is_last,
-                    chunk_id_clone,
-                );
-
-                // Compress if enabled (will auto-skip for random/binary data)
-                // CRITICAL: Always calculate checksum, even if compression is disabled
-                let original_size = chunk.original_size;
-                if enable_compression {
-                    if let Err(e) = chunk.compress() {
-                        tracing::warn!("Compression failed for chunk {}: {}", chunk_id_clone, e);
-                    }
-                } else {
-                    // Compression disabled - still need to calculate checksum for validation
-                    let mut checksum = crate::simd::SimdChecksum::new();
-                    chunk.checksum = checksum.calculate_crc32(&chunk.data[..]);
-                }
-                let compressed_size = chunk.data.len();
-
-                // Only log compression stats occasionally to reduce overhead
-                if chunk_id_clone % 200 == 0 {
-                    let ratio = if compressed_size < original_size {
-                        original_size as f64 / compressed_size as f64
-                    } else {
-                        1.0
-                    };
-                    if ratio > 1.0 {
-                        tracing::debug!(
-                            "Chunk {} - Original: {} bytes, Compressed: {} bytes ({:.2}x)",
-                            chunk_id_clone,
-                            original_size,
-                            compressed_size,
-                            ratio
-                        );
-                    }
-                }
-
-                // Create chunk message
-                let chunk_msg = Message::FileChunk {
-                    chunk_id: chunk_id_clone,
-                    session_id: session_id_clone,
-                    data: chunk.data,
-                    is_last,
-                    is_compressed: chunk.is_compressed,
-                    checksum: chunk.checksum,
-                    original_size: chunk.original_size,
-                    sequence_number: chunk_id_clone,
-                    retry_count: 0,
-                };
-
-                // Queue for sending (bounded channel - may need to wait if buffer is full)
-                if let Err(e) = chunk_tx_clone.send(chunk_msg).await {
-                    tracing::error!("Failed to queue chunk {}: {}", chunk_id_clone, e);
-                    return Err(TransferError::NetworkError(format!(
-                        "Channel closed: {}",
-                        e
-                    )));
-                }
-
-                // Update progress bar - but only to 95% to account for network transfer and ACK wait
-                // We'll finish the remaining 5% when we receive the server ACK
-                if let Some(pb) = progress_bar_clone {
-                    // Calculate 95% of total to avoid showing 100% before ACK
-                    let target_position = (file_size_for_progress as f64 * 0.95) as u64;
-                    let current_position = pb.position();
-                    if current_position < target_position {
-                        // Only increment if we haven't reached 95% yet
-                        let increment = std::cmp::min(original_size as u64, target_position.saturating_sub(current_position));
-                        pb.inc(increment);
-                    } else {
-                        // We're at 95%, don't increment further until ACK
-                    }
-                }
-
-                Ok(())
-            });
-
-            tasks.push(task);
+            // Send work to worker pool (bounded channel provides backpressure)
+            if let Err(e) = work_tx.send((chunk_id, data, is_last)).await {
+                tracing::error!("Failed to send chunk {} to worker pool: {}", chunk_id, e);
+                break;
+            }
+            
             chunk_id += 1;
         }
-
-        // Wait for all chunks to be processed and queued
-        tracing::info!("Waiting for {} chunks to be processed...", tasks.len());
+        
+        // Close work channel to signal workers to finish
+        drop(work_tx);
+        
+        // Wait for all workers to complete
+        tracing::info!("Waiting for {} chunks to be processed...", chunk_id);
         let mut successful = 0;
         let mut failed = 0;
-        for task in tasks {
-            match task.await {
+        for handle in worker_handles {
+            match handle.await {
                 Ok(Ok(_)) => successful += 1,
                 Ok(Err(e)) => {
                     failed += 1;
-                    tracing::error!("Chunk processing failed: {}", e);
+                    tracing::error!("Worker failed: {}", e);
                 }
                 Err(e) => {
                     failed += 1;
-                    tracing::error!("Task join error: {}", e);
+                    tracing::error!("Worker task panicked: {:?}", e);
                 }
             }
         }
 
-        tracing::info!("All {} chunks queued for sending", successful);
+        tracing::info!("All {} chunks processed and queued for sending", successful);
 
         // Send EndOfStream only on the main connection
         // Other connections will naturally close when their channels are dropped
@@ -1339,10 +1339,8 @@ impl ClientTransferManager {
 
         tracing::info!("Received completion ACK from server");
 
-        // Now finish the progress bar to 100% since we have server confirmation
+        // Progress bar should already be at 100% from writer tasks, but ensure it's complete
         if let Some(ref pb) = self.progress_bar {
-            // Set to 100% before finishing
-            pb.set_position(self.file_size);
             pb.finish_with_message("Transfer complete!");
         }
 

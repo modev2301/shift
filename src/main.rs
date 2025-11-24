@@ -230,45 +230,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         info!("Transferring {} files", files_to_transfer.len());
         
-        // Establish connections once and reuse them across all files
-        // This avoids the overhead of connection establishment for each file
-        info!("Establishing {} connections for connection pool...", config.client.num_connections.unwrap_or(8));
-        let mut pooled_connections = Some(
-            ClientTransferManager::establish_connections(&config.client).await?
-        );
-        info!("Connection pool established - will reuse for all {} files", files_to_transfer.len());
+        // Transfer files in parallel for maximum throughput
+        // Use a semaphore to limit concurrent transfers (default: 4 concurrent files)
+        let max_concurrent_transfers = 4;
+        let transfer_semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_transfers));
+        let mut transfer_handles = Vec::new();
         
-        // Transfer files sequentially, reusing the same connections
-        // Each file gets a new session_id and handshake, but uses the same TCP connections
         for (idx, local_file) in files_to_transfer.iter().enumerate() {
-            info!("[{}/{}] Transferring {} -> {}:{}", 
-                idx + 1, files_to_transfer.len(), 
-                local_file.display(), remote.host, remote.port.unwrap_or(443));
+            let file_path = local_file.clone();
+            let client_config = Arc::new(config.client.clone());
+            let progress = multi_progress.clone();
+            let sem = Arc::clone(&transfer_semaphore);
+            let remote_host = remote.host.clone();
+            let remote_port = remote.port.unwrap_or(443);
+            let file_idx = idx + 1;
+            let total_files = files_to_transfer.len();
             
-            let mut client_manager = ClientTransferManager::new(
-                local_file.clone(),
-                Arc::new(config.client.clone()),
-                multi_progress.clone(),
-            ).await?;
-            
-            // Reuse connections from pool when available
-            // Connections are consumed during transfer, so we re-establish for subsequent files
-            if let Some(conns) = pooled_connections.take() {
-                client_manager.run_transfer_with_connections(Some(conns)).await?;
-            } else {
-                // Fallback: create new connections if pool was consumed
+            let handle = tokio::spawn(async move {
+                // Acquire permit for concurrent transfer
+                let _permit = sem.acquire().await.unwrap();
+                
+                info!("[{}/{}] Transferring {} -> {}:{}", 
+                    file_idx, total_files, 
+                    file_path.display(), remote_host, remote_port);
+                
+                let mut client_manager = ClientTransferManager::new(
+                    file_path,
+                    client_config,
+                    progress,
+                ).await?;
+                
+                // Each file gets its own connections (simpler and allows true parallelism)
                 client_manager.run_transfer().await?;
-            }
+                
+                Ok::<(), Box<dyn std::error::Error>>(())
+            });
             
-            // Re-establish connections for next file (since they're consumed)
-            // This is still better than creating connections inside ClientTransferManager
-            // because we can batch the connection establishment
-            if idx < files_to_transfer.len() - 1 {
-                info!("Re-establishing connection pool for next file...");
-                pooled_connections = Some(
-                    ClientTransferManager::establish_connections(&config.client).await?
-                );
+            transfer_handles.push(handle);
+        }
+        
+        // Wait for all transfers to complete
+        let mut successful = 0;
+        let mut failed = 0;
+        for handle in transfer_handles {
+            match handle.await {
+                Ok(Ok(())) => successful += 1,
+                Ok(Err(e)) => {
+                    failed += 1;
+                    eprintln!("Transfer failed: {}", e);
+                }
+                Err(e) => {
+                    failed += 1;
+                    eprintln!("Transfer task panicked: {:?}", e);
+                }
             }
+        }
+        
+        if failed > 0 {
+            return Err(format!("{} transfers failed out of {}", failed, files_to_transfer.len()).into());
         }
         
         info!("All {} files transferred successfully", files_to_transfer.len());
