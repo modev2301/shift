@@ -261,9 +261,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ).await?;
                 
                 // Each file gets its own connections (simpler and allows true parallelism)
-                client_manager.run_transfer().await?;
-                
-                Ok::<(), Box<dyn std::error::Error>>(())
+                client_manager.run_transfer().await
             });
             
             transfer_handles.push(handle);

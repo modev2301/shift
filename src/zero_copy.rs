@@ -72,9 +72,30 @@ impl ZeroCopyReader {
             let mut bytes_mut = BytesMut::with_capacity(slice.len());
             bytes_mut.extend_from_slice(slice);
             let bytes = bytes_mut.freeze(); // Freeze to Bytes (efficient conversion)
-            
+
             self.advance(slice.len());
             Ok(Some(bytes))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Read a chunk with checksum calculation during copy (single pass)
+    /// Returns (Bytes, checksum) to avoid redundant checksum calculation
+    pub fn read_chunk_with_checksum(&mut self, chunk_size: usize) -> Result<Option<(Bytes, u32)>, TransferError> {
+        if let Some(slice) = self.read_chunk_slice(chunk_size) {
+            // Calculate checksum while copying (single pass optimization)
+            use crate::simd::SimdChecksum;
+            let mut checksum_calc = SimdChecksum::new();
+            let crc = checksum_calc.calculate_crc32(slice);
+            
+            use bytes::BytesMut;
+            let mut bytes_mut = BytesMut::with_capacity(slice.len());
+            bytes_mut.extend_from_slice(slice);
+            let bytes = bytes_mut.freeze();
+
+            self.advance(slice.len());
+            Ok(Some((bytes, crc)))
         } else {
             Ok(None)
         }

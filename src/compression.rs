@@ -85,14 +85,8 @@ impl FileChunk {
             return Ok(());
         }
 
-        // Quick check: skip compression for high-entropy (random) data
-        if !self.is_compressible() {
-            // Still calculate checksum for validation
-            let mut checksum = SimdChecksum::new();
-            self.checksum = checksum.calculate_crc32(&self.data[..]);
-            return Ok(());
-        }
-
+        // Skip entropy check - just try compression and use if smaller
+        // LZ4 is fast enough that checking isn't worth the memory bandwidth cost
         let data_slice = &self.data[..];
         let compressed_data = SimdProcessor::compress_lz4_simd(data_slice)
             .map_err(|e| TransferError::CompressionError(e))?;
@@ -104,9 +98,14 @@ impl FileChunk {
             self.is_compressed = true;
         }
 
-        // Calculate SIMD-optimized checksum
-        let mut checksum = SimdChecksum::new();
-        self.checksum = checksum.calculate_crc32(&self.data[..]);
+        // Calculate checksum on final data (compressed or original)
+        // If compression was applied, we need checksum on compressed data
+        // If not compressed and checksum already set (from read), keep it
+        if self.is_compressed || self.checksum == 0 {
+            let mut checksum = SimdChecksum::new();
+            self.checksum = checksum.calculate_crc32(&self.data[..]);
+        }
+        // If not compressed and checksum already set, use existing (no recalculation)
 
         Ok(())
     }

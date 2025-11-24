@@ -1158,7 +1158,8 @@ impl ClientTransferManager {
 
         // 7. Read chunks and process in parallel (compression), then queue for sending
         // Use bounded channel with shared receiver for better concurrency (no semaphore lock contention)
-        let (work_tx, work_rx) = mpsc::channel::<(u64, Bytes, bool)>(self.parallel_streams);
+        // Work item includes pre-calculated checksum to avoid redundant calculation
+        let (work_tx, work_rx) = mpsc::channel::<(u64, Bytes, bool, u32)>(self.parallel_streams);
         let work_rx = Arc::new(tokio::sync::Mutex::new(work_rx));
         let session_id = self.session_id.clone();
         let enable_compression = self.config.enable_compression;
@@ -1180,12 +1181,12 @@ impl ClientTransferManager {
                     };
                     
                     match work {
-                        Some((chunk_id, data, is_last)) => {
+                        Some((chunk_id, data, is_last, checksum)) => {
                             // Distribute chunks across connections using round-robin
                             let connection_idx = (chunk_id as usize) % chunk_txs.len();
                             let chunk_tx = &chunk_txs[connection_idx];
                             
-                            // Create chunk
+                            // Create chunk with pre-calculated checksum
                             let mut chunk = FileChunk::new(
                                 chunk_id,
                                 session_id.clone(),
@@ -1193,16 +1194,14 @@ impl ClientTransferManager {
                                 is_last,
                                 chunk_id,
                             );
+                            chunk.checksum = checksum; // Use pre-calculated checksum from read
+                            chunk.original_size = chunk.data.len();
                             
-                            // Compress if enabled
+                            // Compress if enabled (will recalculate checksum on compressed data)
                             if enable_compression {
                                 if let Err(e) = chunk.compress() {
                                     tracing::warn!("Compression failed for chunk {}: {}", chunk_id, e);
                                 }
-                            } else {
-                                // Compression disabled - still need to calculate checksum
-                                let mut checksum = crate::simd::SimdChecksum::new();
-                                chunk.checksum = checksum.calculate_crc32(&chunk.data[..]);
                             }
                             
                             // Create chunk message
@@ -1239,14 +1238,15 @@ impl ClientTransferManager {
 
         tracing::info!("Starting to read and process {} chunks...", total_chunks);
         
-        // Read chunks using mmap reader and send to worker pool
-        while let Ok(Some(data)) = match &mut file_reader {
-            FileReader::Mmap(reader) => reader.read_chunk(self.chunk_size),
+        // Read chunks using mmap reader with checksum calculation (single pass)
+        // This avoids redundant checksum calculation in workers
+        while let Ok(Some((data, checksum))) = match &mut file_reader {
+            FileReader::Mmap(reader) => reader.read_chunk_with_checksum(self.chunk_size),
         } {
             let is_last = chunk_id + 1 >= total_chunks;
             
-            // Send work to worker pool (bounded channel provides backpressure)
-            if let Err(e) = work_tx.send((chunk_id, data, is_last)).await {
+            // Send work to worker pool with pre-calculated checksum (bounded channel provides backpressure)
+            if let Err(e) = work_tx.send((chunk_id, data, is_last, checksum)).await {
                 tracing::error!("Failed to send chunk {} to worker pool: {}", chunk_id, e);
                 break;
             }
