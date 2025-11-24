@@ -978,7 +978,7 @@ impl ClientTransferManager {
                                 break;
                             }
                             tracing::debug!("EndOfStream sent on connection {}", conn_idx);
-                            // Connection will be closed by server after ACK
+                            break; // Exit loop after sending EndOfStream
                         }
                         Message::FileChunk { ref data, .. } => {
                             let chunk_size = data.len();
@@ -1048,6 +1048,7 @@ impl ClientTransferManager {
                             }
                             eos_sent = true;
                             tracing::debug!("EndOfStream sent on main connection");
+                            break; // Exit loop after sending EndOfStream
                         }
                         Message::FileChunk { ref data, .. } => {
                             let chunk_size = data.len();
@@ -1306,25 +1307,24 @@ impl ClientTransferManager {
         drop(chunk_txs);
         tracing::debug!("Closed all writer channels, waiting for writer tasks to finish...");
 
-        // Wait for all writer tasks to finish (cleanup)
-        // Use longer timeout for large files
+        // Wait for all writer tasks with a single timeout
         let writer_timeout_secs = (10.0 + (file_size_gb * 5.0)) as u64;
-        let writer_timeout_secs = writer_timeout_secs.min(120); // Cap at 2 minutes
-        for (idx, handle) in writer_handles.into_iter().enumerate() {
-            let writer_result =
-                tokio::time::timeout(tokio::time::Duration::from_secs(writer_timeout_secs), handle).await;
-            
-            match writer_result {
-                Ok(Ok(())) => {
-                    tracing::debug!("Writer task {} completed successfully", idx);
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!("Writer task {} returned error: {:?}", idx, e);
-                }
-                Err(_) => {
-                    tracing::warn!("Writer task {} timed out, but continuing...", idx);
+        let writer_timeout_secs = writer_timeout_secs.min(120);
+        
+        let wait_result = tokio::time::timeout(
+            tokio::time::Duration::from_secs(writer_timeout_secs),
+            async {
+                for (idx, handle) in writer_handles.into_iter().enumerate() {
+                    match handle.await {
+                        Ok(()) => tracing::debug!("Writer task {} completed", idx),
+                        Err(e) => tracing::warn!("Writer task {} panicked: {:?}", idx, e),
+                    }
                 }
             }
+        ).await;
+
+        if wait_result.is_err() {
+            tracing::debug!("Writer tasks did not complete within {}s, but transfer succeeded (ACK received)", writer_timeout_secs);
         }
 
         if !ack_received {
@@ -1337,21 +1337,18 @@ impl ClientTransferManager {
             ));
         }
 
-        tracing::info!("Received completion ACK from server");
-
         // Progress bar should already be at 100% from writer tasks, but ensure it's complete
         if let Some(ref pb) = self.progress_bar {
             pb.finish_with_message("Transfer complete!");
         }
 
         let elapsed = start_time.elapsed();
-        let throughput = (self.file_size as f64 / 1024.0 / 1024.0) / elapsed.as_secs_f64();
+        let throughput_mbps = (self.file_size as f64 / 1024.0 / 1024.0) / elapsed.as_secs_f64();
         tracing::info!(
-            "All chunks processed and sent in {:.2?} - {:.2} MB/s ({} successful, {} failed)",
-            elapsed,
-            throughput,
-            successful,
-            failed
+            "Transfer completed successfully: {:.2} GB in {:.2}s ({:.1} MB/s)",
+            self.file_size as f64 / 1024.0 / 1024.0 / 1024.0,
+            elapsed.as_secs_f64(),
+            throughput_mbps
         );
 
         reader_handle.abort();
