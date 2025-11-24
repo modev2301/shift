@@ -104,7 +104,12 @@ fn is_remote_path(s: &str) -> bool {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    // Initialize tracing with info level by default, but allow RUST_LOG env var to override
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .init();
     
     let cli = Cli::parse();
     
@@ -112,8 +117,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(command) = cli.command {
         match command {
             Commands::Server => {
-                info!("Starting server with config: {:?}", cli.config);
                 let config = Config::load_or_create(&cli.config)?;
+                let addr = format!("{}:{}", config.server.address, config.server.port);
+                
+                println!("Shift Transfer Server");
+                println!("Listening on: {}", addr);
+                println!("Output directory: {}", config.server.output_directory);
+                println!("Config file: {:?}", cli.config);
+                println!("Server is running. Press Ctrl+C to stop.");
+                println!();
+                
                 let server = TransferServer::new(Arc::new(config.server));
                 server.run().await?;
                 return Ok(());
