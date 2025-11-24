@@ -232,6 +232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         // Transfer files in parallel for maximum throughput
         // Use a semaphore to limit concurrent transfers (default: 4 concurrent files)
+        // Each file gets its own connections for true parallelism
         let max_concurrent_transfers = 4;
         let transfer_semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_transfers));
         let mut transfer_handles = Vec::new();
@@ -260,7 +261,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     progress,
                 ).await?;
                 
-                // Each file gets its own connections (simpler and allows true parallelism)
+                // Each file gets its own connections for true parallelism
                 client_manager.run_transfer().await
             });
             

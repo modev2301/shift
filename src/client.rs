@@ -948,7 +948,7 @@ impl ClientTransferManager {
 
         // 4. Create channels for each connection (distribute chunks across connections)
         // Each connection gets its own channel for true parallelism
-        const CHANNEL_BUFFER_SIZE: usize = 16;
+        const CHANNEL_BUFFER_SIZE: usize = 32;
         let mut writer_handles = Vec::new();
         let mut chunk_txs = Vec::new();
         

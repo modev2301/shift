@@ -13,7 +13,7 @@ use std::path::PathBuf;
 // Default chunk size balances protocol overhead and memory usage.
 // Larger chunks reduce protocol overhead but increase memory requirements.
 pub const BASE_CHUNK_SIZE: usize = 1024 * 1024; // 1MB
-pub const DEFAULT_PARALLEL_STREAMS: usize = 16;
+pub const DEFAULT_PARALLEL_STREAMS: usize = 8;
 pub const MEMORY_POOL_SIZE: usize = 2000;
 pub const SIMD_CHUNK_SIZE: usize = 1024 * 1024; // 1MB for SIMD operations
 pub const ZERO_COPY_ENABLED: bool = true;
