@@ -242,9 +242,13 @@ impl TransferServer {
             // check if all chunks have arrived. This handles cases where chunks
             // are still in-flight when EndOfStream is sent.
             let msg = if end_of_stream_received {
-                const POST_EOS_TIMEOUT_SECS: u64 = 5; // Increased from 2 to 5 seconds
+                // Calculate timeout based on file size - larger files need more time
+                // Base timeout of 10 seconds, plus 1 second per 100MB of file size
+                let file_size_mb = file_size / (1024 * 1024);
+                let timeout_secs = 10 + (file_size_mb / 100).max(1);
+                let timeout_secs = timeout_secs.min(120); // Cap at 2 minutes
                 match tokio::time::timeout(
-                    tokio::time::Duration::from_secs(POST_EOS_TIMEOUT_SECS),
+                    tokio::time::Duration::from_secs(timeout_secs),
                     Message::read_from_stream(&mut reader),
                 )
                 .await
@@ -308,13 +312,21 @@ impl TransferServer {
                         } else {
                             // Still missing chunks, continue waiting for them to arrive.
                             let missing = total_chunks - received_count;
+                            // Log which chunks are missing for debugging
+                            let session_guard = session.lock().await;
+                            let received_set: std::collections::HashSet<u64> = session_guard.received_chunk_ids.iter().copied().collect();
+                            let missing_chunks: Vec<u64> = (0..total_chunks)
+                                .filter(|&id| !received_set.contains(&id))
+                                .collect();
                             debug!(
                                 chunks_received = received_count,
                                 total_chunks = total_chunks,
                                 missing_chunks = missing,
-                                "Still waiting for {} chunks after timeout",
+                                missing_chunk_ids = ?missing_chunks[..missing_chunks.len().min(10)],
+                                "Still waiting for {} chunks after timeout (showing first 10 missing)",
                                 missing
                             );
+                            drop(session_guard);
                             continue;
                         }
                     }

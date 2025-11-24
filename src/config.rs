@@ -40,13 +40,17 @@ pub const DETAILED_LOGGING: bool = true;
 /// Main configuration structure containing all subsystem configurations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// Server-specific configuration.
+    /// Server-specific configuration (optional, only needed on server).
+    #[serde(default)]
     pub server: ServerConfig,
-    /// Client-specific configuration.
+    /// Client-specific configuration (optional, only needed on client).
+    #[serde(default)]
     pub client: ClientConfig,
     /// Security and authentication configuration.
+    #[serde(default)]
     pub security: SecurityConfig,
     /// Performance tuning and optimization configuration.
+    #[serde(default)]
     pub performance: PerformanceConfig,
 }
 

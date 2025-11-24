@@ -1,6 +1,6 @@
 [server]
 address = "0.0.0.0"
-port = 443
+port = 8080
 num_connections = 8
 output_directory = "./downloads"
 max_clients = 10
@@ -15,7 +15,7 @@ allowed_extensions = ["*"]
 
 [client]
 server_address = "127.0.0.1"
-server_port = 443
+server_port = 8080
 num_connections = 8
 parallel_streams = 8
 chunk_size = 16777216
@@ -38,4 +38,4 @@ zero_copy_enabled = true
 memory_pool_size = 2000
 connection_pool_size = 100
 compression_level = 1
-metrics_enabled = true    
+metrics_enabled = true

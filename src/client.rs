@@ -1291,8 +1291,15 @@ impl ClientTransferManager {
         }
         tracing::debug!("EndOfStream queued on all connections, waiting for server ACK...");
 
+        // Calculate timeouts based on file size - larger files need more time
+        let file_size_gb = (self.file_size as f64) / (1024.0 * 1024.0 * 1024.0);
+        
         // Wait for completion ACK from server - this is the definitive signal
-        let ack_timeout = tokio::time::Duration::from_secs(60); // Longer timeout for large files
+        // Base timeout of 60 seconds, plus 10 seconds per GB
+        let timeout_secs = (60.0 + (file_size_gb * 10.0)) as u64;
+        let timeout_secs = timeout_secs.min(300); // Cap at 5 minutes for very large files
+        let ack_timeout = tokio::time::Duration::from_secs(timeout_secs);
+        tracing::debug!("Waiting for completion ACK with {}s timeout (file size: {:.2} GB)", timeout_secs, file_size_gb);
         let ack_received = tokio::time::timeout(ack_timeout, completion_flag.notified()).await.is_ok();
 
         // Close all channels to signal writer tasks to finish
@@ -1300,9 +1307,12 @@ impl ClientTransferManager {
         tracing::debug!("Closed all writer channels, waiting for writer tasks to finish...");
 
         // Wait for all writer tasks to finish (cleanup)
+        // Use longer timeout for large files
+        let writer_timeout_secs = (10.0 + (file_size_gb * 5.0)) as u64;
+        let writer_timeout_secs = writer_timeout_secs.min(120); // Cap at 2 minutes
         for (idx, handle) in writer_handles.into_iter().enumerate() {
             let writer_result =
-                tokio::time::timeout(tokio::time::Duration::from_secs(5), handle).await;
+                tokio::time::timeout(tokio::time::Duration::from_secs(writer_timeout_secs), handle).await;
             
             match writer_result {
                 Ok(Ok(())) => {

@@ -36,7 +36,7 @@ The resulting binary is located at `target/release/shift`.
 ./target/release/shift server
 ```
 
-The server listens on the address and port specified in `config.toml` (default: `0.0.0.0:443`).
+The server listens on the address and port specified in `config.toml` (default: `0.0.0.0:8080`).
 
 #### Transfer Files
 
@@ -69,19 +69,22 @@ Configuration is specified in TOML format. Create a `config.toml` file in the wo
 ```toml
 [server]
 address = "0.0.0.0"
-port = 443
+port = 8080
 num_connections = 8
 output_directory = "./downloads"
+max_clients = 10
 parallel_streams = 8
 buffer_size = 16777216
 enable_progress_bar = true
 enable_compression = false
 enable_resume = true
 timeout_seconds = 30
+max_file_size = 1073741824
+allowed_extensions = ["*"]
 
 [client]
 server_address = "127.0.0.1"
-server_port = 443
+server_port = 8080
 num_connections = 8
 parallel_streams = 8
 chunk_size = 16777216
@@ -92,15 +95,19 @@ timeout_seconds = 30
 retry_attempts = 3
 retry_delay_ms = 1000
 progress_bar_enabled = true
+detailed_logging = true
 
 [security]
 auth_token = "shift_default_token"
+max_connections_per_ip = 10
 
 [performance]
 simd_enabled = true
 zero_copy_enabled = true
 memory_pool_size = 2000
 connection_pool_size = 100
+compression_level = 1
+metrics_enabled = true
 ```
 
 ### Configuration Options
