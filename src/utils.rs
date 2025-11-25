@@ -14,8 +14,14 @@ pub struct ChunkPool {
 
 impl ChunkPool {
     pub fn new(chunk_size: usize, max_pool_size: usize) -> Self {
+        // Pre-warm pool with 50% of max capacity to avoid cold allocations
+        let mut pool = VecDeque::with_capacity(max_pool_size);
+        let pre_warm_count = max_pool_size / 2;
+        for _ in 0..pre_warm_count {
+            pool.push_back(BytesMut::with_capacity(chunk_size));
+        }
         Self {
-            pool: Arc::new(Mutex::new(VecDeque::new())),
+            pool: Arc::new(Mutex::new(pool)),
             chunk_size,
             max_pool_size,
         }

@@ -314,7 +314,12 @@ impl TransferServer {
                             let missing = total_chunks - received_count;
                             // Log which chunks are missing for debugging
                             let session_guard = session.lock().await;
-                            let received_set: std::collections::HashSet<u64> = session_guard.received_chunk_ids.iter().copied().collect();
+                            // Convert BitVec to HashSet for resume info
+                   let received_set: std::collections::HashSet<u64> = session_guard.received_chunk_ids
+                       .iter()
+                       .enumerate()
+                       .filter_map(|(idx, received)| if *received { Some(idx as u64) } else { None })
+                       .collect();
                             let missing_chunks: Vec<u64> = (0..total_chunks)
                                 .filter(|&id| !received_set.contains(&id))
                                 .collect();

@@ -10,6 +10,7 @@ use bytes::Bytes;
 use indicatif::{MultiProgress, ProgressBar};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use bitvec::prelude::*;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -282,8 +283,9 @@ pub struct TransferSession {
     pub output_directory: PathBuf,
 
     // State
-    pub received_chunk_ids: HashSet<u64>, // Only track IDs, not data
+    pub received_chunk_ids: BitVec, // BitVec for efficient chunk tracking (1 bit per chunk)
     pub file_handle: Option<Arc<tokio::sync::Mutex<tokio::fs::File>>>, // Async file handle for writing
+    pub std_file_handle: Option<Arc<std::fs::File>>, // Std file handle for pwrite (parallel writes)
     pub completed_streams: HashSet<u64>,
     pub total_streams: usize,
     pub is_completed: AtomicBool,
@@ -398,9 +400,10 @@ impl TransferSession {
             }
         }
 
-        // Use async file I/O instead of memory mapping to avoid permission issues with large files
-        // Create file synchronously first, then convert to async handle
-        let file_handle = match std::fs::OpenOptions::new()
+        // Create file for both async and sync I/O
+        // Store std::fs::File for pwrite (parallel writes without mutex)
+        // Store tokio::fs::File for async operations (sync_all, metadata)
+        let (file_handle, std_file_handle) = match std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
@@ -415,14 +418,58 @@ impl TransferSession {
                         e
                     );
                 }
-                // Convert to async file handle
+                
+                // Clone file for both handles (file descriptor is shared)
+                let file_clone = match file.try_clone() {
+                    Ok(clone) => clone,
+                    Err(e) => {
+                        tracing::error!("Failed to clone file handle: {}", e);
+                        // Fallback: use the original file for async, None for std
+                        let async_file = tokio::fs::File::from_std(file);
+                        tracing::info!(
+                            "Created output file: {} ({} bytes) - using async-only mode",
+                            output_path.display(),
+                            file_size
+                        );
+                        return Self {
+                            session_id,
+                            filename,
+                            file_size,
+                            enable_progress_bar,
+                            chunk_size,
+                            completion_tx,
+                            parallel_streams,
+                            resume_info,
+                            ack_tx,
+                            chunk_pool,
+                            output_directory,
+                            received_chunk_ids: {
+                                let total_chunks = (file_size + chunk_size as u64 - 1) / chunk_size as u64;
+                                let mut bv = BitVec::with_capacity(total_chunks as usize);
+                                bv.resize(total_chunks as usize, false);
+                                bv
+                            },
+                            file_handle: Some(Arc::new(tokio::sync::Mutex::new(async_file))),
+                            std_file_handle: None,
+                            completed_streams: HashSet::new(),
+                            total_streams: parallel_streams,
+                            is_completed: AtomicBool::new(false),
+                            bytes_received: AtomicU64::new(0),
+                            start_time: Instant::now(),
+                        };
+                    }
+                };
+                
+                // Create async file handle
                 let async_file = tokio::fs::File::from_std(file);
+                let std_file = Arc::new(file_clone);
+                
                 tracing::info!(
                     "Created output file: {} ({} bytes)",
                     output_path.display(),
                     file_size
                 );
-                Some(Arc::new(tokio::sync::Mutex::new(async_file)))
+                (Some(Arc::new(tokio::sync::Mutex::new(async_file))), Some(std_file))
             }
             Err(e) => {
                 tracing::error!(
@@ -431,9 +478,14 @@ impl TransferSession {
                     e,
                     std::env::current_dir()
                 );
-                None
+                (None, None)
             }
         };
+        
+        // Initialize BitVec for chunk tracking (1 bit per chunk)
+        let total_chunks = (file_size + chunk_size as u64 - 1) / chunk_size as u64;
+        let mut received_chunk_ids = BitVec::with_capacity(total_chunks as usize);
+        received_chunk_ids.resize(total_chunks as usize, false);
 
         Self {
             session_id,
@@ -447,8 +499,9 @@ impl TransferSession {
             ack_tx,
             chunk_pool,
             output_directory,
-            received_chunk_ids: HashSet::new(),
+            received_chunk_ids,
             file_handle,
+            std_file_handle,
             completed_streams: HashSet::new(),
             total_streams: parallel_streams,
             is_completed: AtomicBool::new(false),
@@ -520,9 +573,6 @@ impl TransferSession {
         // We use async file I/O rather than memory mapping to avoid permission
         // issues with large files and to support out-of-order writes efficiently.
         if let Some(ref file_handle) = self.file_handle {
-            use tokio::io::AsyncSeekExt;
-            use tokio::io::AsyncWriteExt;
-
             // Calculate the file offset for this chunk based on its ID.
             // Chunks are numbered sequentially, so offset = chunk_id * chunk_size.
             let offset = chunk.chunk_id as u64 * self.chunk_size as u64;
@@ -565,41 +615,93 @@ impl TransferSession {
                     "Chunk has zero write size"
                 );
                 // Still mark as received to avoid blocking completion
-                self.received_chunk_ids.insert(chunk.chunk_id);
+                let chunk_idx = chunk.chunk_id as usize;
+                if chunk_idx < self.received_chunk_ids.len() {
+                    self.received_chunk_ids.set(chunk_idx, true);
+                }
                 return Ok(false);
             }
 
-            let mut file = file_handle.lock().await;
-            file.seek(std::io::SeekFrom::Start(offset))
-                .await
-                .map_err(|e| {
+            // Use pwrite for parallel writes without mutex contention
+            // This allows multiple chunks to write simultaneously at different offsets
+            if let Some(ref std_file) = self.std_file_handle {
+                use std::os::unix::io::AsRawFd;
+                
+                let data_to_write = if write_size < chunk.data.len() {
+                    &chunk.data[..write_size]
+                } else {
+                    &chunk.data
+                };
+                
+                // pwrite is thread-safe for writes at different offsets
+                let result = unsafe {
+                    libc::pwrite(
+                        std_file.as_raw_fd(),
+                        data_to_write.as_ptr() as *const libc::c_void,
+                        data_to_write.len(),
+                        offset as libc::off_t,
+                    )
+                };
+                
+                if result < 0 {
+                    let err = std::io::Error::last_os_error();
                     tracing::error!(
-                        "Failed to seek to offset {} for chunk {}: {}",
-                        offset,
+                        "Failed to write chunk {} at offset {}: {}",
                         chunk.chunk_id,
-                        e
+                        offset,
+                        err
                     );
-                    TransferError::Io(e)
-                })?;
-
-            // Write only the data that fits
-            if write_size < chunk.data.len() {
-                file.write_all(&chunk.data[..write_size])
+                    return Err(TransferError::Io(err));
+                }
+                
+                if result as usize != data_to_write.len() {
+                    tracing::error!(
+                        "Partial write for chunk {}: wrote {}/{} bytes",
+                        chunk.chunk_id,
+                        result,
+                        data_to_write.len()
+                    );
+                    return Err(TransferError::Io(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        format!("Partial write for chunk {}", chunk.chunk_id),
+                    )));
+                }
+            } else {
+                // Fallback to async I/O if std_file_handle not available
+                let mut file = file_handle.lock().await;
+                use tokio::io::AsyncSeekExt;
+                use tokio::io::AsyncWriteExt;
+                
+                file.seek(std::io::SeekFrom::Start(offset))
                     .await
                     .map_err(|e| {
                         tracing::error!(
-                            "Failed to write chunk {} (truncated to {} bytes): {}",
+                            "Failed to seek to offset {} for chunk {}: {}",
+                            offset,
                             chunk.chunk_id,
-                            write_size,
                             e
                         );
                         TransferError::Io(e)
                     })?;
-            } else {
-                file.write_all(&chunk.data).await.map_err(|e| {
-                    tracing::error!("Failed to write chunk {}: {}", chunk.chunk_id, e);
-                    TransferError::Io(e)
-                })?;
+
+                if write_size < chunk.data.len() {
+                    file.write_all(&chunk.data[..write_size])
+                        .await
+                        .map_err(|e| {
+                            tracing::error!(
+                                "Failed to write chunk {} (truncated to {} bytes): {}",
+                                chunk.chunk_id,
+                                write_size,
+                                e
+                            );
+                            TransferError::Io(e)
+                        })?;
+                } else {
+                    file.write_all(&chunk.data).await.map_err(|e| {
+                        tracing::error!("Failed to write chunk {}: {}", chunk.chunk_id, e);
+                        TransferError::Io(e)
+                    })?;
+                }
             }
 
             // Don't flush after every chunk - OS buffers handle this efficiently
@@ -618,7 +720,10 @@ impl TransferSession {
         }
 
         // Track that we received this chunk ID (not the data)
-        self.received_chunk_ids.insert(chunk.chunk_id);
+        let chunk_idx = chunk.chunk_id as usize;
+        if chunk_idx < self.received_chunk_ids.len() {
+            self.received_chunk_ids.set(chunk_idx, true);
+        }
 
         // Update resume info if available
         if let Some(ref mut _resume_info) = self.resume_info {
@@ -631,7 +736,8 @@ impl TransferSession {
 
         // Check if transfer is complete
         let total_chunks = (self.file_size + self.chunk_size as u64 - 1) / self.chunk_size as u64;
-        if self.received_chunk_ids.len() as u64 >= total_chunks {
+        let received_count = self.received_chunk_ids.count_ones() as u64;
+        if received_count >= total_chunks {
             self.complete_transfer().await?;
             return Ok(true);
         }
@@ -716,7 +822,7 @@ pub struct ClientTransferManager {
     pub file_path: PathBuf,
     pub config: Arc<crate::config::ClientConfig>,
     pub multi_progress: MultiProgress,
-    pub session_id: String,
+    pub session_id: Arc<str>,
     pub file_size: u64,
     pub chunk_size: usize,
     pub parallel_streams: usize,
@@ -740,8 +846,8 @@ impl ClientTransferManager {
             .map_err(|e| TransferError::Io(e))?;
         let file_size = metadata.len();
 
-        // Generate session ID
-        let session_id = Uuid::new_v4().to_string();
+        // Generate session ID as Arc<str> to avoid cloning overhead
+        let session_id: Arc<str> = Uuid::new_v4().to_string().into();
 
         // Calculate optimal chunk size
         let chunk_size = config
@@ -770,7 +876,7 @@ impl ClientTransferManager {
         // Create resume info
         let total_chunks = (file_size + chunk_size as u64 - 1) / chunk_size as u64;
         let resume_info = Arc::new(Mutex::new(ResumeInfo::new(
-            session_id.clone(),
+            session_id.to_string(), // ResumeInfo expects String
             file_path.clone(),
             total_chunks,
             file_size,
@@ -833,7 +939,9 @@ impl ClientTransferManager {
             
             // Set send and receive buffer sizes (50MB each for high-bandwidth networks)
             // For 10Gbps with 10ms RTT: BDP = 12.5MB, use 4x BDP = 50MB
-            const TCP_BUFFER_SIZE: i32 = 50 * 1024 * 1024; // 50MB
+            // TCP buffer size: 2x BDP for 10Gbps with 10ms RTT = 25MB
+            // Using 25MB instead of 50MB to reduce kernel memory usage
+            const TCP_BUFFER_SIZE: i32 = 25 * 1024 * 1024; // 25MB
             if let Err(e) = sock_ref.set_send_buffer_size(TCP_BUFFER_SIZE as usize) {
                 tracing::warn!("Failed to set SO_SNDBUF on connection {}: {} (using OS default)", i, e);
             } else {
@@ -916,7 +1024,7 @@ impl ClientTransferManager {
         };
 
         let handshake = Message::Handshake {
-            session_id: self.session_id.clone(),
+            session_id: self.session_id.to_string(), // Message needs String for serialization
             filename: filename.clone(),
             file_size: self.file_size,
             chunk_size: self.chunk_size,
@@ -951,7 +1059,7 @@ impl ClientTransferManager {
         tracing::info!("Handshake sent on all {} connections", num_connections);
         
         // Use first connection for ACK reading
-        let (mut reader, mut writer) = handshake_connections.remove(0);
+        let (mut reader, writer) = handshake_connections.remove(0);
         let mut additional_connections = handshake_connections;
 
         // 3. Open file with mmap reader (O_DIRECT disabled - was slower)
@@ -960,8 +1068,6 @@ impl ClientTransferManager {
         }
         
         let mut file_reader: FileReader = FileReader::Mmap(ZeroCopyReader::new(&self.file_path)?);
-        
-        let total_chunks = (self.file_size + self.chunk_size as u64 - 1) / self.chunk_size as u64;
 
         // 4. Create channels for each connection (distribute chunks across connections)
         // Each connection gets its own channel for true parallelism
@@ -1116,7 +1222,7 @@ impl ClientTransferManager {
         // We only read ACKs for errors or completion, not for every chunk
         let completion_flag = Arc::new(tokio::sync::Notify::new());
         let reader_handle = {
-            let _session_id = self.session_id.clone();
+            let _session_id = Arc::clone(&self.session_id);
             let completion_flag_clone = Arc::clone(&completion_flag);
             tokio::spawn(async move {
                 loop {
@@ -1175,66 +1281,64 @@ impl ClientTransferManager {
         };
 
         // 7. Read chunks and process in parallel (compression), then queue for sending
-        // Use work distribution pattern: single receiver distributes to workers via individual channels
-        // This eliminates mutex contention - workers receive work without locking
-        let (work_tx, mut work_rx) = mpsc::channel::<(u64, Bytes, bool, u32)>(self.parallel_streams);
-        let session_id = self.session_id.clone();
+        // Use async-channel for multi-consumer work distribution (no distributor bottleneck)
+        // Each worker clones the receiver and pulls work directly
+        use async_channel;
+        let (work_tx, work_rx) = async_channel::bounded::<(u64, Bytes, bool, u32)>(self.parallel_streams * 2);
+        let session_id = Arc::clone(&self.session_id);
         let enable_compression = self.config.enable_compression;
         let chunk_txs_clone = chunk_txs.clone();
         
-        // Create individual channels for each worker (no mutex needed)
-        let mut worker_channels = Vec::new();
+        // Spawn worker pool - each worker gets a cloned receiver (async-channel supports this)
         let mut worker_handles = Vec::new();
         for _worker_id in 0..self.parallel_streams {
-            let (worker_tx, mut worker_rx) = mpsc::channel::<(u64, Bytes, bool, u32)>(16);
-            worker_channels.push(worker_tx);
-            
-            let session_id = session_id.clone();
+            let work_rx = work_rx.clone();
+            let session_id = Arc::clone(&session_id);
             let enable_compression = enable_compression;
             let chunk_txs = chunk_txs_clone.clone();
             
             let handle = tokio::spawn(async move {
-                while let Some((chunk_id, data, is_last, checksum)) = worker_rx.recv().await {
-                            // Distribute chunks across connections using round-robin
-                            let connection_idx = (chunk_id as usize) % chunk_txs.len();
-                            let chunk_tx = &chunk_txs[connection_idx];
-                            
-                            // Create chunk with pre-calculated checksum
-                            let mut chunk = FileChunk::new(
-                                chunk_id,
-                                session_id.clone(),
-                                data,
-                                is_last,
-                                chunk_id,
-                            );
-                            chunk.checksum = checksum; // Use pre-calculated checksum from read
-                            chunk.original_size = chunk.data.len();
-                            
-                            // Compress if enabled (will recalculate checksum on compressed data)
-                            if enable_compression {
-                                if let Err(e) = chunk.compress() {
-                                    tracing::warn!("Compression failed for chunk {}: {}", chunk_id, e);
-                                }
-                            }
-                            
-                            // Create chunk message
-                            let chunk_msg = Message::FileChunk {
-                                chunk_id,
-                                session_id: session_id.clone(),
-                                data: chunk.data,
-                                is_last,
-                                is_compressed: chunk.is_compressed,
-                                checksum: chunk.checksum,
-                                original_size: chunk.original_size,
-                                sequence_number: chunk_id,
-                                retry_count: 0,
-                            };
-                            
-                            // Queue for sending
-                            if let Err(e) = chunk_tx.send(chunk_msg).await {
-                                tracing::error!("Failed to queue chunk {}: {}", chunk_id, e);
-                                return Err(TransferError::NetworkError(format!("Channel closed: {}", e)));
-                            }
+                while let Ok((chunk_id, data, is_last, checksum)) = work_rx.recv().await {
+                    // Distribute chunks across connections using round-robin
+                    let connection_idx = (chunk_id as usize) % chunk_txs.len();
+                    let chunk_tx = &chunk_txs[connection_idx];
+                    
+                    // Create chunk with pre-calculated checksum
+                    let mut chunk = FileChunk::new(
+                        chunk_id,
+                        session_id.to_string(),
+                        data,
+                        is_last,
+                        chunk_id,
+                    );
+                    chunk.checksum = checksum; // Use pre-calculated checksum from read
+                    chunk.original_size = chunk.data.len();
+                    
+                    // Compress if enabled (will recalculate checksum on compressed data)
+                    if enable_compression {
+                        if let Err(e) = chunk.compress() {
+                            tracing::warn!("Compression failed for chunk {}: {}", chunk_id, e);
+                        }
+                    }
+                    
+                    // Create chunk message
+                    let chunk_msg = Message::FileChunk {
+                        chunk_id,
+                        session_id: session_id.to_string(),
+                        data: chunk.data,
+                        is_last,
+                        is_compressed: chunk.is_compressed,
+                        checksum: chunk.checksum,
+                        original_size: chunk.original_size,
+                        sequence_number: chunk_id,
+                        retry_count: 0,
+                    };
+                    
+                    // Queue for sending
+                    if let Err(e) = chunk_tx.send(chunk_msg).await {
+                        tracing::error!("Failed to queue chunk {}: {}", chunk_id, e);
+                        return Err(TransferError::NetworkError(format!("Channel closed: {}", e)));
+                    }
                 }
                 Ok::<(), TransferError>(())
             });
@@ -1248,21 +1352,6 @@ impl ClientTransferManager {
 
         tracing::info!("Starting to read and process {} chunks...", total_chunks);
         
-        // Spawn distributor task that round-robins work to workers
-        let distributor_handle = tokio::spawn(async move {
-            let mut worker_idx = 0;
-            while let Some(work) = work_rx.recv().await {
-                // Round-robin distribution to workers
-                if let Err(e) = worker_channels[worker_idx].send(work).await {
-                    tracing::error!("Failed to send work to worker {}: {}", worker_idx, e);
-                    break;
-                }
-                worker_idx = (worker_idx + 1) % worker_channels.len();
-            }
-            // Close all worker channels
-            drop(worker_channels);
-        });
-        
         // Read chunks using mmap reader with checksum calculation (single pass)
         // This avoids redundant checksum calculation in workers
         while let Ok(Some((data, checksum))) = match &mut file_reader {
@@ -1270,20 +1359,17 @@ impl ClientTransferManager {
         } {
             let is_last = chunk_id + 1 >= total_chunks;
             
-            // Send work to distributor (bounded channel provides backpressure)
+            // Send work to workers (async-channel handles multi-consumer distribution)
             if let Err(e) = work_tx.send((chunk_id, data, is_last, checksum)).await {
-                tracing::error!("Failed to send chunk {} to distributor: {}", chunk_id, e);
+                tracing::error!("Failed to send chunk {} to worker pool: {}", chunk_id, e);
                 break;
             }
             
             chunk_id += 1;
         }
         
-        // Close work channel to signal distributor to finish
+        // Close work channel to signal workers to finish
         drop(work_tx);
-        
-        // Wait for distributor to finish
-        let _ = distributor_handle.await;
         
         // Wait for all workers to complete
         tracing::info!("Waiting for {} chunks to be processed...", chunk_id);
@@ -1303,12 +1389,12 @@ impl ClientTransferManager {
             }
         }
 
-        tracing::info!("All {} chunks processed and queued for sending", successful);
+        tracing::info!("All {} chunks processed and queued for sending ({} failed)", successful, failed);
 
         // Send EndOfStream only on the main connection
         // Other connections will naturally close when their channels are dropped
         let eos = Message::EndOfStream {
-            session_id: self.session_id.clone(),
+            session_id: self.session_id.to_string(), // Message needs String for serialization
             stream_id: 0,
         };
         // Send on the main connection (last one in the list, which is the first connection we kept)
@@ -1455,7 +1541,7 @@ mod tests {
         }
 
         // Verify all chunks received
-        assert_eq!(session.received_chunk_ids.len(), 10);
+        assert_eq!(session.received_chunk_ids.count_ones(), 10);
 
         // Complete transfer
         session.complete_transfer().await.unwrap();

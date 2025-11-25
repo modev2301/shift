@@ -6,7 +6,6 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::AsRawFd;
 
 /// Zero-copy file reader using memory mapping
 pub struct ZeroCopyReader {
@@ -254,7 +253,7 @@ impl DirectIOReader {
 
             // Extract the data we need (accounting for alignment offset)
             let data_start = position_offset;
-            let data_end = std::cmp::min(data_start + read_size, bytes_read);
+            let _data_end = std::cmp::min(data_start + read_size, bytes_read);
             
             if data_start < bytes_read {
                 let needed = std::cmp::min(read_size, bytes_read - data_start);
