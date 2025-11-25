@@ -17,6 +17,7 @@ use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use uuid::Uuid;
+use futures::future::try_join_all;
 
 // Constants for transfer
 const DEFAULT_BUFFER_SIZE: usize = 64 * 1024;
@@ -102,17 +103,28 @@ impl Message {
                 retry_count: _,
             } => {
                 // Binary format: [magic:u8=0xFF][type:u8=0x01][chunk_id:u64][session_len:u8][session][data_len:u32][data][flags:u8][checksum:u32][original_size:u32]
-                // Direct write without buffering for maximum performance
-                writer.write_all(&[0xFF, 0x01]).await.map_err(|e| TransferError::Io(e))?; // Magic + type
-                writer.write_all(&chunk_id.to_be_bytes()).await.map_err(|e| TransferError::Io(e))?;
-                writer.write_all(&[session_id.len() as u8]).await.map_err(|e| TransferError::Io(e))?;
-                writer.write_all(session_id.as_bytes()).await.map_err(|e| TransferError::Io(e))?;
-                writer.write_all(&(data.len() as u32).to_be_bytes()).await.map_err(|e| TransferError::Io(e))?;
-                writer.write_all(data).await.map_err(|e| TransferError::Io(e))?;
+                // Buffer entire message to reduce syscalls (8 writes -> 1 write)
+                let session_len = session_id.len() as u8;
+                let data_len = data.len() as u32;
                 let flags = (*is_last as u8) | ((*is_compressed as u8) << 1);
-                writer.write_all(&[flags]).await.map_err(|e| TransferError::Io(e))?;
-                writer.write_all(&checksum.to_be_bytes()).await.map_err(|e| TransferError::Io(e))?;
-                writer.write_all(&(*original_size as u32).to_be_bytes()).await.map_err(|e| TransferError::Io(e))?;
+                let original_size_u32 = *original_size as u32;
+                
+                // Pre-allocate buffer with exact size needed
+                let header_size = 1 + 1 + 8 + 1 + session_id.len() + 4 + 1 + 4 + 4; // All header fields
+                let mut msg_buf = Vec::with_capacity(header_size + data.len());
+                
+                msg_buf.extend_from_slice(&[0xFF, 0x01]); // Magic + type
+                msg_buf.extend_from_slice(&chunk_id.to_be_bytes());
+                msg_buf.push(session_len);
+                msg_buf.extend_from_slice(session_id.as_bytes());
+                msg_buf.extend_from_slice(&data_len.to_be_bytes());
+                msg_buf.extend_from_slice(data);
+                msg_buf.push(flags);
+                msg_buf.extend_from_slice(&checksum.to_be_bytes());
+                msg_buf.extend_from_slice(&original_size_u32.to_be_bytes());
+                
+                // Single write_all call instead of 8 separate calls
+                writer.write_all(&msg_buf).await.map_err(|e| TransferError::Io(e))?;
                 // Don't flush - let TCP buffer handle batching
             }
             // Keep JSON for control messages (handshake, ACKs) - they're small
@@ -914,22 +926,27 @@ impl ClientTransferManager {
             resume_info,
         };
 
-        // Send handshake on all connections - server requires handshake before accepting chunks
-        let mut handshake_connections = Vec::new();
-        for (idx, (mut conn_reader, mut conn_writer)) in connections.into_iter().enumerate() {
-            if let Err(e) = handshake.write_to_stream(&mut conn_writer).await {
-                return Err(TransferError::NetworkError(format!(
-                    "Failed to send handshake on connection {}: {}", idx, e
-                )));
+        // Send handshake on all connections in parallel - server requires handshake before accepting chunks
+        let handshake_futures: Vec<_> = connections.into_iter().enumerate().map(|(idx, (conn_reader, mut conn_writer))| {
+            let handshake = handshake.clone();
+            async move {
+                if let Err(e) = handshake.write_to_stream(&mut conn_writer).await {
+                    return Err(TransferError::NetworkError(format!(
+                        "Failed to send handshake on connection {}: {}", idx, e
+                    )));
+                }
+                if let Err(e) = conn_writer.flush().await {
+                    return Err(TransferError::NetworkError(format!(
+                        "Failed to flush handshake on connection {}: {}", idx, e
+                    )));
+                }
+                tracing::debug!("Handshake sent on connection {}", idx);
+                Ok::<_, TransferError>((conn_reader, conn_writer))
             }
-            if let Err(e) = conn_writer.flush().await {
-                return Err(TransferError::NetworkError(format!(
-                    "Failed to flush handshake on connection {}: {}", idx, e
-                )));
-            }
-            handshake_connections.push((conn_reader, conn_writer));
-            tracing::debug!("Handshake sent on connection {}", idx);
-        }
+        }).collect();
+        
+        let handshake_results = try_join_all(handshake_futures).await?;
+        let mut handshake_connections: Vec<_> = handshake_results.into_iter().collect();
         
         tracing::info!("Handshake sent on all {} connections", num_connections);
         
@@ -1158,31 +1175,26 @@ impl ClientTransferManager {
         };
 
         // 7. Read chunks and process in parallel (compression), then queue for sending
-        // Use bounded channel with shared receiver for better concurrency (no semaphore lock contention)
-        // Work item includes pre-calculated checksum to avoid redundant calculation
-        let (work_tx, work_rx) = mpsc::channel::<(u64, Bytes, bool, u32)>(self.parallel_streams);
-        let work_rx = Arc::new(tokio::sync::Mutex::new(work_rx));
+        // Use work distribution pattern: single receiver distributes to workers via individual channels
+        // This eliminates mutex contention - workers receive work without locking
+        let (work_tx, mut work_rx) = mpsc::channel::<(u64, Bytes, bool, u32)>(self.parallel_streams);
         let session_id = self.session_id.clone();
         let enable_compression = self.config.enable_compression;
         let chunk_txs_clone = chunk_txs.clone();
         
-        // Spawn worker pool for chunk processing
+        // Create individual channels for each worker (no mutex needed)
+        let mut worker_channels = Vec::new();
         let mut worker_handles = Vec::new();
         for _worker_id in 0..self.parallel_streams {
-            let work_rx = Arc::clone(&work_rx);
+            let (worker_tx, mut worker_rx) = mpsc::channel::<(u64, Bytes, bool, u32)>(16);
+            worker_channels.push(worker_tx);
+            
             let session_id = session_id.clone();
             let enable_compression = enable_compression;
             let chunk_txs = chunk_txs_clone.clone();
             
             let handle = tokio::spawn(async move {
-                loop {
-                    let work = {
-                        let mut rx = work_rx.lock().await;
-                        rx.recv().await
-                    };
-                    
-                    match work {
-                        Some((chunk_id, data, is_last, checksum)) => {
+                while let Some((chunk_id, data, is_last, checksum)) = worker_rx.recv().await {
                             // Distribute chunks across connections using round-robin
                             let connection_idx = (chunk_id as usize) % chunk_txs.len();
                             let chunk_tx = &chunk_txs[connection_idx];
@@ -1223,9 +1235,6 @@ impl ClientTransferManager {
                                 tracing::error!("Failed to queue chunk {}: {}", chunk_id, e);
                                 return Err(TransferError::NetworkError(format!("Channel closed: {}", e)));
                             }
-                        }
-                        None => break, // Channel closed
-                    }
                 }
                 Ok::<(), TransferError>(())
             });
@@ -1239,6 +1248,21 @@ impl ClientTransferManager {
 
         tracing::info!("Starting to read and process {} chunks...", total_chunks);
         
+        // Spawn distributor task that round-robins work to workers
+        let distributor_handle = tokio::spawn(async move {
+            let mut worker_idx = 0;
+            while let Some(work) = work_rx.recv().await {
+                // Round-robin distribution to workers
+                if let Err(e) = worker_channels[worker_idx].send(work).await {
+                    tracing::error!("Failed to send work to worker {}: {}", worker_idx, e);
+                    break;
+                }
+                worker_idx = (worker_idx + 1) % worker_channels.len();
+            }
+            // Close all worker channels
+            drop(worker_channels);
+        });
+        
         // Read chunks using mmap reader with checksum calculation (single pass)
         // This avoids redundant checksum calculation in workers
         while let Ok(Some((data, checksum))) = match &mut file_reader {
@@ -1246,17 +1270,20 @@ impl ClientTransferManager {
         } {
             let is_last = chunk_id + 1 >= total_chunks;
             
-            // Send work to worker pool with pre-calculated checksum (bounded channel provides backpressure)
+            // Send work to distributor (bounded channel provides backpressure)
             if let Err(e) = work_tx.send((chunk_id, data, is_last, checksum)).await {
-                tracing::error!("Failed to send chunk {} to worker pool: {}", chunk_id, e);
+                tracing::error!("Failed to send chunk {} to distributor: {}", chunk_id, e);
                 break;
             }
             
             chunk_id += 1;
         }
         
-        // Close work channel to signal workers to finish
+        // Close work channel to signal distributor to finish
         drop(work_tx);
+        
+        // Wait for distributor to finish
+        let _ = distributor_handle.await;
         
         // Wait for all workers to complete
         tracing::info!("Waiting for {} chunks to be processed...", chunk_id);
