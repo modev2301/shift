@@ -13,41 +13,32 @@
 //! # Example
 //!
 //! ```no_run
-//! use shift::{Config, TransferServer};
-//! use std::sync::Arc;
+//! use shift::{blocking_transfer::{blocking_server_loop, BlockingTransferConfig}, Config};
+//! use std::path::PathBuf;
 //!
-//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let config = Arc::new(Config::load_or_create(&"config.toml".into())?);
-//! let server = TransferServer::new(Arc::clone(&config.server));
-//! server.run().await?;
-//! # Ok(())
-//! # }
+//! let config = Config::load_or_create(&"config.toml".into())?;
+//! let transfer_config = BlockingTransferConfig {
+//!     num_threads: 8,
+//!     base_port: 8080,
+//!     buffer_size: 8 * 1024 * 1024,
+//!     enable_compression: false,
+//! };
+//! let output_dir = PathBuf::from(&config.server.output_directory);
+//! blocking_server_loop(&output_dir, transfer_config)?;
 //! ```
 
-pub mod adaptive;
 pub mod benchmark;
 pub mod blocking_transfer;
-pub mod client;
-pub mod compression;
 pub mod config;
 pub mod error;
-#[cfg(target_os = "linux")]
-pub mod io_uring;
-pub mod network;
-pub mod server;
 pub mod simd;
 pub mod utils;
-pub mod zero_copy;
 
 pub use benchmark::{BenchmarkResult, PerformanceBenchmark, TestFile};
-pub use client::{ClientTransferManager, Message, TransferSession};
-pub use compression::FileChunk;
+pub use blocking_transfer::{BlockingTransferConfig, blocking_client_transfer, blocking_server_loop, blocking_server_receive};
 pub use config::Config;
 pub use error::TransferError;
-pub use network::{ConnectionPool, NetworkStats};
-pub use server::TransferServer;
 pub use simd::{SimdBenchmark, SimdChecksum, SimdOperation, SimdProcessor};
-pub use zero_copy::{DirectIOReader, ZeroCopyBufferPool, ZeroCopyReader, ZeroCopyTransferManager, ZeroCopyWriter};
 
 // Re-export commonly used types for convenience
 pub use bytes;

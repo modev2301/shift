@@ -1,6 +1,6 @@
-//! Blocking thread-based transfer (WDT-style architecture)
+//! Blocking thread-based transfer architecture
 //! 
-//! This module implements a WDT-inspired transfer system using:
+//! This module implements a high-performance transfer system using:
 //! - OS threads with blocking I/O (no async overhead)
 //! - Thread-per-port architecture (zero coordination)
 //! - Pre-split file ranges (no round-robin distribution)
@@ -22,6 +22,14 @@ use std::time::Instant;
 pub struct FileRange {
     pub start: u64,
     pub end: u64,
+}
+
+/// File metadata (only sent once on thread 0)
+#[derive(Debug, Clone)]
+pub struct FileMetadata {
+    pub filename: String,
+    pub file_size: u64,
+    pub num_threads: usize,
 }
 
 /// Configuration for blocking transfer
@@ -97,58 +105,12 @@ pub fn split_file_ranges(file_size: u64, num_threads: usize) -> Vec<FileRange> {
     ranges
 }
 
-/// Handshake message (minimal protocol)
-#[derive(Debug)]
-struct Handshake {
-    filename: String,
-    file_size: u64,
-}
-
-impl Handshake {
-    fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        // [filename_len: varint][filename: bytes][file_size: varint]
-        encode_varint(self.filename.len() as u64, &mut buf);
-        buf.extend_from_slice(self.filename.as_bytes());
-        encode_varint(self.file_size, &mut buf);
-        buf
-    }
-    
-    fn decode<R: Read>(reader: &mut R) -> Result<Self, TransferError> {
-        let filename_len = decode_varint(reader)? as usize;
-        let mut filename_bytes = vec![0u8; filename_len];
-        reader.read_exact(&mut filename_bytes)?;
-        let filename = String::from_utf8(filename_bytes)
-            .map_err(|e| TransferError::ProtocolError(format!("Invalid filename: {}", e)))?;
-        let file_size = decode_varint(reader)?;
-        Ok(Handshake { filename, file_size })
-    }
-}
-
-/// Sender thread: reads file region and sends over socket
-pub fn sender_thread(
-    file_path: &Path,
-    range: FileRange,
-    server_addr: &str,
-    port: u16,
-    buffer_size: usize,
-    filename: String,
-    file_size: u64,
-) -> Result<u64, TransferError> {
-    // Open file
-    let mut file = File::open(file_path)?;
-    
-    // Connect to server
-    let addr = format!("{}:{}", server_addr, port);
-    let mut stream = TcpStream::connect(&addr)?;
-    
-    // Configure TCP for throughput
+/// Configure TCP for throughput (sender)
+fn configure_tcp_for_throughput(stream: &TcpStream) -> Result<(), TransferError> {
     stream.set_nodelay(true)?;
     #[cfg(target_os = "linux")]
     {
-        use std::os::unix::io::AsRawFd;
         let fd = stream.as_raw_fd();
-        // Set TCP buffer sizes
         let buf_size: libc::c_int = 25 * 1024 * 1024; // 25MB
         unsafe {
             libc::setsockopt(
@@ -160,83 +122,14 @@ pub fn sender_thread(
             );
         }
     }
-    
-    // Send handshake: [filename][file_size]
-    let handshake = Handshake { filename, file_size };
-    let handshake_bytes = handshake.encode();
-    stream.write_all(&handshake_bytes)?;
-    
-    // Allocate buffer
-    let mut buffer = vec![0u8; buffer_size];
-    let mut offset = range.start;
-    let mut total_sent = 0u64;
-    
-    // Send file range header: [start_offset: varint][end_offset: varint]
-    let mut header = Vec::new();
-    encode_varint(range.start, &mut header);
-    encode_varint(range.end, &mut header);
-    stream.write_all(&header)?;
-    
-    // Transfer loop: pread → write (blocking, no async)
-    while offset < range.end {
-        let remaining = (range.end - offset) as usize;
-        let read_size = std::cmp::min(buffer_size, remaining);
-        
-        // Use pread for thread-safe reads at specific offset
-        #[cfg(target_os = "linux")]
-        use std::os::unix::io::AsRawFd;
-        #[cfg(target_os = "linux")]
-        let bytes_read = unsafe {
-            libc::pread(
-                file.as_raw_fd(),
-                buffer.as_mut_ptr() as *mut libc::c_void,
-                read_size,
-                offset as libc::off_t,
-            )
-        };
-        #[cfg(not(target_os = "linux"))]
-        let bytes_read = {
-            // Fallback: seek + read (not thread-safe, but works on non-Linux)
-            file.seek(std::io::SeekFrom::Start(offset))?;
-            file.read(&mut buffer[..read_size])? as i64
-        };
-        
-        if bytes_read < 0 {
-            return Err(TransferError::Io(std::io::Error::last_os_error()));
-        }
-        
-        if bytes_read == 0 {
-            break;
-        }
-        
-        // Write to socket (blocking)
-        stream.write_all(&buffer[..bytes_read as usize])?;
-        
-        offset += bytes_read as u64;
-        total_sent += bytes_read as u64;
-    }
-    
-    // Flush and close
-    stream.flush()?;
-    
-    Ok(total_sent)
+    Ok(())
 }
 
-/// Receiver thread: accepts connection and writes to file
-pub fn receiver_thread(
-    listener: TcpListener,
-    output_dir: &Path,
-    buffer_size: usize,
-) -> Result<(String, u64), TransferError> {
-    // Accept connection
-    let (mut stream, addr) = listener.accept()?;
-    tracing::info!("Accepted connection from {} on thread", addr);
-    
-    // Configure TCP
+/// Configure TCP for throughput (receiver)
+fn configure_tcp_for_throughput_recv(stream: &TcpStream) -> Result<(), TransferError> {
     stream.set_nodelay(true)?;
     #[cfg(target_os = "linux")]
     {
-        use std::os::unix::io::AsRawFd;
         let fd = stream.as_raw_fd();
         let buf_size: libc::c_int = 25 * 1024 * 1024; // 25MB
         unsafe {
@@ -249,38 +142,120 @@ pub fn receiver_thread(
             );
         }
     }
+    Ok(())
+}
+
+/// Sender thread: reads file region and sends over socket
+/// Only thread 0 sends metadata, all threads send their range header
+pub fn sender_thread(
+    file_path: &Path,
+    range: FileRange,
+    server_addr: &str,
+    port: u16,
+    buffer_size: usize,
+    thread_id: usize,
+    metadata: Option<FileMetadata>,
+) -> Result<u64, TransferError> {
+    // Open file
+    let mut file = File::open(file_path)?;
     
-    // Read handshake: [filename][file_size]
-    let handshake = Handshake::decode(&mut stream)?;
-    let output_path = output_dir.join(&handshake.filename);
+    // Connect to server
+    let addr = format!("{}:{}", server_addr, port);
+    let mut stream = TcpStream::connect(&addr)?;
     
-    tracing::info!(
-        "Receiving file: {} ({} bytes) -> {}",
-        handshake.filename,
-        handshake.file_size,
-        output_path.display()
-    );
+    // Configure TCP for throughput
+    configure_tcp_for_throughput(&stream)?;
     
-    // Create output file
-    let mut file = File::create(&output_path)?;
-    file.set_len(handshake.file_size)?;
-    #[cfg(target_os = "linux")]
-    use std::os::unix::io::AsRawFd;
-    #[cfg(target_os = "linux")]
-    let file_fd = file.as_raw_fd();
+    // Only thread 0 sends file metadata
+    if let Some(meta) = metadata {
+        let mut header = Vec::with_capacity(64);
+        encode_varint(meta.filename.len() as u64, &mut header);
+        header.extend_from_slice(meta.filename.as_bytes());
+        encode_varint(meta.file_size, &mut header);
+        encode_varint(meta.num_threads as u64, &mut header);
+        stream.write_all(&header)?;
+    }
     
-    // Read range header
+    // All threads send: [thread_id: u8][start: varint][end: varint]
+    let mut range_header = Vec::with_capacity(32);
+    range_header.push(thread_id as u8);
+    encode_varint(range.start, &mut range_header);
+    encode_varint(range.end, &mut range_header);
+    stream.write_all(&range_header)?;
+    
+    // Allocate buffer
+    let mut buffer = vec![0u8; buffer_size];
+    let mut offset = range.start;
+    let mut total_sent = 0u64;
+    
+    // Transfer loop: pread → write (blocking, no async, no checksums, no headers)
+    while offset < range.end {
+        let remaining = (range.end - offset) as usize;
+        let read_size = std::cmp::min(buffer_size, remaining);
+        
+        // Use pread for thread-safe reads at specific offset
+        #[cfg(target_os = "linux")]
+        let bytes_read = {
+            let fd = file.as_raw_fd();
+            unsafe {
+                libc::pread(
+                    fd,
+                    buffer.as_mut_ptr() as *mut libc::c_void,
+                    read_size,
+                    offset as libc::off_t,
+                )
+            }
+        };
+        #[cfg(not(target_os = "linux"))]
+        let bytes_read = {
+            // Fallback: seek + read (not thread-safe, but works on non-Linux)
+            file.seek(std::io::SeekFrom::Start(offset))?;
+            file.read(&mut buffer[..read_size])? as i64
+        };
+        
+        if bytes_read <= 0 {
+            break;
+        }
+        
+        // Write raw data - NO headers, NO checksums, just pure data
+        stream.write_all(&buffer[..bytes_read as usize])?;
+        
+        offset += bytes_read as u64;
+        total_sent += bytes_read as u64;
+    }
+    
+    // Flush and close
+    stream.flush()?;
+    
+    Ok(total_sent)
+}
+
+/// Receiver worker thread: receives data and writes to file at offset
+fn receiver_worker(
+    mut stream: TcpStream,
+    file: Arc<File>,
+    buffer_size: usize,
+) -> Result<u64, TransferError> {
+    configure_tcp_for_throughput_recv(&stream)?;
+    
+    // Read thread's range header: [thread_id: u8][start: varint][end: varint]
+    let mut thread_id_buf = [0u8; 1];
+    stream.read_exact(&mut thread_id_buf)?;
+    let _thread_id = thread_id_buf[0];
     let start_offset = decode_varint(&mut stream)?;
     let end_offset = decode_varint(&mut stream)?;
     
-    tracing::debug!("Thread received range: {} - {}", start_offset, end_offset);
+    tracing::debug!("Thread {} received range: {} - {}", _thread_id, start_offset, end_offset);
     
     // Allocate buffer
     let mut buffer = vec![0u8; buffer_size];
     let mut offset = start_offset;
     let mut total_received = 0u64;
     
-    // Transfer loop: read → pwrite (blocking, no async)
+    #[cfg(target_os = "linux")]
+    let file_fd = file.as_raw_fd();
+    
+    // Transfer loop: read → pwrite (blocking, no async, no checksums)
     while offset < end_offset {
         let remaining = (end_offset - offset) as usize;
         let read_size = std::cmp::min(buffer_size, remaining);
@@ -305,8 +280,9 @@ pub fn receiver_thread(
         #[cfg(not(target_os = "linux"))]
         let bytes_written = {
             // Fallback: seek + write (not thread-safe, but works on non-Linux)
-            file.seek(std::io::SeekFrom::Start(offset))?;
-            file.write(&buffer[..bytes_read])? as i64
+            let mut file_mut = File::try_clone(&*file)?;
+            file_mut.seek(std::io::SeekFrom::Start(offset))?;
+            file_mut.write(&buffer[..bytes_read])? as i64
         };
         
         if bytes_written < 0 {
@@ -324,13 +300,104 @@ pub fn receiver_thread(
         total_received += bytes_written as u64;
     }
     
+    Ok(total_received)
+}
+
+/// Receiver coordinator - creates file, spawns worker threads
+pub fn blocking_server_receive(
+    output_dir: &Path,
+    config: BlockingTransferConfig,
+) -> Result<(String, u64), TransferError> {
+    // Phase 1: Accept connection on base port to get metadata (thread 0)
+    let meta_addr = format!("0.0.0.0:{}", config.base_port);
+    let meta_listener = TcpListener::bind(&meta_addr)?;
+    meta_listener.set_nonblocking(false)?;
+    
+    tracing::info!("Waiting for metadata connection on port {}", config.base_port);
+    let (mut meta_stream, _) = meta_listener.accept()?;
+    tracing::info!("Metadata connection accepted");
+    
+    // Read file metadata (only from thread 0)
+    let filename_len = decode_varint(&mut meta_stream)? as usize;
+    let mut filename_bytes = vec![0u8; filename_len];
+    meta_stream.read_exact(&mut filename_bytes)?;
+    let filename = String::from_utf8(filename_bytes)
+        .map_err(|e| TransferError::ProtocolError(format!("Invalid filename: {}", e)))?;
+    let file_size = decode_varint(&mut meta_stream)?;
+    let num_threads = decode_varint(&mut meta_stream)? as usize;
+    
+    tracing::info!(
+        "Receiving file: {} ({} bytes) with {} threads",
+        filename,
+        file_size,
+        num_threads
+    );
+    
+    // Create and pre-allocate output file ONCE
+    let output_path = output_dir.join(&filename);
+    let file = File::create(&output_path)?;
+    file.set_len(file_size)?;
+    let file = Arc::new(file); // Share file handle across threads
+    
+    // Phase 2: Spawn receiver worker for thread 0 (already has connection)
+    let file_clone = Arc::clone(&file);
+    let buffer_size = config.buffer_size;
+    let handle0 = thread::spawn(move || {
+        receiver_worker(meta_stream, file_clone, buffer_size)
+    });
+    
+    // Accept remaining connections and spawn workers
+    let mut handles = Vec::with_capacity(num_threads);
+    handles.push(handle0);
+    
+    for i in 1..num_threads {
+        let port = config.base_port + i as u16;
+        let addr = format!("0.0.0.0:{}", port);
+        let listener = TcpListener::bind(&addr)?;
+        listener.set_nonblocking(false)?;
+        
+        tracing::info!("Waiting for connection on port {}", port);
+        let (stream, _) = listener.accept()?;
+        tracing::info!("Connection accepted on port {}", port);
+        
+        let file_clone = Arc::clone(&file);
+        let buffer_size = config.buffer_size;
+        
+        let handle = thread::spawn(move || {
+            receiver_worker(stream, file_clone, buffer_size)
+        });
+        handles.push(handle);
+    }
+    
+    // Wait for all threads
+    let mut total_received = 0u64;
+    for (thread_id, handle) in handles.into_iter().enumerate() {
+        match handle.join() {
+            Ok(Ok(bytes)) => {
+                total_received += bytes;
+                tracing::info!("Thread {} received {} bytes", thread_id, bytes);
+            }
+            Ok(Err(e)) => {
+                tracing::error!("Thread {} failed: {}", thread_id, e);
+                return Err(e);
+            }
+            Err(_) => {
+                return Err(TransferError::NetworkError(format!(
+                    "Thread {} panicked",
+                    thread_id
+                )));
+            }
+        }
+    }
+    
     // Sync file
     file.sync_all()?;
     
-    Ok((handshake.filename, total_received))
+    tracing::info!("Server transfer complete: {} bytes received", total_received);
+    Ok((filename, total_received))
 }
 
-/// Blocking client transfer (WDT-style) - Main entry point
+/// Blocking client transfer - Main entry point
 pub fn blocking_client_transfer(
     file_path: &Path,
     server_addr: &str,
@@ -358,15 +425,27 @@ pub fn blocking_client_transfer(
     let start_time = Instant::now();
     let file_path = Arc::new(file_path.to_path_buf());
     let server_addr = Arc::new(server_addr.to_string());
-    let filename = Arc::new(filename);
+    
+    // Create metadata (only for thread 0)
+    let metadata = FileMetadata {
+        filename: filename.clone(),
+        file_size,
+        num_threads: config.num_threads,
+    };
     
     // Spawn sender threads
     let mut handles = Vec::new();
     for (thread_id, range) in ranges.into_iter().enumerate() {
         let file_path = Arc::clone(&file_path);
         let server_addr = Arc::clone(&server_addr);
-        let filename = Arc::clone(&filename);
         let port = config.base_port + thread_id as u16;
+        
+        // Only thread 0 gets metadata
+        let metadata = if thread_id == 0 {
+            Some(metadata.clone())
+        } else {
+            None
+        };
         
         let handle = thread::spawn(move || {
             sender_thread(
@@ -375,8 +454,8 @@ pub fn blocking_client_transfer(
                 &server_addr,
                 port,
                 config.buffer_size,
-                filename.to_string(),
-                file_size,
+                thread_id,
+                metadata,
             )
         });
         handles.push(handle);
@@ -418,63 +497,6 @@ pub fn blocking_client_transfer(
     Ok(())
 }
 
-/// Blocking server transfer (WDT-style)
-/// Accepts connections and writes to output directory
-/// Returns when all threads complete (single file transfer)
-pub fn blocking_server_transfer(
-    output_dir: &Path,
-    config: BlockingTransferConfig,
-) -> Result<Vec<(String, u64)>, TransferError> {
-    // Create listeners for each port
-    let mut listeners = Vec::new();
-    for i in 0..config.num_threads {
-        let port = config.base_port + i as u16;
-        let addr = format!("0.0.0.0:{}", port);
-        let listener = TcpListener::bind(&addr)?;
-        listener.set_nonblocking(false)?; // Blocking mode
-        listeners.push((port, listener));
-        tracing::info!("Listening on port {} for blocking transfer", port);
-    }
-    
-    // Accept one connection per port (each thread handles one file range)
-    let mut handles = Vec::new();
-    for (_port, listener) in listeners {
-        let output_dir = output_dir.to_path_buf();
-        let buffer_size = config.buffer_size;
-        
-        let handle = thread::spawn(move || {
-            receiver_thread(listener, &output_dir, buffer_size)
-        });
-        handles.push(handle);
-    }
-    
-    // Wait for all threads
-    let mut results = Vec::new();
-    let mut total_received = 0u64;
-    for (thread_id, handle) in handles.into_iter().enumerate() {
-        match handle.join() {
-            Ok(Ok((filename, bytes))) => {
-                total_received += bytes;
-                results.push((filename, bytes));
-                tracing::info!("Thread {} received {} bytes", thread_id, bytes);
-            }
-            Ok(Err(e)) => {
-                tracing::error!("Thread {} failed: {}", thread_id, e);
-                return Err(e);
-            }
-            Err(_) => {
-                return Err(TransferError::NetworkError(format!(
-                    "Thread {} panicked",
-                    thread_id
-                )));
-            }
-        }
-    }
-    
-    tracing::info!("Server transfer complete: {} bytes received", total_received);
-    Ok(results)
-}
-
 /// Blocking server loop - accepts multiple transfers
 pub fn blocking_server_loop(
     output_dir: &Path,
@@ -482,9 +504,9 @@ pub fn blocking_server_loop(
 ) -> Result<(), TransferError> {
     loop {
         tracing::info!("Waiting for new transfer...");
-        match blocking_server_transfer(output_dir, config.clone()) {
-            Ok(results) => {
-                tracing::info!("Transfer completed: {:?}", results);
+        match blocking_server_receive(output_dir, config.clone()) {
+            Ok((filename, bytes)) => {
+                tracing::info!("Transfer completed: {} ({} bytes)", filename, bytes);
             }
             Err(e) => {
                 tracing::error!("Transfer failed: {}", e);
@@ -526,4 +548,3 @@ mod tests {
         assert_eq!(ranges[2].end, 1000);
     }
 }
-

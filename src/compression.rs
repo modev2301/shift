@@ -47,6 +47,7 @@ impl FileChunk {
     /// Quick entropy check - returns true if data appears compressible.
     ///
     /// Fast rejection of uncompressible data to avoid CPU waste.
+    #[allow(dead_code)]
     fn is_compressible(&self) -> bool {
         if self.data.len() < 4096 {
             return false; // Too small to compress efficiently

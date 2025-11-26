@@ -1,8 +1,6 @@
 use clap::{Parser, Subcommand};
-use indicatif::MultiProgress;
 use shift::{Config, PerformanceBenchmark};
 use std::path::PathBuf;
-use std::sync::Arc;
 use tracing::info;
 
 #[derive(Parser)]
@@ -118,17 +116,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Commands::Server => {
                 let config = Config::load_or_create(&cli.config)?;
                 
-                // Use blocking server (WDT-style)
+                // Use blocking server
                 use shift::blocking_transfer::{blocking_server_loop, BlockingTransferConfig};
                 
                 let transfer_config = BlockingTransferConfig {
                     num_threads: config.server.max_clients,
                     base_port: config.server.port,
                     buffer_size: config.server.buffer_size.unwrap_or(8 * 1024 * 1024),
-                    enable_compression: false, // Compression handled separately if needed
+                    enable_compression: false,
                 };
                 
-                println!("Shift Transfer Server (Blocking Mode)");
+                println!("Shift Transfer Server");
                 println!("Listening on ports: {} to {}", 
                     transfer_config.base_port, 
                     transfer_config.base_port + transfer_config.num_threads as u16 - 1);
@@ -174,7 +172,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     
     let config = Config::load_or_create(&cli.config)?;
-    let multi_progress = MultiProgress::new();
     
     if source_is_remote {
         // Pull mode: shift user@host:/file.txt ./
@@ -182,7 +179,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("Pull mode supports only one source file at a time".into());
         }
         let remote = RemotePath::parse(&sources[0])?;
-        let local_dest = PathBuf::from(&dest);
         
         info!("Pulling {} from {}:{}", remote.path.display(), remote.host, remote.port.unwrap_or(443));
         
