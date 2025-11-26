@@ -502,6 +502,9 @@ pub fn blocking_server_loop(
     output_dir: &Path,
     config: BlockingTransferConfig,
 ) -> Result<(), TransferError> {
+    // Create output directory if it doesn't exist
+    std::fs::create_dir_all(output_dir)?;
+    
     loop {
         tracing::info!("Waiting for new transfer...");
         match blocking_server_receive(output_dir, config.clone()) {
