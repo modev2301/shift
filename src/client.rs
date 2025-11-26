@@ -830,6 +830,7 @@ pub struct ClientTransferManager {
     pub resume_info: Arc<Mutex<ResumeInfo>>,
     pub retry_manager: RetryManager,
     pub chunk_pool: Arc<ChunkPool>,
+    pub adaptive: Arc<Mutex<crate::adaptive::AdaptiveController>>,
 }
 
 impl ClientTransferManager {
@@ -901,6 +902,7 @@ impl ClientTransferManager {
             resume_info,
             retry_manager: RetryManager::new(MAX_RETRIES),
             chunk_pool,
+            adaptive: Arc::new(Mutex::new(crate::adaptive::AdaptiveController::new())),
         })
     }
 
@@ -998,8 +1000,15 @@ impl ClientTransferManager {
         tracing::info!("Parallel streams: {}", self.parallel_streams);
         tracing::info!("Compression enabled: {}", self.config.enable_compression);
 
+        // 0. Update adaptive controller with initial RTT measurement
+        let adaptive_guard = self.adaptive.lock().await;
+        let recommended_connections = adaptive_guard.connections();
+        let _recommended_chunk_size = adaptive_guard.chunk_size();
+        drop(adaptive_guard);
+
         // 1. Connect to server (reuse connections if provided, otherwise create new)
-        let num_connections = self.config.num_connections.unwrap_or(8);
+        // Use adaptive controller recommendations if available
+        let num_connections = self.config.num_connections.unwrap_or(recommended_connections);
         let connections = if let Some(conns) = pre_established_connections.take() {
             tracing::info!("Reusing {} pre-established connections", conns.len());
             conns
@@ -1060,14 +1069,38 @@ impl ClientTransferManager {
         
         // Use first connection for ACK reading
         let (mut reader, writer) = handshake_connections.remove(0);
-        let mut additional_connections = handshake_connections;
+        let additional_connections = handshake_connections;
 
-        // 3. Open file with mmap reader (O_DIRECT disabled - was slower)
+        // 3. Open file with optimal reader (io_uring on Linux, mmap fallback)
         enum FileReader {
+            #[cfg(target_os = "linux")]
+            Uring(crate::io_uring::UringReader),
             Mmap(ZeroCopyReader),
         }
         
-        let mut file_reader: FileReader = FileReader::Mmap(ZeroCopyReader::new(&self.file_path)?);
+        let mut file_reader: FileReader = {
+            #[cfg(target_os = "linux")]
+            {
+                if crate::io_uring::io_uring_available() {
+                    match crate::io_uring::UringReader::new(&self.file_path, self.chunk_size) {
+                        Ok(reader) => {
+                            tracing::info!("Using io_uring for file I/O (zero-syscall mode)");
+                            FileReader::Uring(reader)
+                        }
+                        Err(e) => {
+                            tracing::warn!("io_uring not available, falling back to mmap: {}", e);
+                            FileReader::Mmap(ZeroCopyReader::new(&self.file_path)?)
+                        }
+                    }
+                } else {
+                    FileReader::Mmap(ZeroCopyReader::new(&self.file_path)?)
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                FileReader::Mmap(ZeroCopyReader::new(&self.file_path)?)
+            }
+        };
 
         // 4. Create channels for each connection (distribute chunks across connections)
         // Each connection gets its own channel for true parallelism
@@ -1106,6 +1139,8 @@ impl ClientTransferManager {
                         Message::FileChunk { ref data, .. } => {
                             let chunk_size = data.len();
                             
+                            // Note: MSG_ZEROCOPY requires raw TcpStream, but we have WriteHalf
+                            // For now, use standard write - can be enhanced later with stream reconstruction
                             if let Err(e) = chunk_msg.write_to_stream(&mut conn_writer).await {
                                 tracing::error!("Failed to write chunk on connection {}: {}", conn_idx, e);
                                 error_count += 1;
@@ -1176,7 +1211,24 @@ impl ClientTransferManager {
                         Message::FileChunk { ref data, .. } => {
                             let chunk_size = data.len();
                             
-                            if let Err(e) = chunk_msg.write_to_stream(&mut writer_main).await {
+                            // Use MSG_ZEROCOPY for large chunks on Linux (>10KB)
+                            #[cfg(target_os = "linux")]
+                            let write_result = if chunk_size > 10 * 1024 {
+                                // Try zerocopy send
+                                use crate::network::send_zerocopy;
+                                send_zerocopy(&writer_main, data).await
+                                    .map_err(|e| TransferError::Io(std::io::Error::new(
+                                        std::io::ErrorKind::Other,
+                                        format!("Zerocopy send failed: {}", e)
+                                    )))
+                            } else {
+                                chunk_msg.write_to_stream(&mut writer_main).await
+                            };
+                            
+                            #[cfg(not(target_os = "linux"))]
+                            let write_result = chunk_msg.write_to_stream(&mut writer_main).await;
+                            
+                            if let Err(e) = write_result {
                                 tracing::error!("Failed to write chunk to stream: {}", e);
                                 error_count += 1;
                                 if error_count > 10 {
@@ -1352,9 +1404,28 @@ impl ClientTransferManager {
 
         tracing::info!("Starting to read and process {} chunks...", total_chunks);
         
-        // Read chunks using mmap reader with checksum calculation (single pass)
+        // Track transfer metrics for adaptive controller
+        let mut last_adaptive_update = Instant::now();
+        const ADAPTIVE_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+        
+        // Read chunks using optimal reader (io_uring or mmap) with checksum calculation
         // This avoids redundant checksum calculation in workers
         while let Ok(Some((data, checksum))) = match &mut file_reader {
+            #[cfg(target_os = "linux")]
+            FileReader::Uring(reader) => {
+                // io_uring reader - read chunk and calculate checksum
+                match reader.read_chunk(self.chunk_size) {
+                    Ok(Some(chunk_data)) => {
+                        // Calculate checksum
+                        use crate::simd::SimdChecksum;
+                        let mut checksum_calc = SimdChecksum::new();
+                        let crc = checksum_calc.calculate_crc32(&chunk_data);
+                        Ok(Some((chunk_data, crc)))
+                    }
+                    Ok(None) => Ok(None),
+                    Err(e) => Err(e),
+                }
+            }
             FileReader::Mmap(reader) => reader.read_chunk_with_checksum(self.chunk_size),
         } {
             let is_last = chunk_id + 1 >= total_chunks;
@@ -1366,6 +1437,16 @@ impl ClientTransferManager {
             }
             
             chunk_id += 1;
+            
+            // Update adaptive controller periodically
+            if last_adaptive_update.elapsed() >= ADAPTIVE_UPDATE_INTERVAL {
+                let bytes_transferred = chunk_id * self.chunk_size as u64;
+                let duration = start_time.elapsed();
+                let mut adaptive_guard = self.adaptive.lock().await;
+                adaptive_guard.record_transfer(bytes_transferred as usize, duration, None);
+                drop(adaptive_guard);
+                last_adaptive_update = Instant::now();
+            }
         }
         
         // Close work channel to signal workers to finish

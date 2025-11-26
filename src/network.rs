@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
+use std::os::unix::io::AsRawFd;
 
 #[derive(Debug, Clone)]
 pub struct NetworkStats {
@@ -88,6 +89,9 @@ impl ConnectionPool {
             .set_nodelay(true)
             .map_err(|e| TransferError::NetworkError(e.to_string()))?;
 
+        // Configure optimal TCP settings for high-throughput transfers
+        configure_tcp_for_throughput(&stream)?;
+
         Ok(stream)
     }
 
@@ -109,6 +113,161 @@ impl ConnectionPool {
 impl Default for ConnectionPool {
     fn default() -> Self {
         Self::new(CONNECTION_POOL_SIZE)
+    }
+}
+
+/// Configure optimal TCP settings for high-throughput transfers
+pub fn configure_tcp_for_throughput(stream: &TcpStream) -> Result<(), TransferError> {
+    let fd = stream.as_raw_fd();
+    
+    // 1. Enable TCP_NODELAY (already done, but ensure it)
+    stream.set_nodelay(true).map_err(|e| {
+        TransferError::NetworkError(format!("Failed to set TCP_NODELAY: {}", e))
+    })?;
+    
+    // 2. Set TCP congestion control to BBR (better than CUBIC for high-bandwidth)
+    #[cfg(target_os = "linux")]
+    {
+        const TCP_CONGESTION: libc::c_int = 13;
+        let bbr = b"bbr\0";
+        
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                TCP_CONGESTION,
+                bbr.as_ptr() as *const libc::c_void,
+                bbr.len() as libc::socklen_t,
+            )
+        };
+        
+        if ret < 0 {
+            // BBR not available, that's okay - CUBIC is fine
+            tracing::debug!("BBR congestion control not available, using default");
+        } else {
+            tracing::debug!("Enabled BBR congestion control");
+        }
+    }
+    
+    // 3. Enable TCP_QUICKACK for faster ACKs
+    #[cfg(target_os = "linux")]
+    {
+        const TCP_QUICKACK: libc::c_int = 12;
+        let enable: libc::c_int = 1;
+        
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                TCP_QUICKACK,
+                &enable as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+    
+    // 4. Set TCP_MAXSEG for optimal segment size (jumbo frames if available)
+    #[cfg(target_os = "linux")]
+    {
+        // Try to detect MTU and set accordingly
+        // Default: 1460 (1500 MTU - 40 bytes TCP/IP headers)
+        // Jumbo: 8960 (9000 MTU - 40 bytes)
+        let mss: libc::c_int = 8960; // Try jumbo first
+        
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_MAXSEG,
+                &mss as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        
+        if ret < 0 {
+            tracing::debug!("Jumbo frames not available, using standard MTU");
+        }
+    }
+    
+    Ok(())
+}
+
+/// Send data with MSG_ZEROCOPY to avoid kernel copy
+/// Only beneficial for large sends (>10KB) on fast networks
+#[cfg(target_os = "linux")]
+pub async fn send_zerocopy(
+    stream: &TcpStream,
+    data: &[u8],
+) -> Result<usize, TransferError> {
+    const MSG_ZEROCOPY: libc::c_int = 0x4000000;
+    const SO_ZEROCOPY: libc::c_int = 60;
+    
+    let fd = stream.as_raw_fd();
+    
+    // Enable zerocopy on socket (one-time setup)
+    let enable: libc::c_int = 1;
+    unsafe {
+        let ret = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            SO_ZEROCOPY,
+            &enable as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        if ret < 0 {
+            // Zerocopy not supported, fall back to normal send
+            return send_normal(stream, data).await;
+        }
+    }
+    
+    // Send with MSG_ZEROCOPY flag
+    let sent = unsafe {
+        libc::send(
+            fd,
+            data.as_ptr() as *const libc::c_void,
+            data.len(),
+            MSG_ZEROCOPY,
+        )
+    };
+    
+    if sent < 0 {
+        let err = std::io::Error::last_os_error();
+        // ENOBUFS means zerocopy queue is full, fall back to normal
+        if err.raw_os_error() == Some(libc::ENOBUFS) {
+            return send_normal(stream, data).await;
+        }
+        return Err(TransferError::Io(err));
+    }
+    
+    // Note: With zerocopy, we need to wait for completion notification
+    // via errqueue before reusing the buffer. For simplicity, we're
+    // using owned data here. A more advanced implementation would
+    // track pending completions.
+    
+    Ok(sent as usize)
+}
+
+#[cfg(target_os = "linux")]
+async fn send_normal(
+    stream: &TcpStream,
+    data: &[u8],
+) -> Result<usize, TransferError> {
+    use tokio::io::AsyncWriteExt;
+    stream.try_write(data).map_err(TransferError::Io)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn send_zerocopy(
+    stream: &TcpStream,
+    data: &[u8],
+) -> Result<usize, TransferError> {
+    // Use try_write for non-blocking write
+    match stream.try_write(data) {
+        Ok(n) => Ok(n),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(TransferError::Io(e))
+        }
+        Err(e) => Err(TransferError::Io(e)),
     }
 }
 

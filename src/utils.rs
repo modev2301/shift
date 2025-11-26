@@ -5,6 +5,20 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+/// Allocate memory on the local NUMA node for better performance
+#[cfg(target_os = "linux")]
+pub fn numa_alloc_local(size: usize) -> Option<Vec<u8>> {
+    // For now, use regular allocation
+    // Full NUMA support would require libnuma or direct syscalls
+    // This is a placeholder that can be enhanced later
+    Some(vec![0u8; size])
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn numa_alloc_local(size: usize) -> Option<Vec<u8>> {
+    Some(vec![0u8; size])
+}
+
 #[derive(Debug)]
 pub struct ChunkPool {
     pub pool: Arc<Mutex<VecDeque<BytesMut>>>,

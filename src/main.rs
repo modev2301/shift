@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use indicatif::MultiProgress;
-use shift::{ClientTransferManager, Config, PerformanceBenchmark, TransferServer};
+use shift::{Config, PerformanceBenchmark};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
@@ -102,8 +102,7 @@ fn is_remote_path(s: &str) -> bool {
     s.contains(':') && (s.contains('@') || s.matches(':').count() >= 2)
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing with info level by default, but allow RUST_LOG env var to override
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
@@ -118,22 +117,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match command {
             Commands::Server => {
                 let config = Config::load_or_create(&cli.config)?;
-                let addr = format!("{}:{}", config.server.address, config.server.port);
                 
-                println!("Shift Transfer Server");
-                println!("Listening on: {}", addr);
+                // Use blocking server (WDT-style)
+                use shift::blocking_transfer::{blocking_server_loop, BlockingTransferConfig};
+                
+                let transfer_config = BlockingTransferConfig {
+                    num_threads: config.server.max_clients,
+                    base_port: config.server.port,
+                    buffer_size: config.server.buffer_size.unwrap_or(8 * 1024 * 1024),
+                    enable_compression: false, // Compression handled separately if needed
+                };
+                
+                println!("Shift Transfer Server (Blocking Mode)");
+                println!("Listening on ports: {} to {}", 
+                    transfer_config.base_port, 
+                    transfer_config.base_port + transfer_config.num_threads as u16 - 1);
                 println!("Output directory: {}", config.server.output_directory);
                 println!("Config file: {:?}", cli.config);
                 println!("Server is running. Press Ctrl+C to stop.");
                 println!();
                 
-                let server = TransferServer::new(Arc::new(config.server));
-                server.run().await?;
+                // Run blocking server loop (synchronous)
+                let output_dir = PathBuf::from(&config.server.output_directory);
+                blocking_server_loop(&output_dir, transfer_config)?;
                 return Ok(());
             }
             Commands::Benchmark { output_dir } => {
                 info!("Running performance benchmarks");
-                run_benchmarks(&output_dir).await?;
+                // Benchmark requires async runtime
+                let rt = tokio::runtime::Runtime::new()?;
+                rt.block_on(run_benchmarks(&output_dir))?;
                 return Ok(());
             }
         }
@@ -230,66 +243,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         info!("Transferring {} files", files_to_transfer.len());
         
-        // Transfer files in parallel for maximum throughput
-        // Use a semaphore to limit concurrent transfers (default: 4 concurrent files)
-        // Each file gets its own connections for true parallelism
-        let max_concurrent_transfers = 4;
-        let transfer_semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_transfers));
-        let mut transfer_handles = Vec::new();
+        // Use blocking transfer (WDT-style) for maximum throughput
+        use shift::blocking_transfer::{blocking_client_transfer, BlockingTransferConfig};
+        
+        // Sort files by size (largest first) for better parallelism utilization
+        files_to_transfer.sort_by(|a, b| {
+            let size_a = std::fs::metadata(a).ok().map(|m| m.len()).unwrap_or(0);
+            let size_b = std::fs::metadata(b).ok().map(|m| m.len()).unwrap_or(0);
+            size_b.cmp(&size_a) // Descending order
+        });
         
         for (idx, local_file) in files_to_transfer.iter().enumerate() {
-            let file_path = local_file.clone();
-            let client_config = Arc::new(config.client.clone());
-            let progress = multi_progress.clone();
-            let sem = Arc::clone(&transfer_semaphore);
-            let remote_host = remote.host.clone();
-            let remote_port = remote.port.unwrap_or(443);
             let file_idx = idx + 1;
             let total_files = files_to_transfer.len();
             
-            let handle = tokio::spawn(async move {
-                // Acquire permit for concurrent transfer
-                let _permit = sem.acquire().await.unwrap();
-                
-                info!("[{}/{}] Transferring {} -> {}:{}", 
-                    file_idx, total_files, 
-                    file_path.display(), remote_host, remote_port);
-                
-                let mut client_manager = ClientTransferManager::new(
-                    file_path,
-                    client_config,
-                    progress,
-                ).await?;
-                
-                // Each file gets its own connections for true parallelism
-                client_manager.run_transfer().await
-            });
+            info!("[{}/{}] Starting transfer: {}", file_idx, total_files, local_file.display());
             
-            transfer_handles.push(handle);
-        }
-        
-        // Wait for all transfers to complete
-        let mut successful = 0;
-        let mut failed = 0;
-        for handle in transfer_handles {
-            match handle.await {
-                Ok(Ok(())) => successful += 1,
-                Ok(Err(e)) => {
-                    failed += 1;
-                    eprintln!("Transfer failed: {}", e);
+            // Create blocking transfer config
+            let transfer_config = BlockingTransferConfig {
+                num_threads: config.client.parallel_streams.unwrap_or(8),
+                base_port: remote.port.unwrap_or(8080),
+                buffer_size: config.client.buffer_size.unwrap_or(8 * 1024 * 1024),
+                enable_compression: config.client.enable_compression,
+            };
+            
+            let server_addr = format!("{}", remote.host);
+            
+            // Run blocking transfer (synchronous, no async overhead)
+            match blocking_client_transfer(local_file, &server_addr, transfer_config) {
+                Ok(_) => {
+                    info!("[{}/{}] Transfer complete: {}", file_idx, total_files, local_file.display());
                 }
                 Err(e) => {
-                    failed += 1;
-                    eprintln!("Transfer task panicked: {:?}", e);
+                    eprintln!("[{}/{}] Transfer failed: {} - {}", file_idx, total_files, local_file.display(), e);
                 }
             }
         }
         
-        if failed > 0 {
-            return Err(format!("{} transfers failed out of {}", failed, files_to_transfer.len()).into());
-        }
-        
-        info!("All {} files transferred successfully", files_to_transfer.len());
+        info!("All transfers completed");
     } else {
         return Err("At least one path must be remote (user@host:/path)".into());
     }
@@ -316,3 +307,5 @@ async fn run_benchmarks(output_dir: &PathBuf) -> Result<(), Box<dyn std::error::
     
     Ok(())
 }
+
+

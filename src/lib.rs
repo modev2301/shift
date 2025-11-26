@@ -24,11 +24,15 @@
 //! # }
 //! ```
 
+pub mod adaptive;
 pub mod benchmark;
+pub mod blocking_transfer;
 pub mod client;
 pub mod compression;
 pub mod config;
 pub mod error;
+#[cfg(target_os = "linux")]
+pub mod io_uring;
 pub mod network;
 pub mod server;
 pub mod simd;

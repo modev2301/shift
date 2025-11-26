@@ -4,6 +4,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+// Parallel compression functions use rayon
 
 #[derive(Debug, Clone)]
 pub struct FileChunk {
@@ -249,4 +250,50 @@ impl From<SerializableResumeInfo> for ResumeInfo {
             timestamp: info.timestamp,
         }
     }
+}
+
+/// Compress multiple chunks in parallel using work-stealing
+pub fn compress_chunks_parallel(
+    chunks: Vec<(u64, Bytes)>,
+    _level: i32,
+) -> Vec<(u64, Bytes, u32, bool)> {
+    use rayon::prelude::*;
+    chunks.into_par_iter()
+        .map(|(chunk_id, data)| {
+            let original_size = data.len();
+            
+            // Try compression using SIMD-optimized LZ4
+            match SimdProcessor::compress_lz4_simd(&data) {
+                Ok(compressed) if compressed.len() < (original_size * 95 / 100) => {
+                    // Compression worthwhile (>5% reduction)
+                    let mut checksum = SimdChecksum::new();
+                    let crc = checksum.calculate_crc32(&compressed);
+                    (chunk_id, Bytes::from(compressed), crc, true)
+                }
+                _ => {
+                    // Keep uncompressed
+                    let mut checksum = SimdChecksum::new();
+                    let crc = checksum.calculate_crc32(&data);
+                    (chunk_id, data, crc, false)
+                }
+            }
+        })
+        .collect()
+}
+
+/// Decompress multiple chunks in parallel
+pub fn decompress_chunks_parallel(
+    chunks: Vec<(u64, Bytes, usize, bool)>, // (id, data, original_size, is_compressed)
+) -> Result<Vec<(u64, Bytes)>, String> {
+    use rayon::prelude::*;
+    chunks.into_par_iter()
+        .map(|(chunk_id, data, original_size, is_compressed)| {
+            if is_compressed {
+                let decompressed = SimdProcessor::decompress_lz4_simd(&data, original_size)?;
+                Ok((chunk_id, Bytes::from(decompressed)))
+            } else {
+                Ok((chunk_id, data))
+            }
+        })
+        .collect()
 }
