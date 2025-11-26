@@ -269,13 +269,19 @@ fn receiver_worker(
         
         // Use pwrite for thread-safe writes at specific offset
         #[cfg(target_os = "linux")]
-        let bytes_written = unsafe {
-            libc::pwrite(
-                file_fd,
-                buffer.as_ptr() as *const libc::c_void,
-                bytes_read,
-                offset as libc::off_t,
-            )
+        let bytes_written = {
+            let result = unsafe {
+                libc::pwrite(
+                    file_fd,
+                    buffer.as_ptr() as *const libc::c_void,
+                    bytes_read,
+                    offset as libc::off_t,
+                )
+            };
+            if result < 0 {
+                return Err(TransferError::Io(std::io::Error::last_os_error()));
+            }
+            result as usize
         };
         #[cfg(not(target_os = "linux"))]
         let bytes_written = {
@@ -339,7 +345,20 @@ pub fn blocking_server_receive(
     file.set_len(file_size)?;
     let file = Arc::new(file); // Share file handle across threads
     
-    // Phase 2: Spawn receiver worker for thread 0 (already has connection)
+    // Phase 2: Create ALL listeners upfront before accepting connections
+    // This ensures all ports are listening when client threads connect
+    // (Skip port 0 since we already accepted that connection)
+    let mut listeners = Vec::with_capacity(num_threads - 1);
+    for i in 1..num_threads {
+        let port = config.base_port + i as u16;
+        let addr = format!("0.0.0.0:{}", port);
+        let listener = TcpListener::bind(&addr)?;
+        listener.set_nonblocking(false)?;
+        tracing::info!("Listening on port {}", port);
+        listeners.push(listener);
+    }
+    
+    // Now spawn worker for thread 0 (already has connection)
     let file_clone = Arc::clone(&file);
     let buffer_size = config.buffer_size;
     let handle0 = thread::spawn(move || {
@@ -350,12 +369,8 @@ pub fn blocking_server_receive(
     let mut handles = Vec::with_capacity(num_threads);
     handles.push(handle0);
     
-    for i in 1..num_threads {
-        let port = config.base_port + i as u16;
-        let addr = format!("0.0.0.0:{}", port);
-        let listener = TcpListener::bind(&addr)?;
-        listener.set_nonblocking(false)?;
-        
+    for (i, listener) in listeners.into_iter().enumerate() {
+        let port = config.base_port + (i + 1) as u16;
         tracing::info!("Waiting for connection on port {}", port);
         let (stream, _) = listener.accept()?;
         tracing::info!("Connection accepted on port {}", port);
