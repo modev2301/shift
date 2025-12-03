@@ -8,7 +8,7 @@
 //! - Out-of-order packet handling
 
 use crate::error::TransferError;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{Read, Seek, Write};
 use std::net::{SocketAddr, UdpSocket};
@@ -21,9 +21,11 @@ use std::time::{Duration, Instant};
 
 const MAX_PACKET_SIZE: usize = 1400; // MTU-safe (1500 - IP/UDP headers)
 const DATA_PAYLOAD_SIZE: usize = MAX_PACKET_SIZE - 32; // Reserve space for header
-const WINDOW_SIZE: usize = 64; // Number of unacked packets
-const RETRANSMIT_TIMEOUT_MS: u64 = 100; // 100ms retransmit timeout
+const INITIAL_WINDOW_SIZE: usize = 64; // Initial window size
+const MIN_RTO_MS: u64 = 10; // Minimum RTO (10ms)
+const MAX_RTO_MS: u64 = 60000; // Maximum RTO (60s)
 const ACK_INTERVAL_MS: u64 = 10; // Send ACK every 10ms
+const INITIAL_RTT_MS: u64 = 100; // Initial RTT estimate
 
 // Packet types
 const PKT_DATA: u8 = 0x01;
@@ -185,7 +187,7 @@ pub fn split_file_ranges(file_size: u64, num_threads: usize) -> Vec<FileRange> {
 }
 
 /// Configure UDP socket for high performance
-fn configure_udp_socket(_socket: &UdpSocket) -> Result<(), TransferError> {
+fn configure_udp_socket(socket: &UdpSocket) -> Result<(), TransferError> {
     #[cfg(target_os = "linux")]
     {
         let fd = socket.as_raw_fd();
@@ -210,13 +212,137 @@ fn configure_udp_socket(_socket: &UdpSocket) -> Result<(), TransferError> {
     Ok(())
 }
 
-/// Reliable UDP sender with sliding window
+/// RTT estimator (RFC 6298)
+struct RttEstimator {
+    srtt: Duration,      // Smoothed RTT
+    rttvar: Duration,   // RTT variance
+    rto: Duration,      // Retransmit timeout
+}
+
+impl RttEstimator {
+    fn new() -> Self {
+        let initial_rtt = Duration::from_millis(INITIAL_RTT_MS);
+        Self {
+            srtt: initial_rtt,
+            rttvar: initial_rtt / 2,
+            rto: initial_rtt + initial_rtt, // srtt + 4*rttvar, but start with 2*srtt
+        }
+    }
+
+    fn update(&mut self, sample: Duration) {
+        if sample.is_zero() {
+            return;
+        }
+
+        // RFC 6298 algorithm
+        let alpha = 0.125; // 1/8
+        let beta = 0.25;   // 1/4
+
+        let err = if sample > self.srtt {
+            sample - self.srtt
+        } else {
+            self.srtt - sample
+        };
+
+        // Update RTT variance
+        self.rttvar = Duration::from_secs_f64(
+            (1.0 - beta) * self.rttvar.as_secs_f64() + beta * err.as_secs_f64()
+        );
+
+        // Update smoothed RTT
+        self.srtt = Duration::from_secs_f64(
+            (1.0 - alpha) * self.srtt.as_secs_f64() + alpha * sample.as_secs_f64()
+        );
+
+        // Calculate RTO
+        self.rto = self.srtt + 4 * self.rttvar;
+        self.rto = self.rto.max(Duration::from_millis(MIN_RTO_MS));
+        self.rto = self.rto.min(Duration::from_millis(MAX_RTO_MS));
+    }
+
+    fn rto(&self) -> Duration {
+        self.rto
+    }
+}
+
+/// BBR-style congestion controller
+struct CongestionController {
+    btl_bw: u64,              // Bottleneck bandwidth (bytes/sec)
+    min_rtt: Duration,        // Minimum observed RTT
+    pacing_rate: u64,         // Current send rate (bytes/sec)
+    cwnd: usize,              // Congestion window (packets)
+    delivered: u64,           // Total bytes delivered
+    delivered_time: Instant,  // Time of last delivery measurement
+    rtt_samples: VecDeque<Duration>,
+}
+
+impl CongestionController {
+    fn new() -> Self {
+        Self {
+            btl_bw: 1_000_000, // Start with 1MB/s estimate
+            min_rtt: Duration::from_millis(INITIAL_RTT_MS),
+            pacing_rate: 1_000_000,
+            cwnd: INITIAL_WINDOW_SIZE,
+            delivered: 0,
+            delivered_time: Instant::now(),
+            rtt_samples: VecDeque::with_capacity(10),
+        }
+    }
+
+    fn on_ack(&mut self, acked_bytes: u64, rtt: Duration) {
+        // Update minimum RTT
+        self.min_rtt = self.min_rtt.min(rtt);
+        self.rtt_samples.push_back(rtt);
+        if self.rtt_samples.len() > 10 {
+            self.rtt_samples.pop_front();
+        }
+
+        // Estimate bandwidth: bytes_delivered / time
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.delivered_time);
+        if elapsed.as_secs_f64() > 0.0 {
+            let delivery_rate = acked_bytes as f64 / elapsed.as_secs_f64();
+            self.btl_bw = self.btl_bw.max(delivery_rate as u64);
+        }
+
+        self.delivered += acked_bytes;
+        self.delivered_time = now;
+
+        // BBR-style: target rate = btl_bw, target inflight = btl_bw * min_rtt
+        let bdp = (self.btl_bw as f64 * self.min_rtt.as_secs_f64()) as usize;
+        self.cwnd = (bdp / MAX_PACKET_SIZE).max(INITIAL_WINDOW_SIZE).min(10000);
+        self.pacing_rate = self.btl_bw;
+    }
+
+    fn should_send(&self, inflight: usize) -> bool {
+        inflight < self.cwnd
+    }
+
+    fn pacing_delay(&self) -> Duration {
+        if self.pacing_rate == 0 {
+            return Duration::from_millis(1);
+        }
+        let delay_ns = (MAX_PACKET_SIZE as u64 * 1_000_000_000) / self.pacing_rate;
+        Duration::from_nanos(delay_ns.max(1000)) // Minimum 1 microsecond
+    }
+
+    #[allow(dead_code)]
+    fn cwnd(&self) -> usize {
+        self.cwnd
+    }
+}
+
+/// Reliable UDP sender with sliding window, congestion control, and pacing
 struct ReliableSender {
     socket: UdpSocket,
     peer_addr: SocketAddr,
     next_sequence: u32,
     window_base: u32,
     unacked_packets: HashMap<u32, (Vec<u8>, Instant)>,
+    rtt_estimator: RttEstimator,
+    congestion: CongestionController,
+    last_send_time: Instant,
+    sent_sequences: HashMap<u32, Instant>, // Track when each packet was sent for RTT
 }
 
 impl ReliableSender {
@@ -228,15 +354,29 @@ impl ReliableSender {
             next_sequence: 1,
             window_base: 1,
             unacked_packets: HashMap::new(),
+            rtt_estimator: RttEstimator::new(),
+            congestion: CongestionController::new(),
+            last_send_time: Instant::now(),
+            sent_sequences: HashMap::new(),
         })
     }
 
     fn send_packet(&mut self, packet_type: u8, thread_id: u8, offset: u64, data: &[u8]) -> Result<(), TransferError> {
-        // Wait for window space
-        while (self.next_sequence - self.window_base) as usize >= WINDOW_SIZE {
-            // Check for ACKs
+        // Check for ACKs first
+        self.check_acks()?;
+
+        // Wait for congestion window space
+        let inflight = (self.next_sequence - self.window_base) as usize;
+        while !self.congestion.should_send(inflight) {
             self.check_acks()?;
             thread::sleep(Duration::from_millis(1));
+        }
+
+        // Packet pacing: space out sends to avoid bursts
+        let now = Instant::now();
+        let target_time = self.last_send_time + self.congestion.pacing_delay();
+        if now < target_time {
+            thread::sleep(target_time - now);
         }
 
         let sequence = self.next_sequence;
@@ -262,11 +402,13 @@ impl ReliableSender {
         packet[22..24].copy_from_slice(&checksum.to_le_bytes());
 
         // Send packet
-        self.socket.send_to(&packet, self.peer_addr)?;
-
-        // Store for retransmission
         let send_time = Instant::now();
+        self.socket.send_to(&packet, self.peer_addr)?;
+        self.last_send_time = send_time;
+
+        // Store for retransmission and RTT measurement
         self.unacked_packets.insert(sequence, (packet, send_time));
+        self.sent_sequences.insert(sequence, send_time);
 
         // Retransmit old packets
         self.retransmit_old_packets()?;
@@ -276,6 +418,8 @@ impl ReliableSender {
 
     fn check_acks(&mut self) -> Result<(), TransferError> {
         let mut buf = [0u8; MAX_PACKET_SIZE];
+        let mut acked_bytes = 0u64;
+        
         while let Ok((size, _)) = self.socket.recv_from(&mut buf) {
             if size < 32 {
                 continue;
@@ -283,33 +427,57 @@ impl ReliableSender {
             let header = PacketHeader::from_bytes(&buf[..32])?;
             if header.packet_type == PKT_ACK {
                 let acked = header.ack_sequence;
+                
+                // Calculate RTT for newly ACKed packets
+                if let Some(&send_time) = self.sent_sequences.get(&acked) {
+                    let rtt = Instant::now().duration_since(send_time);
+                    self.rtt_estimator.update(rtt);
+                    
+                    // Calculate bytes ACKed
+                    if let Some((packet, _)) = self.unacked_packets.get(&acked) {
+                        acked_bytes += (packet.len() - 32) as u64; // Exclude header
+                    }
+                }
+                
                 // Remove acked packets
                 self.unacked_packets.retain(|&seq, _| seq > acked);
+                self.sent_sequences.retain(|&seq, _| seq > acked);
+                
                 // Advance window
                 if acked >= self.window_base {
                     self.window_base = acked + 1;
                 }
             }
         }
+        
+        // Update congestion controller
+        if acked_bytes > 0 {
+            self.congestion.on_ack(acked_bytes, self.rtt_estimator.srtt);
+        }
+        
         Ok(())
     }
 
     fn retransmit_old_packets(&mut self) -> Result<(), TransferError> {
         let now = Instant::now();
+        let rto = self.rtt_estimator.rto();
         let mut to_retransmit = Vec::new();
         
         for (&seq, (_packet, send_time)) in &self.unacked_packets {
-            if now.duration_since(*send_time).as_millis() > RETRANSMIT_TIMEOUT_MS as u128 {
+            if now.duration_since(*send_time) > rto {
                 to_retransmit.push(seq);
             }
         }
 
         for seq in to_retransmit {
             if let Some((packet, _)) = self.unacked_packets.get_mut(&seq) {
+                let send_time = Instant::now();
                 self.socket.send_to(packet, self.peer_addr)?;
                 if let Some(entry) = self.unacked_packets.get_mut(&seq) {
-                    entry.1 = Instant::now();
+                    entry.1 = send_time;
                 }
+                // Update sent time for RTT measurement
+                self.sent_sequences.insert(seq, send_time);
             }
         }
         Ok(())
@@ -326,13 +494,21 @@ impl ReliableSender {
     }
 }
 
-/// Reliable UDP receiver with out-of-order handling
+/// Selective ACK block (range of received packets)
+#[derive(Debug, Clone)]
+struct SackBlock {
+    start: u32,
+    end: u32,
+}
+
+/// Reliable UDP receiver with out-of-order handling and SACK
 struct ReliableReceiver {
     socket: UdpSocket,
     peer_addr: SocketAddr,
     expected_sequence: u32,
-    received_packets: HashMap<u32, Vec<u8>>,
+    received_packets: HashMap<u32, (u64, Vec<u8>)>, // sequence -> (offset, data)
     last_ack_time: Instant,
+    received_sequences: Vec<u32>, // Track all received sequences for SACK
 }
 
 impl ReliableReceiver {
@@ -344,7 +520,44 @@ impl ReliableReceiver {
             expected_sequence: 1,
             received_packets: HashMap::new(),
             last_ack_time: Instant::now(),
+            received_sequences: Vec::new(),
         })
+    }
+
+    fn generate_sack_blocks(&self) -> Vec<SackBlock> {
+        if self.received_sequences.is_empty() {
+            return Vec::new();
+        }
+
+        let mut sorted: Vec<u32> = self.received_sequences.iter()
+            .filter(|&&seq| seq > self.expected_sequence)
+            .copied()
+            .collect();
+        sorted.sort_unstable();
+        sorted.dedup();
+
+        if sorted.is_empty() {
+            return Vec::new();
+        }
+
+        let mut blocks = Vec::new();
+        let mut start = sorted[0];
+        let mut end = sorted[0];
+
+        for &seq in sorted.iter().skip(1) {
+            if seq == end + 1 {
+                end = seq;
+            } else {
+                blocks.push(SackBlock { start, end });
+                start = seq;
+                end = seq;
+            }
+        }
+        blocks.push(SackBlock { start, end });
+
+        // Limit to 3 blocks (common SACK limit)
+        blocks.truncate(3);
+        blocks
     }
 
     fn recv_packet(&mut self, timeout: Duration) -> Result<Option<(u64, Vec<u8>)>, TransferError> {
@@ -381,22 +594,32 @@ impl ReliableReceiver {
         if header.sequence == self.expected_sequence {
             // In-order packet
             self.expected_sequence = self.expected_sequence.wrapping_add(1);
+            self.received_sequences.retain(|&s| s != header.sequence);
             
             // Deliver any buffered packets
-            let mut result = vec![(header.offset, data)];
-            while let Some(buffered) = self.received_packets.remove(&self.expected_sequence) {
-                // We need offset from buffered packet, but we only stored data
-                // For now, use sequence as proxy (not ideal, but works)
-                result.push((self.expected_sequence as u64, buffered));
+            let mut result_offset = header.offset;
+            let mut result_data = data;
+            
+            while let Some((offset, buffered_data)) = self.received_packets.remove(&self.expected_sequence) {
+                result_offset = offset;
+                result_data = buffered_data;
                 self.expected_sequence = self.expected_sequence.wrapping_add(1);
             }
-            return Ok(Some((header.offset, result.into_iter().next().unwrap().1)));
+            
+            // Clean up old received sequences
+            self.received_sequences.retain(|&s| s >= self.expected_sequence);
+            
+            return Ok(Some((result_offset, result_data)));
         } else if header.sequence > self.expected_sequence {
             // Out-of-order, buffer it
-            self.received_packets.insert(header.sequence, data);
+            let seq = header.sequence; // Copy to avoid packed field reference
+            if !self.received_packets.contains_key(&seq) {
+                self.received_packets.insert(seq, (header.offset, data));
+                self.received_sequences.push(seq);
+            }
             return Ok(None);
         } else {
-            // Old packet, already received
+            // Old packet, already received - still send ACK
             return Ok(None);
         }
     }
@@ -408,18 +631,30 @@ impl ReliableReceiver {
         }
         self.last_ack_time = now;
 
+        // Generate SACK blocks
+        let sack_blocks = self.generate_sack_blocks();
+        
+        // Build ACK packet with SACK
+        let mut ack_data = Vec::new();
+        ack_data.push(sack_blocks.len() as u8); // Number of SACK blocks
+        for block in &sack_blocks {
+            ack_data.extend_from_slice(&block.start.to_le_bytes());
+            ack_data.extend_from_slice(&block.end.to_le_bytes());
+        }
+
         let header = PacketHeader {
             packet_type: PKT_ACK,
             thread_id: 0,
-            flags: 0,
+            flags: if !sack_blocks.is_empty() { 0x01 } else { 0 }, // SACK flag
             _reserved: 0,
             sequence: 0,
             ack_sequence,
             offset: 0,
-            data_len: 0,
+            data_len: ack_data.len() as u16,
             checksum: 0,
         };
         let mut packet = header.to_bytes().to_vec();
+        packet.extend_from_slice(&ack_data);
         let checksum = calculate_checksum(&packet[24..]);
         packet[22..24].copy_from_slice(&checksum.to_le_bytes());
         self.socket.send_to(&packet, self.peer_addr)?;
@@ -532,9 +767,9 @@ fn receiver_worker(
         match receiver.recv_packet(Duration::from_secs(1))? {
             Some((offset, data)) => {
                 if !received_metadata {
-                    // First packet is metadata or range header
-                    let (range_start, _) = decode_varint_from_slice(&data)?;
-                    let (range_end, _) = decode_varint_from_slice(&data[8..])?;
+                    // First packet is range header
+                    let (range_start, len1) = decode_varint_from_slice(&data)?;
+                    let (range_end, _len2) = decode_varint_from_slice(&data[len1..])?;
                     start_offset = range_start;
                     end_offset = range_end;
                     received_metadata = true;
