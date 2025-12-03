@@ -8,6 +8,7 @@
 //! - Out-of-order packet handling
 
 use crate::error::TransferError;
+use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{Read, Seek, Write};
@@ -297,12 +298,14 @@ impl CongestionController {
             self.rtt_samples.pop_front();
         }
 
-        // Estimate bandwidth: bytes_delivered / time
+        // Estimate bandwidth: bytes_delivered / time (EWMA)
         let now = Instant::now();
         let elapsed = now.duration_since(self.delivered_time);
-        if elapsed.as_secs_f64() > 0.0 {
+        if elapsed.as_secs_f64() > 0.001 { // At least 1ms elapsed
             let delivery_rate = acked_bytes as f64 / elapsed.as_secs_f64();
-            self.btl_bw = self.btl_bw.max(delivery_rate as u64);
+            
+            // EWMA with alpha=0.1 for smoothing (adapts to both increases and decreases)
+            self.btl_bw = ((0.9 * self.btl_bw as f64) + (0.1 * delivery_rate)) as u64;
         }
 
         self.delivered += acked_bytes;
@@ -310,7 +313,8 @@ impl CongestionController {
 
         // BBR-style: target rate = btl_bw, target inflight = btl_bw * min_rtt
         let bdp = (self.btl_bw as f64 * self.min_rtt.as_secs_f64()) as usize;
-        self.cwnd = (bdp / MAX_PACKET_SIZE).max(INITIAL_WINDOW_SIZE).min(10000);
+        // Increased max window to 100,000 packets (140MB) for high-BDP links
+        self.cwnd = (bdp / MAX_PACKET_SIZE).max(INITIAL_WINDOW_SIZE).min(100_000);
         self.pacing_rate = self.btl_bw;
     }
 
@@ -332,6 +336,60 @@ impl CongestionController {
     }
 }
 
+/// Encryption wrapper for packet encryption/decryption
+struct PacketEncryption {
+    key: LessSafeKey,
+    nonce_counter: u64,
+}
+
+impl PacketEncryption {
+    #[allow(dead_code)]
+    fn new(key_bytes: &[u8; 32]) -> Result<Self, TransferError> {
+        let unbound_key = UnboundKey::new(&AES_256_GCM, key_bytes)
+            .map_err(|e| TransferError::ProtocolError(format!("Key creation failed: {:?}", e)))?;
+        Ok(Self {
+            key: LessSafeKey::new(unbound_key),
+            nonce_counter: 0,
+        })
+    }
+
+    fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, TransferError> {
+        let nonce_bytes = self.nonce_counter.to_le_bytes();
+        self.nonce_counter = self.nonce_counter.wrapping_add(1);
+        
+        let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes)
+            .map_err(|e| TransferError::ProtocolError(format!("Nonce creation failed: {:?}", e)))?;
+        
+        let mut in_out = plaintext.to_vec();
+        self.key.seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out)
+            .map_err(|e| TransferError::ProtocolError(format!("Encryption failed: {:?}", e)))?;
+        
+        // Prepend nonce to ciphertext
+        let mut packet = nonce_bytes.to_vec();
+        packet.extend(in_out);
+        Ok(packet)
+    }
+
+    fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, TransferError> {
+        if ciphertext.len() < 8 {
+            return Err(TransferError::ProtocolError("Ciphertext too short".to_string()));
+        }
+        
+        let nonce_bytes: [u8; 8] = ciphertext[0..8].try_into()
+            .map_err(|_| TransferError::ProtocolError("Invalid nonce".to_string()))?;
+        let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes)
+            .map_err(|e| TransferError::ProtocolError(format!("Nonce creation failed: {:?}", e)))?;
+        
+        let mut in_out = ciphertext[8..].to_vec();
+        self.key.open_in_place(nonce, Aad::empty(), &mut in_out)
+            .map_err(|e| TransferError::ProtocolError(format!("Decryption failed: {:?}", e)))?;
+        
+        // Remove authentication tag (16 bytes for GCM)
+        in_out.truncate(in_out.len() - 16);
+        Ok(in_out)
+    }
+}
+
 /// Reliable UDP sender with sliding window, congestion control, and pacing
 struct ReliableSender {
     socket: UdpSocket,
@@ -343,11 +401,14 @@ struct ReliableSender {
     congestion: CongestionController,
     last_send_time: Instant,
     sent_sequences: HashMap<u32, Instant>, // Track when each packet was sent for RTT
+    encryption: Option<PacketEncryption>, // Optional encryption
 }
 
 impl ReliableSender {
     fn new(socket: UdpSocket, peer_addr: SocketAddr) -> Result<Self, TransferError> {
         configure_udp_socket(&socket)?;
+        // For now, encryption is disabled (use None)
+        // In production, derive key from handshake/auth_token
         Ok(Self {
             socket,
             peer_addr,
@@ -358,6 +419,7 @@ impl ReliableSender {
             congestion: CongestionController::new(),
             last_send_time: Instant::now(),
             sent_sequences: HashMap::new(),
+            encryption: None, // TODO: Enable after handshake
         })
     }
 
@@ -397,17 +459,25 @@ impl ReliableSender {
         packet.extend_from_slice(&header.to_bytes());
         packet.extend_from_slice(data);
         
-        // Calculate checksum
-        let checksum = calculate_checksum(&packet[24..]);
-        packet[22..24].copy_from_slice(&checksum.to_le_bytes());
+        // Encrypt if enabled
+        let final_packet = if let Some(ref mut enc) = self.encryption {
+            enc.encrypt(&packet)?
+        } else {
+            packet
+        };
+        
+        // Calculate checksum on final packet
+        let mut packet_with_checksum = final_packet;
+        let checksum = calculate_checksum(&packet_with_checksum[24..]);
+        packet_with_checksum[22..24].copy_from_slice(&checksum.to_le_bytes());
 
         // Send packet
         let send_time = Instant::now();
-        self.socket.send_to(&packet, self.peer_addr)?;
+        self.socket.send_to(&packet_with_checksum, self.peer_addr)?;
         self.last_send_time = send_time;
 
         // Store for retransmission and RTT measurement
-        self.unacked_packets.insert(sequence, (packet, send_time));
+        self.unacked_packets.insert(sequence, (packet_with_checksum, send_time));
         self.sent_sequences.insert(sequence, send_time);
 
         // Retransmit old packets
@@ -428,6 +498,39 @@ impl ReliableSender {
             if header.packet_type == PKT_ACK {
                 let acked = header.ack_sequence;
                 
+                // Parse SACK blocks if present
+                if (header.flags & 0x01) != 0 && size > 32 {
+                    let sack_data = &buf[32..size];
+                    if !sack_data.is_empty() {
+                        let num_blocks = sack_data[0] as usize;
+                        let mut offset = 1;
+                        for _ in 0..num_blocks {
+                            if offset + 8 <= sack_data.len() {
+                                let start = u32::from_le_bytes([
+                                    sack_data[offset],
+                                    sack_data[offset + 1],
+                                    sack_data[offset + 2],
+                                    sack_data[offset + 3],
+                                ]);
+                                let end = u32::from_le_bytes([
+                                    sack_data[offset + 4],
+                                    sack_data[offset + 5],
+                                    sack_data[offset + 6],
+                                    sack_data[offset + 7],
+                                ]);
+                                // Mark packets in range [start, end] as received
+                                for seq in start..=end {
+                                    if let Some((packet, _)) = self.unacked_packets.remove(&seq) {
+                                        acked_bytes += (packet.len() - 32) as u64;
+                                    }
+                                    self.sent_sequences.remove(&seq);
+                                }
+                                offset += 8;
+                            }
+                        }
+                    }
+                }
+                
                 // Calculate RTT for newly ACKed packets
                 if let Some(&send_time) = self.sent_sequences.get(&acked) {
                     let rtt = Instant::now().duration_since(send_time);
@@ -439,7 +542,7 @@ impl ReliableSender {
                     }
                 }
                 
-                // Remove acked packets
+                // Remove acked packets (cumulative ACK)
                 self.unacked_packets.retain(|&seq, _| seq > acked);
                 self.sent_sequences.retain(|&seq, _| seq > acked);
                 
@@ -509,6 +612,7 @@ struct ReliableReceiver {
     received_packets: HashMap<u32, (u64, Vec<u8>)>, // sequence -> (offset, data)
     last_ack_time: Instant,
     received_sequences: Vec<u32>, // Track all received sequences for SACK
+    encryption: Option<PacketEncryption>, // Optional decryption
 }
 
 impl ReliableReceiver {
@@ -521,6 +625,7 @@ impl ReliableReceiver {
             received_packets: HashMap::new(),
             last_ack_time: Instant::now(),
             received_sequences: Vec::new(),
+            encryption: None, // TODO: Enable after handshake
         })
     }
 
@@ -561,6 +666,17 @@ impl ReliableReceiver {
     }
 
     fn recv_packet(&mut self, timeout: Duration) -> Result<Option<(u64, Vec<u8>)>, TransferError> {
+        // First, deliver any buffered packets that are now in-order
+        while let Some((offset, data)) = self.received_packets.remove(&self.expected_sequence) {
+            self.expected_sequence = self.expected_sequence.wrapping_add(1);
+            self.received_sequences.retain(|&s| s != self.expected_sequence.wrapping_sub(1));
+            return Ok(Some((offset, data)));
+        }
+        
+        // Clean up old received sequences periodically
+        if self.received_sequences.len() > 1000 {
+            self.received_sequences.retain(|&s| s >= self.expected_sequence.wrapping_sub(100));
+        }
         let mut buf = [0u8; MAX_PACKET_SIZE];
         self.socket.set_read_timeout(Some(timeout))?;
         
@@ -573,10 +689,21 @@ impl ReliableReceiver {
             return Ok(None);
         }
 
-        let header = PacketHeader::from_bytes(&buf[..32])?;
+        // Decrypt if enabled
+        let decrypted_buf = if let Some(ref mut enc) = self.encryption {
+            enc.decrypt(&buf[..size])?
+        } else {
+            buf[..size].to_vec()
+        };
+        
+        if decrypted_buf.len() < 32 {
+            return Ok(None);
+        }
+        
+        let header = PacketHeader::from_bytes(&decrypted_buf[..32])?;
         
         // Verify checksum
-        let checksum = calculate_checksum(&buf[24..size]);
+        let checksum = calculate_checksum(&decrypted_buf[24..]);
         if checksum != header.checksum {
             return Ok(None); // Bad checksum, ignore
         }
@@ -588,28 +715,19 @@ impl ReliableReceiver {
             return Ok(None);
         }
 
-        let data = buf[32..size].to_vec();
+        let data = decrypted_buf[32..].to_vec();
         
         // Handle out-of-order packets
         if header.sequence == self.expected_sequence {
-            // In-order packet
+            // In-order packet - return it immediately
+            // Buffered packets will be returned on subsequent recv_packet calls
             self.expected_sequence = self.expected_sequence.wrapping_add(1);
             self.received_sequences.retain(|&s| s != header.sequence);
-            
-            // Deliver any buffered packets
-            let mut result_offset = header.offset;
-            let mut result_data = data;
-            
-            while let Some((offset, buffered_data)) = self.received_packets.remove(&self.expected_sequence) {
-                result_offset = offset;
-                result_data = buffered_data;
-                self.expected_sequence = self.expected_sequence.wrapping_add(1);
-            }
             
             // Clean up old received sequences
             self.received_sequences.retain(|&s| s >= self.expected_sequence);
             
-            return Ok(Some((result_offset, result_data)));
+            return Ok(Some((header.offset, data)));
         } else if header.sequence > self.expected_sequence {
             // Out-of-order, buffer it
             let seq = header.sequence; // Copy to avoid packed field reference
@@ -754,7 +872,7 @@ fn receiver_worker(
     socket: UdpSocket,
     peer_addr: SocketAddr,
     file: Arc<File>,
-    buffer_size: usize,
+    _buffer_size: usize,
 ) -> Result<u64, TransferError> {
     let mut receiver = ReliableReceiver::new(socket, peer_addr)?;
     
@@ -762,6 +880,9 @@ fn receiver_worker(
     let mut start_offset = 0u64;
     let mut end_offset = 0u64;
     let mut received_metadata = false;
+    
+    #[cfg(target_os = "linux")]
+    let file_fd = file.as_raw_fd();
     
     loop {
         match receiver.recv_packet(Duration::from_secs(1))? {
@@ -780,14 +901,16 @@ fn receiver_worker(
                 // Write data to file at offset
                 #[cfg(target_os = "linux")]
                 {
-                    let fd = file.as_raw_fd();
                     unsafe {
-                        libc::pwrite(
-                            fd,
+                        let result = libc::pwrite(
+                            file_fd,
                             data.as_ptr() as *const libc::c_void,
                             data.len(),
                             offset as libc::off_t,
                         );
+                        if result < 0 {
+                            return Err(TransferError::Io(std::io::Error::last_os_error()));
+                        }
                     }
                 }
                 #[cfg(not(target_os = "linux"))]
