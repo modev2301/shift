@@ -137,7 +137,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 
                 // Run blocking server loop (synchronous)
                 let output_dir = PathBuf::from(&config.server.output_directory);
-                blocking_server_loop(&output_dir, transfer_config)?;
+                let auth_token = Some(config.security.auth_token.clone());
+                blocking_server_loop(&output_dir, transfer_config, auth_token)?;
                 return Ok(());
             }
             Commands::Benchmark { output_dir } => {
@@ -264,9 +265,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             
             let server_addr = format!("{}", remote.host);
+            let auth_token = Some(config.security.auth_token.clone());
             
             // Run blocking transfer (synchronous, no async overhead)
-            match blocking_client_transfer(local_file, &server_addr, transfer_config) {
+            match blocking_client_transfer(local_file, &server_addr, transfer_config, auth_token) {
                 Ok(_) => {
                     info!("[{}/{}] Transfer complete: {}", file_idx, total_files, local_file.display());
                 }

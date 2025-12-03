@@ -9,6 +9,8 @@
 
 use crate::error::TransferError;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
+use ring::hkdf::{Salt, HKDF_SHA256};
+use ring::rand::{SecureRandom, SystemRandom};
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{Read, Seek, Write};
@@ -34,6 +36,12 @@ const PKT_ACK: u8 = 0x02;
 const PKT_METADATA: u8 = 0x04;
 const PKT_RANGE: u8 = 0x08;
 const PKT_FIN: u8 = 0x10;
+#[allow(dead_code)]
+const PKT_HANDSHAKE_INIT: u8 = 0x20;
+#[allow(dead_code)]
+const PKT_HANDSHAKE_RESP: u8 = 0x21;
+
+const PROTOCOL_VERSION: u16 = 1;
 
 /// Packet header (16 bytes)
 #[repr(C, packed)]
@@ -191,6 +199,7 @@ pub fn split_file_ranges(file_size: u64, num_threads: usize) -> Vec<FileRange> {
 fn configure_udp_socket(socket: &UdpSocket) -> Result<(), TransferError> {
     #[cfg(target_os = "linux")]
     {
+        use std::os::unix::io::AsRawFd;
         let fd = socket.as_raw_fd();
         let buf_size: libc::c_int = 25 * 1024 * 1024; // 25MB
         unsafe {
@@ -209,6 +218,10 @@ fn configure_udp_socket(socket: &UdpSocket) -> Result<(), TransferError> {
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
         }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = socket; // Socket configuration not needed on non-Linux
     }
     Ok(())
 }
@@ -266,27 +279,40 @@ impl RttEstimator {
     }
 }
 
-/// BBR-style congestion controller
+/// Congestion control state
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CongestionState {
+    SlowStart,
+    ProbeBW,  // Steady-state BBR
+}
+
+/// BBR-style congestion controller with slow start
 struct CongestionController {
+    state: CongestionState,
     btl_bw: u64,              // Bottleneck bandwidth (bytes/sec)
     min_rtt: Duration,        // Minimum observed RTT
     pacing_rate: u64,         // Current send rate (bytes/sec)
     cwnd: usize,              // Congestion window (packets)
+    ssthresh: usize,          // Slow start threshold
     delivered: u64,           // Total bytes delivered
     delivered_time: Instant,  // Time of last delivery measurement
     rtt_samples: VecDeque<Duration>,
+    packets_since_last_loss: usize,
 }
 
 impl CongestionController {
     fn new() -> Self {
         Self {
+            state: CongestionState::SlowStart,
             btl_bw: 1_000_000, // Start with 1MB/s estimate
             min_rtt: Duration::from_millis(INITIAL_RTT_MS),
             pacing_rate: 1_000_000,
             cwnd: INITIAL_WINDOW_SIZE,
+            ssthresh: 1000, // Initial threshold (will adapt)
             delivered: 0,
             delivered_time: Instant::now(),
             rtt_samples: VecDeque::with_capacity(10),
+            packets_since_last_loss: 0,
         }
     }
 
@@ -310,12 +336,39 @@ impl CongestionController {
 
         self.delivered += acked_bytes;
         self.delivered_time = now;
+        self.packets_since_last_loss += 1;
 
-        // BBR-style: target rate = btl_bw, target inflight = btl_bw * min_rtt
-        let bdp = (self.btl_bw as f64 * self.min_rtt.as_secs_f64()) as usize;
-        // Increased max window to 100,000 packets (140MB) for high-BDP links
-        self.cwnd = (bdp / MAX_PACKET_SIZE).max(INITIAL_WINDOW_SIZE).min(100_000);
+        match self.state {
+            CongestionState::SlowStart => {
+                // Exponential growth: double cwnd per RTT (approximate with packet count)
+                // In practice, we double every ~cwnd packets ACKed
+                if self.packets_since_last_loss >= self.cwnd {
+                    self.cwnd = (self.cwnd * 2).min(self.ssthresh);
+                    self.packets_since_last_loss = 0;
+                }
+                
+                // Exit slow start when we hit threshold or detect bandwidth plateau
+                if self.cwnd >= self.ssthresh || self.btl_bw > 10_000_000 {
+                    self.state = CongestionState::ProbeBW;
+                }
+            }
+            CongestionState::ProbeBW => {
+                // BBR-style: target rate = btl_bw, target inflight = btl_bw * min_rtt
+                let bdp = (self.btl_bw as f64 * self.min_rtt.as_secs_f64()) as usize;
+                // Increased max window to 100,000 packets (140MB) for high-BDP links
+                self.cwnd = (bdp / MAX_PACKET_SIZE).max(INITIAL_WINDOW_SIZE).min(100_000);
+            }
+        }
+        
         self.pacing_rate = self.btl_bw;
+    }
+
+    fn on_loss(&mut self) {
+        // Multiplicative decrease
+        self.ssthresh = (self.cwnd / 2).max(INITIAL_WINDOW_SIZE);
+        self.cwnd = self.ssthresh;
+        self.state = CongestionState::ProbeBW;
+        self.packets_since_last_loss = 0;
     }
 
     fn should_send(&self, inflight: usize) -> bool {
@@ -353,8 +406,12 @@ impl PacketEncryption {
         })
     }
 
-    fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, TransferError> {
-        let nonce_bytes = self.nonce_counter.to_le_bytes();
+    fn encrypt(&mut self, plaintext: &[u8], thread_id: u8) -> Result<Vec<u8>, TransferError> {
+        // AES-GCM requires 12-byte nonce
+        // Format: [thread_id: 1 byte][counter: 8 bytes][padding: 3 bytes]
+        let mut nonce_bytes = [0u8; 12];
+        nonce_bytes[0] = thread_id; // Thread ID prevents nonce collision across threads
+        nonce_bytes[1..9].copy_from_slice(&self.nonce_counter.to_le_bytes());
         self.nonce_counter = self.nonce_counter.wrapping_add(1);
         
         let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes)
@@ -371,22 +428,22 @@ impl PacketEncryption {
     }
 
     fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, TransferError> {
-        if ciphertext.len() < 8 {
+        // AES-GCM nonce is 12 bytes, plus minimum 16 bytes for tag
+        if ciphertext.len() < 12 + 16 {
             return Err(TransferError::ProtocolError("Ciphertext too short".to_string()));
         }
         
-        let nonce_bytes: [u8; 8] = ciphertext[0..8].try_into()
+        let nonce_bytes: [u8; 12] = ciphertext[0..12].try_into()
             .map_err(|_| TransferError::ProtocolError("Invalid nonce".to_string()))?;
         let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes)
             .map_err(|e| TransferError::ProtocolError(format!("Nonce creation failed: {:?}", e)))?;
         
-        let mut in_out = ciphertext[8..].to_vec();
-        self.key.open_in_place(nonce, Aad::empty(), &mut in_out)
+        let mut in_out = ciphertext[12..].to_vec();
+        // open_in_place already removes the authentication tag and returns plaintext
+        let plaintext = self.key.open_in_place(nonce, Aad::empty(), &mut in_out)
             .map_err(|e| TransferError::ProtocolError(format!("Decryption failed: {:?}", e)))?;
         
-        // Remove authentication tag (16 bytes for GCM)
-        in_out.truncate(in_out.len() - 16);
-        Ok(in_out)
+        Ok(plaintext.to_vec())
     }
 }
 
@@ -407,8 +464,6 @@ struct ReliableSender {
 impl ReliableSender {
     fn new(socket: UdpSocket, peer_addr: SocketAddr) -> Result<Self, TransferError> {
         configure_udp_socket(&socket)?;
-        // For now, encryption is disabled (use None)
-        // In production, derive key from handshake/auth_token
         Ok(Self {
             socket,
             peer_addr,
@@ -419,8 +474,61 @@ impl ReliableSender {
             congestion: CongestionController::new(),
             last_send_time: Instant::now(),
             sent_sequences: HashMap::new(),
-            encryption: None, // TODO: Enable after handshake
+            encryption: None, // Will be enabled after handshake
         })
+    }
+
+    fn perform_handshake(&mut self, auth_token: &str) -> Result<(), TransferError> {
+        
+        // Generate client random
+        let rng = SystemRandom::new();
+        let mut client_random = [0u8; 32];
+        rng.fill(&mut client_random)
+            .map_err(|e| TransferError::ProtocolError(format!("RNG failed: {:?}", e)))?;
+        
+        // Send handshake init
+        let mut init_data = Vec::new();
+        init_data.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+        init_data.extend_from_slice(&client_random);
+        init_data.extend_from_slice(auth_token.as_bytes());
+        
+        self.socket.send_to(&init_data, self.peer_addr)?;
+        
+        // Receive handshake response
+        let mut buf = [0u8; MAX_PACKET_SIZE];
+        let (size, _) = self.socket.recv_from(&mut buf)?;
+        if size < 2 + 32 {
+            return Err(TransferError::ProtocolError("Handshake response too short".to_string()));
+        }
+        
+        let server_version = u16::from_le_bytes([buf[0], buf[1]]);
+        if server_version != PROTOCOL_VERSION {
+            return Err(TransferError::ProtocolError(format!(
+                "Version mismatch: client {}, server {}", PROTOCOL_VERSION, server_version
+            )));
+        }
+        
+        let mut server_random = [0u8; 32];
+        server_random.copy_from_slice(&buf[2..34]);
+        
+        // Derive encryption key from shared secret (auth_token) + randoms
+        let mut combined = Vec::new();
+        combined.extend_from_slice(&client_random);
+        combined.extend_from_slice(&server_random);
+        combined.extend_from_slice(auth_token.as_bytes());
+        
+        let salt = Salt::new(HKDF_SHA256, auth_token.as_bytes());
+        let prk = salt.extract(&combined);
+        let mut key_bytes = [0u8; 32];
+        prk.expand(&[b"shift-transfer-key"], HKDF_SHA256)
+            .map_err(|e| TransferError::ProtocolError(format!("Key derivation failed: {:?}", e)))?
+            .fill(&mut key_bytes)
+            .map_err(|e| TransferError::ProtocolError(format!("Key expansion failed: {:?}", e)))?;
+        
+        // Enable encryption
+        self.encryption = Some(PacketEncryption::new(&key_bytes)?);
+        
+        Ok(())
     }
 
     fn send_packet(&mut self, packet_type: u8, thread_id: u8, offset: u64, data: &[u8]) -> Result<(), TransferError> {
@@ -459,25 +567,25 @@ impl ReliableSender {
         packet.extend_from_slice(&header.to_bytes());
         packet.extend_from_slice(data);
         
-        // Encrypt if enabled
+        // Calculate checksum before encryption (if not encrypted)
+        // AES-GCM provides integrity, so checksum is redundant when encrypted
         let final_packet = if let Some(ref mut enc) = self.encryption {
-            enc.encrypt(&packet)?
+            // Encrypt: AES-GCM provides authentication, no separate checksum needed
+            enc.encrypt(&packet, thread_id)?
         } else {
+            // Unencrypted: calculate and set checksum
+            let checksum = calculate_checksum(&packet[24..]);
+            packet[22..24].copy_from_slice(&checksum.to_le_bytes());
             packet
         };
-        
-        // Calculate checksum on final packet
-        let mut packet_with_checksum = final_packet;
-        let checksum = calculate_checksum(&packet_with_checksum[24..]);
-        packet_with_checksum[22..24].copy_from_slice(&checksum.to_le_bytes());
 
         // Send packet
         let send_time = Instant::now();
-        self.socket.send_to(&packet_with_checksum, self.peer_addr)?;
+        self.socket.send_to(&final_packet, self.peer_addr)?;
         self.last_send_time = send_time;
 
         // Store for retransmission and RTT measurement
-        self.unacked_packets.insert(sequence, (packet_with_checksum, send_time));
+        self.unacked_packets.insert(sequence, (final_packet, send_time));
         self.sent_sequences.insert(sequence, send_time);
 
         // Retransmit old packets
@@ -489,18 +597,35 @@ impl ReliableSender {
     fn check_acks(&mut self) -> Result<(), TransferError> {
         let mut buf = [0u8; MAX_PACKET_SIZE];
         let mut acked_bytes = 0u64;
+        let mut highest_sacked = self.window_base;
+        let mut detected_loss = false;
         
         while let Ok((size, _)) = self.socket.recv_from(&mut buf) {
             if size < 32 {
                 continue;
             }
-            let header = PacketHeader::from_bytes(&buf[..32])?;
+            
+            // Decrypt if needed
+            let decrypted_buf = if let Some(ref mut enc) = self.encryption {
+                match enc.decrypt(&buf[..size]) {
+                    Ok(d) => d,
+                    Err(_) => continue, // Bad packet, skip
+                }
+            } else {
+                buf[..size].to_vec()
+            };
+            
+            if decrypted_buf.len() < 32 {
+                continue;
+            }
+            
+            let header = PacketHeader::from_bytes(&decrypted_buf[..32])?;
             if header.packet_type == PKT_ACK {
                 let acked = header.ack_sequence;
                 
                 // Parse SACK blocks if present
-                if (header.flags & 0x01) != 0 && size > 32 {
-                    let sack_data = &buf[32..size];
+                if (header.flags & 0x01) != 0 && decrypted_buf.len() > 32 {
+                    let sack_data = &decrypted_buf[32..];
                     if !sack_data.is_empty() {
                         let num_blocks = sack_data[0] as usize;
                         let mut offset = 1;
@@ -518,6 +643,9 @@ impl ReliableSender {
                                     sack_data[offset + 6],
                                     sack_data[offset + 7],
                                 ]);
+                                
+                                highest_sacked = highest_sacked.max(end);
+                                
                                 // Mark packets in range [start, end] as received
                                 for seq in start..=end {
                                     if let Some((packet, _)) = self.unacked_packets.remove(&seq) {
@@ -526,6 +654,23 @@ impl ReliableSender {
                                     self.sent_sequences.remove(&seq);
                                 }
                                 offset += 8;
+                            }
+                        }
+                    }
+                }
+                
+                // Fast retransmit: if SACK shows gap, retransmit missing packets
+                if highest_sacked > self.window_base + 3 {
+                    for seq in self.window_base..highest_sacked {
+                        if self.unacked_packets.contains_key(&seq) {
+                            // Packet in gap is likely lost - retransmit immediately
+                            if let Some((packet, _)) = self.unacked_packets.get(&seq) {
+                                let send_time = Instant::now();
+                                self.socket.send_to(packet, self.peer_addr)?;
+                                if let Some(entry) = self.unacked_packets.get_mut(&seq) {
+                                    entry.1 = send_time;
+                                }
+                                detected_loss = true;
                             }
                         }
                     }
@@ -554,7 +699,9 @@ impl ReliableSender {
         }
         
         // Update congestion controller
-        if acked_bytes > 0 {
+        if detected_loss {
+            self.congestion.on_loss();
+        } else if acked_bytes > 0 {
             self.congestion.on_ack(acked_bytes, self.rtt_estimator.srtt);
         }
         
@@ -702,10 +849,12 @@ impl ReliableReceiver {
         
         let header = PacketHeader::from_bytes(&decrypted_buf[..32])?;
         
-        // Verify checksum
-        let checksum = calculate_checksum(&decrypted_buf[24..]);
-        if checksum != header.checksum {
-            return Ok(None); // Bad checksum, ignore
+        // Verify checksum only if not encrypted (AES-GCM provides integrity)
+        if self.encryption.is_none() {
+            let checksum = calculate_checksum(&decrypted_buf[24..]);
+            if checksum != header.checksum {
+                return Ok(None); // Bad checksum, ignore
+            }
         }
 
         // Send ACK
@@ -789,6 +938,7 @@ pub fn sender_thread(
     buffer_size: usize,
     thread_id: usize,
     metadata: Option<FileMetadata>,
+    auth_token: Option<String>,
 ) -> Result<u64, TransferError> {
     // Open file
     let file = File::open(file_path)?;
@@ -799,6 +949,13 @@ pub fn sender_thread(
         .map_err(|e| TransferError::NetworkError(format!("Invalid address: {}", e)))?;
     
     let mut sender = ReliableSender::new(socket, peer_addr)?;
+    
+    // Perform handshake only on thread 0
+    if thread_id == 0 {
+        if let Some(token) = auth_token {
+            sender.perform_handshake(&token)?;
+        }
+    }
     
     // Only thread 0 sends file metadata
     if let Some(meta) = metadata {
@@ -873,8 +1030,10 @@ fn receiver_worker(
     peer_addr: SocketAddr,
     file: Arc<File>,
     _buffer_size: usize,
+    encryption: Option<PacketEncryption>,
 ) -> Result<u64, TransferError> {
     let mut receiver = ReliableReceiver::new(socket, peer_addr)?;
+    receiver.encryption = encryption;
     
     // Receive metadata or range header first
     let mut start_offset = 0u64;
@@ -936,29 +1095,87 @@ fn receiver_worker(
 pub fn blocking_server_receive(
     output_dir: &Path,
     config: BlockingTransferConfig,
+    auth_token: Option<String>,
 ) -> Result<(String, u64), TransferError> {
-    // Bind to base port for metadata
+    
+    // Bind to base port for handshake/metadata
     let meta_addr = format!("0.0.0.0:{}", config.base_port);
     let meta_socket = UdpSocket::bind(&meta_addr)?;
     configure_udp_socket(&meta_socket)?;
     
-    tracing::info!("Waiting for metadata on port {}", config.base_port);
+    tracing::info!("Waiting for connection on port {}", config.base_port);
     
-    // Receive metadata packet
+    // Receive handshake init
     let mut buf = [0u8; MAX_PACKET_SIZE];
     let (size, peer_addr) = meta_socket.recv_from(&mut buf)?;
     
-    if size < 32 {
+    if size < 2 + 32 {
+        return Err(TransferError::ProtocolError("Handshake too short".to_string()));
+    }
+    
+    let client_version = u16::from_le_bytes([buf[0], buf[1]]);
+    if client_version != PROTOCOL_VERSION {
+        return Err(TransferError::ProtocolError(format!(
+            "Version mismatch: client {}, server {}", client_version, PROTOCOL_VERSION
+        )));
+    }
+    
+    let mut client_random = [0u8; 32];
+    client_random.copy_from_slice(&buf[2..34]);
+    
+    // Generate server random
+    let rng = SystemRandom::new();
+    let mut server_random = [0u8; 32];
+    rng.fill(&mut server_random)
+        .map_err(|e| TransferError::ProtocolError(format!("RNG failed: {:?}", e)))?;
+    
+    // Send handshake response
+    let mut resp_data = Vec::new();
+    resp_data.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+    resp_data.extend_from_slice(&server_random);
+    meta_socket.send_to(&resp_data, peer_addr)?;
+    
+    // Derive encryption key if auth_token provided
+    let encryption_key = if let Some(token) = &auth_token {
+        let mut combined = Vec::new();
+        combined.extend_from_slice(&client_random);
+        combined.extend_from_slice(&server_random);
+        combined.extend_from_slice(token.as_bytes());
+        
+        let salt = Salt::new(HKDF_SHA256, token.as_bytes());
+        let prk = salt.extract(&combined);
+        let mut key_bytes = [0u8; 32];
+        prk.expand(&[b"shift-transfer-key"], HKDF_SHA256)
+            .map_err(|e| TransferError::ProtocolError(format!("Key derivation failed: {:?}", e)))?
+            .fill(&mut key_bytes)
+            .map_err(|e| TransferError::ProtocolError(format!("Key expansion failed: {:?}", e)))?;
+        Some(key_bytes)
+    } else {
+        None
+    };
+    
+    // Receive metadata packet (now encrypted if key was derived)
+    let (size, _) = meta_socket.recv_from(&mut buf)?;
+    
+    // Decrypt if encryption enabled
+    let decrypted_buf = if let Some(key_bytes) = encryption_key {
+        let mut enc = PacketEncryption::new(&key_bytes)?;
+        enc.decrypt(&buf[..size])?
+    } else {
+        buf[..size].to_vec()
+    };
+    
+    if decrypted_buf.len() < 32 {
         return Err(TransferError::ProtocolError("Packet too small".to_string()));
     }
     
-    let header = PacketHeader::from_bytes(&buf[..32])?;
+    let header = PacketHeader::from_bytes(&decrypted_buf[..32])?;
     if header.packet_type != PKT_METADATA {
         return Err(TransferError::ProtocolError("Expected metadata packet".to_string()));
     }
     
     // Parse metadata
-    let data = &buf[32..size];
+    let data = &decrypted_buf[32..];
     let (filename_len, len_bytes) = decode_varint_from_slice(data)?;
     let filename_start = len_bytes;
     let filename_end = filename_start + filename_len as usize;
@@ -996,8 +1213,12 @@ pub fn blocking_server_receive(
     let mut handles = Vec::with_capacity(num_threads);
     for (thread_id, socket, peer) in sockets {
         let file_clone = Arc::clone(&file);
+        // Each worker needs its own encryption instance (nonce counter)
+        let enc = encryption_key.map(|key_bytes| {
+            PacketEncryption::new(&key_bytes).unwrap()
+        });
         let handle = thread::spawn(move || {
-            receiver_worker(socket, peer, file_clone, config.buffer_size)
+            receiver_worker(socket, peer, file_clone, config.buffer_size, enc)
         });
         handles.push((thread_id, handle));
     }
@@ -1034,6 +1255,7 @@ pub fn blocking_client_transfer(
     file_path: &Path,
     server_addr: &str,
     config: BlockingTransferConfig,
+    auth_token: Option<String>,
 ) -> Result<(), TransferError> {
     let metadata = std::fs::metadata(file_path)?;
     let file_size = metadata.len();
@@ -1075,6 +1297,7 @@ pub fn blocking_client_transfer(
             None
         };
         
+        let auth_token_clone = auth_token.clone();
         let handle = thread::spawn(move || {
             sender_thread(
                 &file_path,
@@ -1084,6 +1307,7 @@ pub fn blocking_client_transfer(
                 config.buffer_size,
                 thread_id,
                 metadata,
+                auth_token_clone,
             )
         });
         handles.push(handle);
@@ -1129,12 +1353,13 @@ pub fn blocking_client_transfer(
 pub fn blocking_server_loop(
     output_dir: &Path,
     config: BlockingTransferConfig,
+    auth_token: Option<String>,
 ) -> Result<(), TransferError> {
     std::fs::create_dir_all(output_dir)?;
     
     loop {
         tracing::info!("Waiting for new transfer...");
-        match blocking_server_receive(output_dir, config.clone()) {
+        match blocking_server_receive(output_dir, config.clone(), auth_token.clone()) {
             Ok((filename, bytes)) => {
                 tracing::info!("Transfer completed: {} ({} bytes)", filename, bytes);
             }
