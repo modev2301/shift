@@ -6,16 +6,18 @@
 
 use crate::error::TransferError;
 use crate::base::{split_file_ranges, FileRange, TransferConfig};
+use crate::progress::{ProgressHandle, TransferProgress};
 use std::fs::File;
-use std::io::{Read, Seek, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use socket2::{Domain, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::TcpListener;
+use tokio::time::interval;
 use tracing::{debug, info};
 
 /// Configure TCP socket for high throughput.
@@ -42,6 +44,7 @@ async fn transfer_range_tcp(
     file: Arc<File>,
     mut stream: tokio::net::TcpStream,
     config: TransferConfig,
+    progress: Option<ProgressHandle>,
 ) -> Result<u64, TransferError> {
     info!(
         thread_id,
@@ -101,6 +104,11 @@ async fn transfer_range_tcp(
 
         offset += bytes_read as u64;
         total_sent += bytes_read as u64;
+        
+        // Update progress if provided
+        if let Some(ref progress) = progress {
+            progress.update(bytes_read as u64);
+        }
     }
 
     // Flush and shutdown write side
@@ -122,6 +130,7 @@ pub async fn receive_range_tcp(
     file: Arc<File>,
     mut stream: tokio::net::TcpStream,
     config: TransferConfig,
+    progress: Option<ProgressHandle>,
 ) -> Result<u64, TransferError> {
     let (mut reader, _writer) = stream.split();
 
@@ -196,6 +205,11 @@ pub async fn receive_range_tcp(
 
         offset += bytes_read as u64;
         total_received += bytes_read as u64;
+        
+        // Update progress if provided
+        if let Some(ref progress) = progress {
+            progress.update(bytes_read as u64);
+        }
     }
 
     // Verify we received the expected amount of data
@@ -258,6 +272,33 @@ pub async fn send_file_tcp(
         "Starting TCP file transfer"
     );
 
+    // Create progress tracker
+    let progress = TransferProgress::new(file_size, true);
+    let progress_handle = progress.handle();
+    
+    // Spawn throughput logger
+    let progress_for_logger = progress.handle();
+    let filename_for_logger = filename.clone();
+    let total_bytes = file_size;
+    let start_time = std::time::Instant::now();
+    let logger_handle = tokio::spawn(async move {
+        let mut interval = interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            let transferred = progress_for_logger.transferred.load(std::sync::atomic::Ordering::Relaxed);
+            if transferred >= total_bytes {
+                break; // Transfer complete
+            }
+            if transferred > 0 {
+                let elapsed = start_time.elapsed().as_secs_f64();
+                if elapsed > 0.0 {
+                    let mbps = (transferred as f64 / (1024.0 * 1024.0)) / elapsed;
+                    info!(file = %filename_for_logger, throughput_mbps = mbps, transferred = transferred, total = total_bytes, "Transfer progress");
+                }
+            }
+        }
+    });
+
     // Send metadata on base port
     let metadata_socket = Socket::new(Domain::IPV4, Type::STREAM, None)
         .map_err(|e| TransferError::NetworkError(format!("Failed to create socket: {}", e)))?;
@@ -312,6 +353,7 @@ pub async fn send_file_tcp(
         let file = Arc::clone(&file);
         let config = config.clone();
         let target_port = base_port + 1 + thread_id as u16;
+        let progress_clone = progress_handle.clone();
 
         let handle = tokio::spawn(async move {
             // Create and configure socket using socket2
@@ -332,7 +374,7 @@ pub async fn send_file_tcp(
             let stream = TcpStream::from_std(std_stream)
                 .map_err(|e| TransferError::NetworkError(format!("Failed to convert to tokio stream: {}", e)))?;
 
-            transfer_range_tcp(thread_id, range, file, stream, config).await
+            transfer_range_tcp(thread_id, range, file, stream, config, Some(progress_clone)).await
         });
 
         handles.push(handle);
@@ -359,9 +401,23 @@ pub async fn send_file_tcp(
         }
     }
 
+    // Wait for logger to finish
+    let _ = logger_handle.await;
+    
+    progress.finish();
+    
+    let duration = progress.start_time.elapsed();
+    let throughput_mbps = if duration.as_secs_f64() > 0.0 {
+        (total_sent as f64 / (1024.0 * 1024.0)) / duration.as_secs_f64()
+    } else {
+        0.0
+    };
+
     info!(
         file = %filename,
         bytes = total_sent,
+        duration_secs = duration.as_secs_f64(),
+        throughput_mbps = throughput_mbps,
         "TCP transfer completed"
     );
 
@@ -427,7 +483,7 @@ pub async fn receive_file_tcp(
             let (stream, _) = listener.accept().await
                 .map_err(|e| TransferError::NetworkError(format!("Accept failed: {}", e)))?;
 
-            receive_range_tcp(thread_id, file, stream, config).await
+            receive_range_tcp(thread_id, file, stream, config, None).await
         });
 
         handles.push(handle);

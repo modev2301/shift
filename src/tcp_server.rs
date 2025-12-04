@@ -177,7 +177,7 @@ impl TcpServer {
                 let (data_stream, _) = listener.accept().await
                     .map_err(|e| TransferError::NetworkError(format!("Accept failed: {}", e)))?;
 
-                receive_range_tcp(thread_id, file, data_stream, config).await
+                receive_range_tcp(thread_id, file, data_stream, config, None).await
             });
 
             data_handles.push(handle);

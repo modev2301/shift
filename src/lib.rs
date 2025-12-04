@@ -22,24 +22,16 @@
 //! ```
 
 pub mod base;
-pub mod benchmark;
 pub mod config;
 pub mod error;
-pub mod quic;
-pub mod receiver;
-pub mod sender;
-pub mod simd;
+pub mod progress;
 pub mod tcp_server;
 pub mod tcp_transfer;
 pub mod utils;
 
 pub use base::{FileRange, TransferConfig, TransferStats};
-pub use benchmark::{BenchmarkResult, PerformanceBenchmark, TestFile};
 pub use config::Config;
 pub use error::TransferError;
-pub use receiver::Receiver;
-pub use sender::Sender;
-pub use simd::{SimdBenchmark, SimdChecksum, SimdOperation, SimdProcessor};
 
 // Re-export commonly used types for convenience
 pub use bytes;

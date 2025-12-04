@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use shift::{Config, PerformanceBenchmark};
+use shift::Config;
 use std::path::PathBuf;
 use tracing::info;
 
@@ -39,11 +39,6 @@ struct Cli {
 enum Commands {
     /// Start the transfer server
     Server,
-    /// Run performance benchmarks
-    Benchmark {
-        #[arg(short, long, default_value = "./benchmark_results")]
-        output_dir: PathBuf,
-    },
 }
 
 /// Parses SCP-like remote path: user@host:/path or host:/path
@@ -146,13 +141,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 
                 let rt = tokio::runtime::Runtime::new()?;
                 rt.block_on(server.run_forever())?;
-                return Ok(());
-            }
-            Commands::Benchmark { output_dir } => {
-                info!("Running performance benchmarks");
-                // Benchmark requires async runtime
-                let rt = tokio::runtime::Runtime::new()?;
-                rt.block_on(run_benchmarks(&output_dir))?;
                 return Ok(());
             }
         }
@@ -295,26 +283,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         return Err("At least one path must be remote (user@host:/path)".into());
     }
-    
-    Ok(())
-}
-
-
-async fn run_benchmarks(output_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    std::fs::create_dir_all(output_dir)?;
-    
-    let mut benchmark = PerformanceBenchmark::new();
-    
-    println!("Starting performance benchmarks...");
-    println!("Test files will be created in: {:?}", output_dir);
-    
-    let results = benchmark.run_full_benchmark(output_dir.to_str().unwrap())?;
-    benchmark.print_results();
-    
-    let results_file = output_dir.join("benchmark_results.json");
-    let json_results = serde_json::to_string_pretty(&results)?;
-    std::fs::write(&results_file, json_results)?;
-    println!("\nDetailed results saved to: {:?}", results_file);
     
     Ok(())
 }
