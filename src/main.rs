@@ -44,7 +44,7 @@ enum Commands {
 /// Parses SCP-like remote path: user@host:/path or host:/path
 #[derive(Debug, Clone)]
 struct RemotePath {
-    user: Option<String>,
+    _user: Option<String>,
     host: String,
     port: Option<u16>,
     path: PathBuf,
@@ -81,7 +81,7 @@ impl RemotePath {
         };
         
         Ok(RemotePath {
-            user,
+            _user: user,
             host,
             port,
             path: PathBuf::from(path_str),
