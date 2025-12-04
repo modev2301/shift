@@ -116,7 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Commands::Server => {
                 let config = Config::load_or_create(&cli.config)?;
                 
-                use shift::{receiver::Receiver, TransferConfig};
+                use shift::{tcp_server::TcpServer, TransferConfig};
                 
                 let transfer_config = TransferConfig {
                     start_port: config.server.port,
@@ -137,13 +137,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "Output directory configured"
                 );
                 
-                let receiver = Receiver::new(
+                let server = TcpServer::new(
                     transfer_config.start_port,
                     transfer_config.num_streams,
-                    PathBuf::from(&config.server.output_directory).as_path(),
-                )?;
+                    PathBuf::from(&config.server.output_directory),
+                    transfer_config,
+                );
                 
-                receiver.run_forever()?;
+                let rt = tokio::runtime::Runtime::new()?;
+                rt.block_on(server.run_forever())?;
                 return Ok(());
             }
             Commands::Benchmark { output_dir } => {
@@ -245,8 +247,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         info!("Transferring {} files", files_to_transfer.len());
         
-        // Use QUIC-based transfer for maximum throughput
-        use shift::{sender::Sender, TransferConfig};
+        // Use TCP-based transfer for maximum throughput
+        use shift::{tcp_transfer::send_file_tcp, TransferConfig};
+        use std::net::ToSocketAddrs;
         
         let transfer_config = TransferConfig {
             start_port: remote.port.unwrap_or(8080),
@@ -256,8 +259,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             timeout_seconds: config.client.timeout_seconds,
         };
         
-        let sender = Sender::new(transfer_config)?;
-        
         // Sort files by size (largest first) for better parallelism utilization
         files_to_transfer.sort_by(|a, b| {
             let size_a = std::fs::metadata(a).ok().map(|m| m.len()).unwrap_or(0);
@@ -265,16 +266,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             size_b.cmp(&size_a)
         });
         
+        let rt = tokio::runtime::Runtime::new()?;
+        
         for (idx, local_file) in files_to_transfer.iter().enumerate() {
             let file_idx = idx + 1;
             let total_files = files_to_transfer.len();
             
             info!("[{}/{}] Starting transfer: {}", file_idx, total_files, local_file.display());
             
-            let server_addr = format!("{}:{}", remote.host, remote.port.unwrap_or(8080));
+            let server_addr_str = format!("{}:{}", remote.host, remote.port.unwrap_or(8080));
+            let server_addr = server_addr_str
+                .to_socket_addrs()?
+                .next()
+                .ok_or_else(|| "Failed to resolve server address")?;
             
-            // Transfer file using QUIC
-            match sender.transfer_file(local_file, &server_addr) {
+            // Transfer file using TCP
+            match rt.block_on(send_file_tcp(local_file, server_addr, transfer_config.clone())) {
                 Ok(_) => {
                     info!("[{}/{}] Transfer complete: {}", file_idx, total_files, local_file.display());
                 }

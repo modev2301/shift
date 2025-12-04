@@ -29,6 +29,8 @@ pub mod quic;
 pub mod receiver;
 pub mod sender;
 pub mod simd;
+pub mod tcp_server;
+pub mod tcp_transfer;
 pub mod utils;
 
 pub use base::{FileRange, TransferConfig, TransferStats};
