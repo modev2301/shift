@@ -164,11 +164,9 @@ impl Receiver {
             "Receiving file"
         );
 
-        // Send acknowledgment
+        // Send initial acknowledgment (keep send side open for final ACK)
         send.write_all(&[0x01]).await
             .map_err(|e| TransferError::NetworkError(format!("Failed to send ack: {}", e)))?;
-        send.finish()
-            .map_err(|e| TransferError::NetworkError(format!("Failed to finish ack stream: {:?}", e)))?;
 
         // Create output file
         let output_path = output_dir.join(&filename);
@@ -230,6 +228,13 @@ impl Receiver {
             bytes = total_received,
             "File transfer completed"
         );
+
+        // Send final acknowledgment to sender that all streams completed successfully
+        // Use the metadata stream's send side (kept open for this purpose)
+        send.write_all(&[0x02]).await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to send final ack: {}", e)))?;
+        send.finish()
+            .map_err(|e| TransferError::NetworkError(format!("Failed to finish final ack: {:?}", e)))?;
 
         Ok(())
     }

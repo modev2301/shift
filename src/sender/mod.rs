@@ -138,7 +138,7 @@ impl Sender {
         send.finish()
             .map_err(|e| TransferError::NetworkError(format!("Failed to finish metadata stream: {:?}", e)))?;
 
-        // Wait for receiver acknowledgment
+        // Wait for receiver initial acknowledgment
         let mut ack_buf = [0u8; 1];
         recv.read_exact(&mut ack_buf).await
             .map_err(|e| TransferError::NetworkError(format!("Failed to receive ack: {}", e)))?;
@@ -191,6 +191,24 @@ impl Sender {
                     );
                     return Err(TransferError::NetworkError(format!("Stream panicked: {:?}", e)));
                 }
+            }
+        }
+
+        // Wait for receiver final acknowledgment before closing
+        // The receiver will send a final ACK (0x02) on the metadata stream when all streams complete
+        let mut final_ack_buf = [0u8; 1];
+        match recv.read_exact(&mut final_ack_buf).await {
+            Ok(_) => {
+                if final_ack_buf[0] == 0x02 {
+                    info!("Receiver confirmed all streams completed successfully");
+                } else {
+                    error!("Unexpected final ACK value: {}", final_ack_buf[0]);
+                    return Err(TransferError::ProtocolError("Invalid final acknowledgment".to_string()));
+                }
+            }
+            Err(e) => {
+                error!("Failed to receive final ACK: {}", e);
+                return Err(TransferError::NetworkError(format!("Transfer incomplete: {}", e)));
             }
         }
 
