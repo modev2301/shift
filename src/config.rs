@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn test_constants() {
         assert_eq!(BASE_CHUNK_SIZE, 1024 * 1024); // 1MB
-        assert_eq!(DEFAULT_PARALLEL_STREAMS, 16);
+        assert_eq!(DEFAULT_PARALLEL_STREAMS, 8);
         assert_eq!(MEMORY_POOL_SIZE, 2000);
         assert_eq!(SIMD_CHUNK_SIZE, 1024 * 1024);
         assert!(ZERO_COPY_ENABLED);

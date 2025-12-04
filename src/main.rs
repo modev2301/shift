@@ -117,7 +117,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     start_port: config.server.port,
                     num_streams: config.server.max_clients,
                     buffer_size: config.server.buffer_size.unwrap_or(8 * 1024 * 1024),
-                    enable_compression: false,
+                    enable_compression: config.client.enable_compression,
+                    enable_encryption: false,
+                    encryption_key: None,
                     timeout_seconds: config.server.timeout_seconds,
                 };
                 
@@ -244,6 +246,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             num_streams: config.client.parallel_streams.unwrap_or(8),
             buffer_size: config.client.buffer_size.unwrap_or(8 * 1024 * 1024),
             enable_compression: config.client.enable_compression,
+            enable_encryption: false,
+            encryption_key: None,
             timeout_seconds: config.client.timeout_seconds,
         };
         

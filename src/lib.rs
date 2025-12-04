@@ -22,9 +22,12 @@
 //! ```
 
 pub mod base;
+pub mod compression;
 pub mod config;
+pub mod encryption;
 pub mod error;
 pub mod progress;
+pub mod resume;
 pub mod tcp_server;
 pub mod tcp_transfer;
 pub mod utils;

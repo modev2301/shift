@@ -17,6 +17,10 @@ pub struct TransferConfig {
     pub buffer_size: usize,
     /// Whether compression is enabled.
     pub enable_compression: bool,
+    /// Whether encryption is enabled.
+    pub enable_encryption: bool,
+    /// Encryption key (32 bytes for AES-256-GCM).
+    pub encryption_key: Option<[u8; 32]>,
     /// Timeout for network operations in seconds.
     pub timeout_seconds: u64,
 }
@@ -28,6 +32,8 @@ impl Default for TransferConfig {
             num_streams: 8,
             buffer_size: 8 * 1024 * 1024,
             enable_compression: false,
+            enable_encryption: false,
+            encryption_key: None,
             timeout_seconds: 30,
         }
     }
@@ -89,7 +95,7 @@ impl TransferStats {
 }
 
 /// File range for parallel transfer.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileRange {
     /// Start offset in bytes.
     pub start: u64,

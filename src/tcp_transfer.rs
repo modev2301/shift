@@ -6,7 +6,10 @@
 
 use crate::error::TransferError;
 use crate::base::{split_file_ranges, FileRange, TransferConfig};
+use crate::compression::{compress, decompress, should_compress};
+use crate::encryption::{Decryptor, Encryptor};
 use crate::progress::{ProgressHandle, TransferProgress};
+use crate::resume::{delete_checkpoint, get_checkpoint_path, TransferCheckpoint};
 use std::fs::File;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -56,12 +59,29 @@ async fn transfer_range_tcp(
 
     let (_reader, mut writer) = stream.split();
 
-    // Send range header: start (8 bytes) + end (8 bytes)
-    let mut header = Vec::with_capacity(16);
+    // Send range header: start (8) + end (8) + flags (1 byte: bit 0=compression, bit 1=encryption)
+    let mut header = Vec::with_capacity(17);
     header.extend_from_slice(&range.start.to_le_bytes());
     header.extend_from_slice(&range.end.to_le_bytes());
+    let mut flags = 0u8;
+    if config.enable_compression {
+        flags |= 0x01;
+    }
+    if config.enable_encryption {
+        flags |= 0x02;
+    }
+    header.push(flags);
     writer.write_all(&header).await
         .map_err(|e| TransferError::NetworkError(format!("Failed to send range header: {}", e)))?;
+    
+    // Initialize encryptor if encryption is enabled
+    let mut encryptor = if config.enable_encryption {
+        config.encryption_key
+            .map(|key| Encryptor::new(&key, thread_id as u32))
+            .transpose()?
+    } else {
+        None
+    };
 
     // Read and send file data
     let mut offset = range.start;
@@ -98,8 +118,37 @@ async fn transfer_range_tcp(
             break;
         }
 
-        let data = &buffer[..bytes_read as usize];
-        writer.write_all(data).await
+        let mut data_to_send = buffer[..bytes_read as usize].to_vec();
+        
+        // Compress if enabled and data is compressible
+        if config.enable_compression && should_compress(&data_to_send) {
+            match compress(&data_to_send) {
+                Ok(compressed) => {
+                    data_to_send = compressed;
+                }
+                Err(_) => {
+                    // Compression failed, continue with uncompressed
+                }
+            }
+        }
+        
+        // Encrypt if enabled
+        if let Some(ref mut enc) = encryptor {
+            enc.encrypt_in_place(&mut data_to_send)?;
+        }
+        
+        // Send packet: compression flag (1) + size (8) + data
+        let mut packet = Vec::with_capacity(9 + data_to_send.len());
+        let compression_flag = if config.enable_compression && data_to_send.len() < bytes_read as usize {
+            0x01
+        } else {
+            0x00
+        };
+        packet.push(compression_flag);
+        packet.extend_from_slice(&(data_to_send.len() as u64).to_le_bytes());
+        packet.extend_from_slice(&data_to_send);
+        
+        writer.write_all(&packet).await
             .map_err(|e| TransferError::NetworkError(format!("Failed to send data: {}", e)))?;
 
         offset += bytes_read as u64;
@@ -134,7 +183,7 @@ pub async fn receive_range_tcp(
 ) -> Result<u64, TransferError> {
     let (mut reader, _writer) = stream.split();
 
-    // Read range header
+    // Read range header: start (8) + end (8) + flags (1)
     let mut start_buf = [0u8; 8];
     reader.read_exact(&mut start_buf).await
         .map_err(|e| TransferError::NetworkError(format!("Failed to read start offset: {}", e)))?;
@@ -144,6 +193,22 @@ pub async fn receive_range_tcp(
     reader.read_exact(&mut end_buf).await
         .map_err(|e| TransferError::NetworkError(format!("Failed to read end offset: {}", e)))?;
     let end_offset = u64::from_le_bytes(end_buf);
+    
+    let mut flags_buf = [0u8; 1];
+    reader.read_exact(&mut flags_buf).await
+        .map_err(|e| TransferError::NetworkError(format!("Failed to read flags: {}", e)))?;
+    let flags = flags_buf[0];
+    let _compression_enabled = (flags & 0x01) != 0;
+    let encryption_enabled = (flags & 0x02) != 0;
+    
+    // Initialize decryptor if encryption is enabled
+    let mut decryptor: Option<Decryptor> = if encryption_enabled {
+        config.encryption_key
+            .map(|key| Decryptor::new(&key, thread_id as u32))
+            .transpose()?
+    } else {
+        None
+    };
 
     info!(
         thread_id,
@@ -156,20 +221,59 @@ pub async fn receive_range_tcp(
     // Receive and write data
     let mut offset = start_offset;
     let mut buffer = vec![0u8; config.buffer_size.min(8 * 1024 * 1024)];
+    let mut decompress_buffer = Vec::new();
     let mut total_received = 0u64;
 
     while offset < end_offset {
         let remaining = (end_offset - offset) as usize;
         let read_size = buffer.len().min(remaining);
 
-        let bytes_read = reader.read(&mut buffer[..read_size]).await
-            .map_err(|e| TransferError::NetworkError(format!("Failed to read from stream: {}", e)))?;
-
+        // Read packet: compression flag (1) + size (8) + data
+        let mut flag_buf = [0u8; 1];
+        reader.read_exact(&mut flag_buf).await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to read compression flag: {}", e)))?;
+        
+        let mut size_buf = [0u8; 8];
+        reader.read_exact(&mut size_buf).await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to read data size: {}", e)))?;
+        let data_size = u64::from_le_bytes(size_buf) as usize;
+        
+        if data_size == 0 {
+            break;
+        }
+        
+        // Read encrypted/compressed data
+        let mut data_buf = vec![0u8; data_size];
+        reader.read_exact(&mut data_buf).await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to read data: {}", e)))?;
+        
+        // Decrypt if enabled
+        if let Some(ref mut dec) = decryptor {
+            let plaintext_len = dec.decrypt_in_place(&mut data_buf)?;
+            data_buf.truncate(plaintext_len);
+        }
+        
+        // Decompress if needed
+        let bytes_read = if flag_buf[0] == 0x01 {
+            decompress_buffer = decompress(&data_buf, read_size)?;
+            decompress_buffer.len()
+        } else {
+            // Copy uncompressed data to buffer
+            let copy_len = data_buf.len().min(buffer.len());
+            buffer[..copy_len].copy_from_slice(&data_buf[..copy_len]);
+            copy_len
+        };
+        
         if bytes_read == 0 {
             break;
         }
-
-        let data = &buffer[..bytes_read];
+        
+        // Determine which buffer to use for writing
+        let data = if flag_buf[0] == 0x01 && !decompress_buffer.is_empty() {
+            &decompress_buffer[..bytes_read]
+        } else {
+            &buffer[..bytes_read]
+        };
 
         // Use pwrite for thread-safe writes (Unix) or seek+write (other platforms)
         #[cfg(unix)]
@@ -340,8 +444,44 @@ pub async fn send_file_tcp(
 
     drop(metadata_stream);
 
+    // Check for existing checkpoint (resume support)
+    let checkpoint_path = get_checkpoint_path(file_path);
+    let mut checkpoint = if checkpoint_path.exists() {
+        info!("Found checkpoint file, attempting to resume transfer");
+        match TransferCheckpoint::load(&checkpoint_path) {
+            Ok(cp) if cp.file_size == file_size => cp,
+            Ok(_) => {
+                info!("Checkpoint file size mismatch, starting fresh transfer");
+                delete_checkpoint(file_path)?;
+                TransferCheckpoint::new(file_size)
+            }
+            Err(e) => {
+                info!(error = %e, "Failed to load checkpoint, starting fresh transfer");
+                delete_checkpoint(file_path)?;
+                TransferCheckpoint::new(file_size)
+            }
+        }
+    } else {
+        TransferCheckpoint::new(file_size)
+    };
+
     // Split file into ranges
-    let ranges = split_file_ranges(file_size, config.num_streams);
+    let all_ranges = split_file_ranges(file_size, config.num_streams);
+    let missing_ranges = checkpoint.get_missing_ranges(&all_ranges);
+    
+    if missing_ranges.is_empty() {
+        info!("All ranges already completed, transfer is complete");
+        delete_checkpoint(file_path)?;
+        return Ok(file_size);
+    }
+
+    info!(
+        total_ranges = all_ranges.len(),
+        completed_ranges = checkpoint.completed_ranges.len(),
+        missing_ranges = missing_ranges.len(),
+        "Resuming transfer"
+    );
+
     let file = Arc::new(File::open(file_path)?);
 
     // Establish parallel TCP connections for data (ports base+1, base+2, ...)
@@ -349,7 +489,10 @@ pub async fn send_file_tcp(
     let base_port = server_addr.port();
     let server_ip = server_addr.ip();
 
-    for (thread_id, range) in ranges.into_iter().enumerate() {
+    // Only transfer missing ranges
+    for (idx, range) in missing_ranges.iter().enumerate() {
+        let thread_id = idx;
+        let range = *range; // Copy the range
         let file = Arc::clone(&file);
         let config = config.clone();
         let target_port = base_port + 1 + thread_id as u16;
@@ -382,24 +525,36 @@ pub async fn send_file_tcp(
 
     // Wait for all connections to complete
     let mut total_sent = 0u64;
-    for (thread_id, handle) in handles.into_iter().enumerate() {
+    for (idx, handle) in handles.into_iter().enumerate() {
         match handle.await {
             Ok(Ok(bytes)) => {
                 total_sent += bytes;
+                // Mark range as completed in checkpoint
+                if idx < missing_ranges.len() {
+                    checkpoint.mark_completed(missing_ranges[idx]);
+                    checkpoint.save(&checkpoint_path)?;
+                }
                 info!(
-                    thread_id,
+                    thread_id = idx,
                     bytes,
                     "Connection completed"
                 );
             }
             Ok(Err(e)) => {
+                // Save checkpoint before returning error
+                let _ = checkpoint.save(&checkpoint_path);
                 return Err(e);
             }
             Err(e) => {
+                // Save checkpoint before returning error
+                let _ = checkpoint.save(&checkpoint_path);
                 return Err(TransferError::NetworkError(format!("Connection panicked: {:?}", e)));
             }
         }
     }
+    
+    // Delete checkpoint on successful completion
+    delete_checkpoint(file_path)?;
 
     // Wait for logger to finish
     let _ = logger_handle.await;
