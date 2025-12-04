@@ -68,3 +68,11 @@ docs/_build/
 *.db
 *.sqlite
 *.sqlite3
+
+# Reference implementations (not part of this project)
+vector/
+wdt/
+
+# Test files
+test_file.bin
+*.test

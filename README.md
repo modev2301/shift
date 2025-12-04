@@ -3,18 +3,17 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 
-Shift is a high-performance file transfer system designed for reliable, efficient data movement over TCP networks. Built with Rust, Shift uses multiple concurrent connections, binary protocol encoding, and SIMD-optimized operations to maximize throughput while maintaining data integrity.
+Shift is a high-performance file transfer system designed for reliable, efficient data movement over QUIC. Built with Rust, Shift leverages QUIC's built-in congestion control, multiplexing, and TLS 1.3 encryption to achieve maximum throughput while maintaining data integrity and security.
 
 ## Features
 
-- **Multi-connection transfers**: Establishes multiple TCP connections per transfer session to utilize available bandwidth
-- **Binary protocol**: Compact binary format for chunk data to eliminate JSON serialization overhead
-- **SIMD-optimized operations**: CRC32 checksum calculation and LZ4 compression use SIMD instructions where available
-- **Selective compression**: Automatically detects compressible data using entropy analysis
-- **Transfer resumption**: Tracks received chunks per session to enable resuming interrupted transfers
-- **Checksum validation**: Validates data integrity using CRC32 checksums computed over transmitted data
-- **Configurable chunking**: Supports configurable chunk sizes with automatic selection based on file size
-- **Zero-copy I/O**: Uses memory-mapped files and zero-copy operations where supported
+- **QUIC Transport**: Modern protocol with built-in congestion control, multiplexing, and encryption
+- **TLS 1.3 Encryption**: End-to-end encryption with automatic certificate management
+- **Parallel Streams**: Multiple concurrent streams per connection for maximum bandwidth utilization
+- **Thread-Safe I/O**: Uses `pread`/`pwrite` for efficient, thread-safe file operations
+- **High Throughput**: Optimized for wire-speed transfers with minimal overhead
+- **Configurable**: Flexible configuration for different network conditions and use cases
+- **Resume Support**: Track transfer progress and resume interrupted transfers
 
 ## Quick Start
 
@@ -70,32 +69,19 @@ Configuration is specified in TOML format. Create a `config.toml` file in the wo
 [server]
 address = "0.0.0.0"
 port = 8080
-num_connections = 8
 output_directory = "./downloads"
 max_clients = 10
-parallel_streams = 8
 buffer_size = 8388608
-enable_progress_bar = true
-enable_compression = false
-enable_resume = true
 timeout_seconds = 30
-max_file_size = 1073741824
-allowed_extensions = ["*"]
 
 [client]
 server_address = "127.0.0.1"
 server_port = 8080
-num_connections = 8
 parallel_streams = 8
-chunk_size = 8388608
 buffer_size = 8388608
-enable_compression = false
-enable_resume = true
 timeout_seconds = 30
 retry_attempts = 3
 retry_delay_ms = 1000
-progress_bar_enabled = true
-detailed_logging = true
 
 [security]
 auth_token = "shift_default_token"
@@ -106,56 +92,64 @@ simd_enabled = true
 zero_copy_enabled = true
 memory_pool_size = 2000
 connection_pool_size = 100
-compression_level = 1
 metrics_enabled = true
 ```
 
 ### Configuration Options
 
 **Server Configuration**:
-- `num_connections`: Number of TCP connections to accept per transfer session (default: 8)
-- `parallel_streams`: Number of concurrent chunk processing streams (default: 8)
-- `buffer_size`: Buffer size for chunk operations in bytes (default: 16MB)
-- `enable_compression`: Enable LZ4 compression for compressible data (default: false)
-- `enable_resume`: Enable transfer resumption support (default: true)
+- `port`: Port number to listen on (default: 8080)
+- `output_directory`: Directory to write received files (default: "./downloads")
+- `max_clients`: Maximum number of concurrent clients (default: 10)
+- `buffer_size`: Buffer size for I/O operations in bytes (default: 8MB)
+- `timeout_seconds`: Connection timeout in seconds (default: 30)
 
 **Client Configuration**:
-- `num_connections`: Number of TCP connections to establish per transfer (default: 8)
-- `chunk_size`: Size of file chunks in bytes (default: 16MB for large files)
-- `parallel_streams`: Number of concurrent compression/processing streams (default: 8)
-- `enable_compression`: Enable compression for compressible data (default: false)
+- `server_address`: Server hostname or IP address
+- `server_port`: Server port number (default: 8080)
+- `parallel_streams`: Number of parallel QUIC streams per transfer (default: 8)
+- `buffer_size`: Buffer size for I/O operations in bytes (default: 8MB)
+- `timeout_seconds`: Transfer timeout in seconds (default: 30)
+- `retry_attempts`: Number of retry attempts on failure (default: 3)
+- `retry_delay_ms`: Delay between retries in milliseconds (default: 1000)
 
 ## Architecture
 
-Shift uses an asynchronous I/O model built on Tokio. The architecture consists of:
+Shift uses QUIC for transport, providing:
+
+**QUIC Benefits**:
+- Built-in congestion control (BBR-style)
+- Multiplexing without head-of-line blocking
+- TLS 1.3 encryption by default
+- Connection migration and resilience
+- Low latency with 0-RTT handshakes
 
 **Client Components**:
-- File reader using zero-copy I/O where supported
-- Parallel chunk processing with configurable stream count
-- Multi-connection writer that distributes chunks across TCP connections
-- Checksum calculation using SIMD-optimized CRC32
+- QUIC endpoint with optimized transport configuration
+- Parallel stream management for file range distribution
+- Thread-safe file reading using `pread` (Linux) or seek-based I/O
+- Automatic retry and error recovery
 
 **Server Components**:
-- Connection handler that accepts multiple connections per session
-- Chunk receiver that validates checksums and handles decompression
-- Out-of-order chunk writer that writes chunks to disk at correct offsets
-- Session management that tracks received chunks and enables resumption
+- QUIC server endpoint with self-signed certificates (development)
+- Connection handler accepting multiple concurrent transfers
+- Thread-safe file writing using `pwrite` (Linux) or seek-based I/O
+- Stream coordination for parallel data reception
 
 **Protocol**:
-- Binary encoding for chunk data (magic byte 0xFF, type byte 0x01)
-- JSON encoding for control messages (handshake, acknowledgments)
-- Session-based transfer model with unique session identifiers
-- Minimal acknowledgment model relying on TCP flow control
+- Binary encoding for file metadata (filename, size, ranges)
+- Stream-based data transfer with automatic flow control
+- Minimal protocol overhead for maximum throughput
 
 ## Implementation Details
 
-**Chunk Distribution**: Chunks are assigned to connections using `chunk_id % num_connections` to ensure even distribution across available connections.
+**File Range Distribution**: Files are split into ranges, with each range transferred over a separate QUIC stream. This enables parallel transfer and optimal bandwidth utilization.
 
-**Checksum Validation**: CRC32 checksums are calculated on the data as transmitted (compressed if compression is enabled, original otherwise). Validation occurs before decompression to detect corruption early.
+**Thread-Safe I/O**: On Linux, uses `pread` and `pwrite` for thread-safe, offset-based file operations. On other platforms, uses seek-based I/O with file cloning.
 
-**Compression**: LZ4 compression is applied only when data is determined to be compressible via entropy analysis. Random or binary data is transmitted uncompressed to avoid CPU overhead.
+**Error Handling**: Failed streams are automatically retried. Transfer sessions maintain state to enable resumption after connection failures.
 
-**Error Handling**: Failed chunks are tracked and can be retried. Transfer sessions maintain state to enable resumption after connection failures.
+**Certificate Management**: Uses self-signed certificates for development. In production, configure proper TLS certificates for secure communication.
 
 ## Testing
 
@@ -165,21 +159,19 @@ Run the test suite:
 cargo test --release
 ```
 
-Tests cover error handling, configuration parsing, compression logic, checksum validation, and transfer session management.
+Tests cover error handling, configuration parsing, transfer logic, and file I/O operations.
 
 ## Performance
 
 Performance depends on network conditions, file characteristics, and system resources. Key performance factors:
 
-- **Chunk size**: Larger chunks reduce protocol overhead but increase memory usage
-- **Connection count**: Multiple connections enable better bandwidth utilization on high-latency networks
-- **Compression**: Only beneficial for compressible data; random data should have compression disabled
-- **SIMD operations**: CRC32 and compression benefit from SIMD when available
+- **Stream Count**: More parallel streams enable better bandwidth utilization
+- **Buffer Size**: Larger buffers reduce system call overhead
+- **Network Conditions**: QUIC adapts to network conditions automatically
+- **File I/O**: Thread-safe I/O operations enable efficient parallel transfers
 
-Network transfer performance should be measured end-to-end under actual network conditions. The system is designed to saturate available bandwidth through parallel connections and efficient protocol design.
+Network transfer performance should be measured end-to-end under actual network conditions. The system is designed to saturate available bandwidth through QUIC's efficient protocol design and parallel stream utilization.
 
 ## License
 
 MIT License
-
-

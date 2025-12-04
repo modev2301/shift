@@ -14,7 +14,7 @@ max_file_size = 1073741824
 allowed_extensions = ["*"]
 
 [client]
-server_address = "127.0.0.1"
+server_address = "3.142.69.49"
 server_port = 8080
 num_connections = 8
 parallel_streams = 8

@@ -116,29 +116,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Commands::Server => {
                 let config = Config::load_or_create(&cli.config)?;
                 
-                // Use blocking server
-                use shift::blocking_transfer::{blocking_server_loop, BlockingTransferConfig};
+                use shift::{receiver::Receiver, TransferConfig};
                 
-                let transfer_config = BlockingTransferConfig {
-                    num_threads: config.server.max_clients,
-                    base_port: config.server.port,
+                let transfer_config = TransferConfig {
+                    start_port: config.server.port,
+                    num_streams: config.server.max_clients,
                     buffer_size: config.server.buffer_size.unwrap_or(8 * 1024 * 1024),
                     enable_compression: false,
+                    timeout_seconds: config.server.timeout_seconds,
                 };
                 
-                println!("Shift Transfer Server");
-                println!("Listening on ports: {} to {}", 
-                    transfer_config.base_port, 
-                    transfer_config.base_port + transfer_config.num_threads as u16 - 1);
-                println!("Output directory: {}", config.server.output_directory);
-                println!("Config file: {:?}", cli.config);
-                println!("Server is running. Press Ctrl+C to stop.");
-                println!();
+                info!("Shift Transfer Server");
+                info!(
+                    port = transfer_config.start_port,
+                    streams = transfer_config.num_streams,
+                    "Server starting"
+                );
+                info!(
+                    output_dir = %config.server.output_directory,
+                    "Output directory configured"
+                );
                 
-                // Run blocking server loop (synchronous)
-                let output_dir = PathBuf::from(&config.server.output_directory);
-                let auth_token = Some(config.security.auth_token.clone());
-                blocking_server_loop(&output_dir, transfer_config, auth_token)?;
+                let receiver = Receiver::new(
+                    transfer_config.start_port,
+                    transfer_config.num_streams,
+                    PathBuf::from(&config.server.output_directory).as_path(),
+                )?;
+                
+                receiver.run_forever()?;
                 return Ok(());
             }
             Commands::Benchmark { output_dir } => {
@@ -240,14 +245,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         info!("Transferring {} files", files_to_transfer.len());
         
-        // Use blocking transfer (WDT-style) for maximum throughput
-        use shift::blocking_transfer::{blocking_client_transfer, BlockingTransferConfig};
+        // Use QUIC-based transfer for maximum throughput
+        use shift::{sender::Sender, TransferConfig};
+        
+        let transfer_config = TransferConfig {
+            start_port: remote.port.unwrap_or(8080),
+            num_streams: config.client.parallel_streams.unwrap_or(8),
+            buffer_size: config.client.buffer_size.unwrap_or(8 * 1024 * 1024),
+            enable_compression: config.client.enable_compression,
+            timeout_seconds: config.client.timeout_seconds,
+        };
+        
+        let sender = Sender::new(transfer_config)?;
         
         // Sort files by size (largest first) for better parallelism utilization
         files_to_transfer.sort_by(|a, b| {
             let size_a = std::fs::metadata(a).ok().map(|m| m.len()).unwrap_or(0);
             let size_b = std::fs::metadata(b).ok().map(|m| m.len()).unwrap_or(0);
-            size_b.cmp(&size_a) // Descending order
+            size_b.cmp(&size_a)
         });
         
         for (idx, local_file) in files_to_transfer.iter().enumerate() {
@@ -256,19 +271,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             
             info!("[{}/{}] Starting transfer: {}", file_idx, total_files, local_file.display());
             
-            // Create blocking transfer config
-            let transfer_config = BlockingTransferConfig {
-                num_threads: config.client.parallel_streams.unwrap_or(8),
-                base_port: remote.port.unwrap_or(8080),
-                buffer_size: config.client.buffer_size.unwrap_or(8 * 1024 * 1024),
-                enable_compression: config.client.enable_compression,
-            };
+            let server_addr = format!("{}:{}", remote.host, remote.port.unwrap_or(8080));
             
-            let server_addr = format!("{}", remote.host);
-            let auth_token = Some(config.security.auth_token.clone());
-            
-            // Run blocking transfer (synchronous, no async overhead)
-            match blocking_client_transfer(local_file, &server_addr, transfer_config, auth_token) {
+            // Transfer file using QUIC
+            match sender.transfer_file(local_file, &server_addr) {
                 Ok(_) => {
                     info!("[{}/{}] Transfer complete: {}", file_idx, total_files, local_file.display());
                 }
