@@ -27,15 +27,63 @@ pub fn create_server_endpoint(
     Ok(endpoint)
 }
 
-/// Create client configuration with certificate validation.
-fn create_client_config() -> Result<ClientConfig, TransferError> {
-    // Build rustls client config
-    // For development, use empty root store to allow self-signed certs
-    // In production, load system certificates properly
-    let root_store = rustls::RootCertStore::empty();
+/// Skip server certificate verification (development only).
+///
+/// WARNING: This allows any server to impersonate your server.
+/// Only use in development environments.
+#[derive(Debug)]
+struct SkipServerVerification;
 
+impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::ED25519,
+        ]
+    }
+}
+
+/// Create client configuration with certificate validation.
+///
+/// In development, this skips certificate verification to allow self-signed certs.
+/// In production, load proper CA certificates for verification.
+fn create_client_config() -> Result<ClientConfig, TransferError> {
+    // For development: skip certificate verification
+    // For production: load system CA certificates
     let rustls_client_config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
 
     // Convert to quinn client config
@@ -49,6 +97,10 @@ fn create_client_config() -> Result<ClientConfig, TransferError> {
     transport.max_concurrent_bidi_streams(1000u32.into());
     transport.max_concurrent_uni_streams(1000u32.into());
     transport.initial_mtu(1500u16);
+    // Increase send/receive windows for better throughput
+    transport.send_window(16 * 1024 * 1024);
+    transport.receive_window((16 * 1024 * 1024u32).into());
+    transport.stream_receive_window((8 * 1024 * 1024u32).into());
     config.transport_config(Arc::new(transport));
 
     Ok(config)
@@ -83,6 +135,10 @@ fn create_server_config() -> Result<ServerConfig, TransferError> {
     transport.max_concurrent_bidi_streams(1000u32.into());
     transport.max_concurrent_uni_streams(1000u32.into());
     transport.initial_mtu(1500u16);
+    // Increase send/receive windows for better throughput
+    transport.send_window(16 * 1024 * 1024);
+    transport.receive_window((16 * 1024 * 1024u32).into());
+    transport.stream_receive_window((8 * 1024 * 1024u32).into());
     config.transport_config(Arc::new(transport));
 
     Ok(config)

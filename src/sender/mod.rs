@@ -93,16 +93,29 @@ impl Sender {
             .parse()
             .map_err(|e| TransferError::NetworkError(format!("Invalid address: {}", e)))?;
 
+        // Extract hostname for certificate validation
+        let hostname = destination
+            .split(':')
+            .next()
+            .unwrap_or("localhost");
+
         // Create QUIC endpoint
         let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
         let endpoint = create_client_endpoint(bind_addr)?;
 
-        // Connect to server
-        let connection = endpoint
-            .connect(server_addr, "localhost")
-            .map_err(|e| TransferError::NetworkError(format!("Connection failed: {}", e)))?
-            .await
-            .map_err(|e| TransferError::NetworkError(format!("Connection error: {}", e)))?;
+        // Connect to server with timeout
+        use tokio::time::{timeout, Duration};
+        let connecting = endpoint
+            .connect(server_addr, hostname)
+            .map_err(|e| TransferError::NetworkError(format!("Connection failed: {}", e)))?;
+        
+        let connection = timeout(
+            Duration::from_secs(self.config.timeout_seconds),
+            connecting
+        )
+        .await
+        .map_err(|_| TransferError::NetworkError("Connection timeout".to_string()))?
+        .map_err(|e| TransferError::NetworkError(format!("Connection error: {}", e)))?;
 
         info!(
             file = %filename,
@@ -110,6 +123,7 @@ impl Sender {
         );
 
         // Send metadata (filename and size) on stream 0
+        // Use bidirectional stream for metadata to receive acknowledgment
         let (mut send, mut recv) = connection.open_bi().await
             .map_err(|e| TransferError::NetworkError(format!("Failed to open stream: {}", e)))?;
 

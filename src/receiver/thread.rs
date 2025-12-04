@@ -5,7 +5,6 @@
 
 use crate::error::TransferError;
 use crate::TransferConfig;
-use quinn::RecvStream;
 use std::fs::File;
 use std::io::{Seek, Write};
 use std::sync::Arc;
@@ -21,7 +20,7 @@ impl ReceiverThread {
     ///
     /// # Arguments
     ///
-    /// * `recv` - QUIC receive stream
+    /// * `recv` - QUIC unidirectional receive stream
     /// * `file` - File handle to write to
     /// * `config` - Transfer configuration
     ///
@@ -29,7 +28,7 @@ impl ReceiverThread {
     ///
     /// Returns the number of bytes received.
     pub async fn receive_range_async(
-        mut recv: RecvStream,
+        mut recv: quinn::RecvStream,
         file: Arc<File>,
         config: TransferConfig,
     ) -> Result<u64, TransferError> {

@@ -45,8 +45,8 @@ impl SenderThread {
             "Transferring file range"
         );
 
-        // Open a new bidirectional stream for this range
-        let (mut send, _recv) = connection.open_bi().await
+        // Open a new unidirectional stream for this range (we only send data)
+        let mut send = connection.open_uni().await
             .map_err(|e| TransferError::NetworkError(format!("Failed to open stream: {}", e)))?;
 
         // Send range header

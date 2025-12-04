@@ -185,7 +185,8 @@ impl Receiver {
             let config = config.clone();
 
             let handle = tokio::spawn(async move {
-                let (_send, recv) = connection.accept_bi().await
+                // Accept unidirectional stream from sender
+                let mut recv = connection.accept_uni().await
                     .map_err(|e| TransferError::NetworkError(format!("Stream error: {:?}", e)))?;
 
                 ReceiverThread::receive_range_async(recv, file, config).await
