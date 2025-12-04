@@ -212,7 +212,7 @@ impl TcpServer {
         }
 
         // Sync file to ensure all data is written to disk
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
             use libc;
@@ -222,7 +222,7 @@ impl TcpServer {
             }
         }
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(unix))]
         {
             let file_mut = std::fs::File::try_clone(&*file)?;
             file_mut.sync_all()?;

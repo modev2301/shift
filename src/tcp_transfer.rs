@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io::{Read, Seek, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use socket2::{Domain, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -69,8 +69,8 @@ async fn transfer_range_tcp(
         let remaining = (range.end - offset) as usize;
         let read_size = buffer.len().min(remaining);
 
-        // Use pread for thread-safe reads (Linux) or seek+read (other platforms)
-        #[cfg(target_os = "linux")]
+        // Use pread for thread-safe reads (Unix) or seek+read (other platforms)
+        #[cfg(unix)]
         let bytes_read = {
             let fd = file.as_raw_fd();
             unsafe {
@@ -83,7 +83,7 @@ async fn transfer_range_tcp(
             }
         };
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(unix))]
         let bytes_read = {
             let mut file_mut = File::try_clone(&*file)?;
             use std::io::SeekFrom;
@@ -162,8 +162,8 @@ pub async fn receive_range_tcp(
 
         let data = &buffer[..bytes_read];
 
-        // Use pwrite for thread-safe writes (Linux) or seek+write (other platforms)
-        #[cfg(target_os = "linux")]
+        // Use pwrite for thread-safe writes (Unix) or seek+write (other platforms)
+        #[cfg(unix)]
         {
             let fd = file.as_raw_fd();
             let written = unsafe {
@@ -186,7 +186,7 @@ pub async fn receive_range_tcp(
             }
         }
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(unix))]
         {
             let mut file_mut = File::try_clone(&*file)?;
             use std::io::SeekFrom;
@@ -208,7 +208,7 @@ pub async fn receive_range_tcp(
     }
 
     // Sync file data to ensure it's written to disk
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
         let fd = file.as_raw_fd();
         unsafe {
@@ -216,7 +216,7 @@ pub async fn receive_range_tcp(
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     {
         let file_mut = File::try_clone(&*file)?;
         file_mut.sync_all()?;
