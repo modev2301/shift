@@ -43,10 +43,11 @@ async fn transfer_range_tcp(
     mut stream: tokio::net::TcpStream,
     config: TransferConfig,
 ) -> Result<u64, TransferError> {
-    debug!(
+    info!(
         thread_id,
         start = range.start,
         end = range.end,
+        size = range.end - range.start,
         "Transferring file range over TCP"
     );
 
@@ -135,10 +136,11 @@ pub async fn receive_range_tcp(
         .map_err(|e| TransferError::NetworkError(format!("Failed to read end offset: {}", e)))?;
     let end_offset = u64::from_le_bytes(end_buf);
 
-    debug!(
+    info!(
         thread_id,
         start = start_offset,
         end = end_offset,
+        size = end_offset - start_offset,
         "Receiving file range over TCP"
     );
 
@@ -196,9 +198,19 @@ pub async fn receive_range_tcp(
         total_received += bytes_read as u64;
     }
 
-    debug!(
+    // Verify we received the expected amount of data
+    let expected_size = end_offset - start_offset;
+    if total_received != expected_size {
+        return Err(TransferError::ProtocolError(
+            format!("Range size mismatch: received {} bytes, expected {} bytes (range {} to {})",
+                total_received, expected_size, start_offset, end_offset)
+        ));
+    }
+
+    info!(
         thread_id,
         bytes = total_received,
+        expected = expected_size,
         "File range reception completed"
     );
 
