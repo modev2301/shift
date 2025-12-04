@@ -6,7 +6,19 @@
 use crate::error::TransferError;
 use quinn::{ClientConfig, Endpoint, ServerConfig};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+/// Initialize rustls crypto provider (called once on first use).
+static CRYPTO_INIT: OnceLock<()> = OnceLock::new();
+
+fn ensure_crypto_provider() {
+    CRYPTO_INIT.get_or_init(|| {
+        // Install default crypto provider for rustls (using ring)
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .expect("Failed to install rustls crypto provider");
+    });
+}
 
 /// Create a QUIC client endpoint with default configuration.
 pub fn create_client_endpoint(
@@ -79,6 +91,7 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
 /// In development, this skips certificate verification to allow self-signed certs.
 /// In production, load proper CA certificates for verification.
 fn create_client_config() -> Result<ClientConfig, TransferError> {
+    ensure_crypto_provider();
     // For development: skip certificate verification
     // For production: load system CA certificates
     let rustls_client_config = rustls::ClientConfig::builder()
@@ -108,6 +121,7 @@ fn create_client_config() -> Result<ClientConfig, TransferError> {
 
 /// Create server configuration with self-signed certificate.
 fn create_server_config() -> Result<ServerConfig, TransferError> {
+    ensure_crypto_provider();
     // Generate self-signed certificate for development
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
         .map_err(|e| TransferError::ProtocolError(format!("Failed to generate cert: {}", e)))?;
