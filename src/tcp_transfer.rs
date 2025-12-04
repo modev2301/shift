@@ -19,7 +19,7 @@ use tokio::net::TcpListener;
 use tracing::{debug, info};
 
 /// Configure TCP socket for high throughput.
-fn configure_tcp_socket(socket: &Socket) -> Result<(), TransferError> {
+pub fn configure_tcp_socket(socket: &Socket) -> Result<(), TransferError> {
     // Set send buffer to 8MB
     socket.set_send_buffer_size(8 * 1024 * 1024)
         .map_err(|e| TransferError::NetworkError(format!("Failed to set SO_SNDBUF: {}", e)))?;
@@ -116,7 +116,7 @@ async fn transfer_range_tcp(
 }
 
 /// Receive a file range over a single TCP connection.
-async fn receive_range_tcp(
+pub async fn receive_range_tcp(
     thread_id: usize,
     file: Arc<File>,
     mut stream: tokio::net::TcpStream,

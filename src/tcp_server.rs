@@ -5,9 +5,10 @@
 
 use crate::error::TransferError;
 use crate::base::TransferConfig;
-use crate::tcp_transfer::receive_file_tcp;
+use crate::tcp_transfer::{configure_tcp_socket, receive_range_tcp};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use socket2::{Domain, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -76,16 +77,18 @@ impl TcpServer {
 
         info!("Listening for connections on port {}", self.base_port);
 
+        // Accept metadata connections
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) => {
-                    info!(remote = %addr, "New connection accepted");
+                    info!(remote = %addr, "New metadata connection accepted");
                     let output_dir = self.output_dir.clone();
                     let config = self.config.clone();
                     let num_connections = self.num_connections;
+                    let base_port = self.base_port;
 
                     tokio::spawn(async move {
-                        if let Err(e) = Self::handle_connection(stream, addr, output_dir, num_connections, config).await {
+                        if let Err(e) = Self::handle_connection(stream, addr, output_dir, num_connections, base_port, config).await {
                             error!(error = %e, "Connection handling failed");
                         }
                     });
@@ -102,6 +105,7 @@ impl TcpServer {
         _addr: SocketAddr,
         output_dir: PathBuf,
         _num_connections: usize,
+        base_port: u16,
         config: TransferConfig,
     ) -> Result<(), TransferError> {
         // Read metadata: filename_len (8) + filename + file_size (8) + num_streams (8)
@@ -133,24 +137,84 @@ impl TcpServer {
             "Receiving file"
         );
 
-        // Send ACK
+        // Create data listeners BEFORE sending ACK so they're ready when client connects
+        let output_path = output_dir.join(&filename);
+        let file = std::fs::File::create(&output_path)?;
+        file.set_len(file_size)?;
+        let file = Arc::new(file);
+
+        let ranges = crate::base::split_file_ranges(file_size, num_streams);
+        let mut data_handles = Vec::new();
+
+        for (thread_id, _range) in ranges.into_iter().enumerate() {
+            let file = Arc::clone(&file);
+            let config = config.clone();
+            let data_port = base_port + 1 + thread_id as u16;
+
+            let handle = tokio::spawn(async move {
+                // Create and configure listening socket
+                let socket = Socket::new(Domain::IPV4, Type::STREAM, None)
+                    .map_err(|e| TransferError::NetworkError(format!("Failed to create socket: {}", e)))?;
+                configure_tcp_socket(&socket)?;
+
+                let addr: SocketAddr = format!("0.0.0.0:{}", data_port)
+                    .parse()
+                    .map_err(|e| TransferError::NetworkError(format!("Invalid address: {}", e)))?;
+                
+                socket.bind(&addr.into())
+                    .map_err(|e| TransferError::NetworkError(format!("Failed to bind: {}", e)))?;
+                socket.listen(1)
+                    .map_err(|e| TransferError::NetworkError(format!("Failed to listen: {}", e)))?;
+
+                socket.set_nonblocking(true)
+                    .map_err(|e| TransferError::NetworkError(format!("Failed to set nonblocking: {}", e)))?;
+                
+                let std_listener = std::net::TcpListener::from(socket);
+                let listener = TcpListener::from_std(std_listener)
+                    .map_err(|e| TransferError::NetworkError(format!("Failed to convert to tokio listener: {}", e)))?;
+
+                // Accept connection
+                let (data_stream, _) = listener.accept().await
+                    .map_err(|e| TransferError::NetworkError(format!("Accept failed: {}", e)))?;
+
+                receive_range_tcp(thread_id, file, data_stream, config).await
+            });
+
+            data_handles.push(handle);
+        }
+
+        // Now send ACK - data ports are ready
         stream.write_all(&[0x01]).await
             .map_err(|e| TransferError::NetworkError(format!("Failed to send ack: {}", e)))?;
 
         // Close metadata connection
         drop(stream);
 
-        // Receive file data on parallel connections (ports base+1, base+2, ...)
-        let output_path = output_dir.join(&filename);
-        let base_port = config.start_port;
-        
-        receive_file_tcp(&output_path, base_port + 1, num_streams, file_size, config).await?;
+        // Wait for all data connections to complete
+        let mut total_received = 0u64;
+        for (thread_id, handle) in data_handles.into_iter().enumerate() {
+            match handle.await {
+                Ok(Ok(bytes)) => {
+                    total_received += bytes;
+                    info!(
+                        thread_id,
+                        bytes,
+                        "Data connection completed"
+                    );
+                }
+                Ok(Err(e)) => {
+                    return Err(e);
+                }
+                Err(e) => {
+                    return Err(TransferError::NetworkError(format!("Data connection panicked: {:?}", e)));
+                }
+            }
+        }
 
-        // Reconnect to send final ACK (or we could keep metadata connection open)
-        // For now, we'll consider the transfer complete when all data connections finish
         info!(
             file = %filename,
-            bytes = file_size,
+            bytes = total_received,
+            expected = file_size,
             "File transfer completed"
         );
 
