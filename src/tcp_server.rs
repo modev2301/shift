@@ -211,6 +211,23 @@ impl TcpServer {
             }
         }
 
+        // Sync file to ensure all data is written to disk
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            use libc;
+            let fd = file.as_raw_fd();
+            unsafe {
+                libc::fsync(fd);
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let file_mut = std::fs::File::try_clone(&*file)?;
+            file_mut.sync_all()?;
+        }
+
         info!(
             file = %filename,
             bytes = total_received,

@@ -207,6 +207,21 @@ pub async fn receive_range_tcp(
         ));
     }
 
+    // Sync file data to ensure it's written to disk
+    #[cfg(target_os = "linux")]
+    {
+        let fd = file.as_raw_fd();
+        unsafe {
+            libc::fsync(fd);
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let file_mut = File::try_clone(&*file)?;
+        file_mut.sync_all()?;
+    }
+
     info!(
         thread_id,
         bytes = total_received,
