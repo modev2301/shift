@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 
-Shift is a high-performance file transfer system designed for reliable, efficient data movement over TCP. Built with Rust, Shift leverages parallel connections, optimized socket settings, and zero-copy I/O to achieve maximum throughput while maintaining data integrity and security.
+Shift is a high-performance file transfer system designed for reliable, efficient data movement over TCP. Built with Rust, Shift leverages parallel connections, optimized socket settings, and zero-copy I/O to achieve maximum throughput while maintaining data integrity and security. Cross-platform support for Linux, macOS, and Windows.
 
 ## Features
 
@@ -150,7 +150,7 @@ Shift uses parallel TCP connections for transport, providing:
 
 **File Range Distribution**: Files are split into ranges, with each range transferred over a separate TCP connection. This enables parallel transfer and optimal bandwidth utilization.
 
-**Thread-Safe I/O**: On Unix systems, uses `pread` and `pwrite` for thread-safe, offset-based file operations. On other platforms, uses seek-based I/O with file cloning.
+**Thread-Safe I/O**: On Unix systems (Linux, macOS), uses `pread` and `pwrite` for thread-safe, offset-based file operations. On Windows, uses seek-based I/O with file cloning for compatibility.
 
 **Resume Support**: Checkpoint files (`.shift_checkpoint`) track completed ranges, allowing transfers to resume from where they left off after interruption.
 
