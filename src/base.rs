@@ -15,6 +15,12 @@ pub struct TransferConfig {
     pub num_streams: usize,
     /// Buffer size for I/O operations in bytes.
     pub buffer_size: usize,
+    /// Socket send buffer size in bytes (SO_SNDBUF).
+    /// If None, uses default system value.
+    pub socket_send_buffer_size: Option<usize>,
+    /// Socket receive buffer size in bytes (SO_RCVBUF).
+    /// If None, uses default system value.
+    pub socket_recv_buffer_size: Option<usize>,
     /// Whether compression is enabled.
     pub enable_compression: bool,
     /// Whether encryption is enabled.
@@ -29,8 +35,10 @@ impl Default for TransferConfig {
     fn default() -> Self {
         Self {
             start_port: 8080,
-            num_streams: 8,
-            buffer_size: 8 * 1024 * 1024,
+            num_streams: 16,
+            buffer_size: 16 * 1024 * 1024,
+            socket_send_buffer_size: Some(16 * 1024 * 1024),
+            socket_recv_buffer_size: Some(16 * 1024 * 1024),
             enable_compression: false,
             enable_encryption: false,
             encryption_key: None,

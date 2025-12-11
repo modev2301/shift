@@ -13,12 +13,30 @@
 //! # Example
 //!
 //! ```no_run
-//! use shift::{receiver::Receiver, Config};
+//! use shift::{tcp_server::TcpServer, Config, TransferConfig};
 //! use std::path::PathBuf;
 //!
-//! let config = Config::load_or_create(&"config.toml".into())?;
-//! let receiver = Receiver::new(config.server.port, 8, &config.server.output_directory)?;
-//! receiver.run_forever()?;
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let config = Config::load_or_create(&"config.toml".into())?;
+//!     let transfer_config = TransferConfig {
+//!         start_port: config.server.port,
+//!         num_streams: 16,
+//!         buffer_size: 16 * 1024 * 1024,
+//!         enable_compression: false,
+//!         enable_encryption: false,
+//!         encryption_key: None,
+//!         timeout_seconds: 30,
+//!     };
+//!     let server = TcpServer::new(
+//!         config.server.port,
+//!         16,
+//!         config.server.output_directory.into(),
+//!         transfer_config,
+//!     );
+//!     server.run_forever().await?;
+//!     Ok(())
+//! }
 //! ```
 
 pub mod base;
@@ -26,6 +44,7 @@ pub mod compression;
 pub mod config;
 pub mod encryption;
 pub mod error;
+pub mod file_io;
 pub mod progress;
 pub mod resume;
 pub mod tcp_server;

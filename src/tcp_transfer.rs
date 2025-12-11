@@ -8,14 +8,13 @@ use crate::error::TransferError;
 use crate::base::{split_file_ranges, FileRange, TransferConfig};
 use crate::compression::{compress, decompress, should_compress};
 use crate::encryption::{Decryptor, Encryptor};
+use crate::file_io::{open_file_optimized, read_at};
 use crate::progress::{ProgressHandle, TransferProgress};
 use crate::resume::{delete_checkpoint, get_checkpoint_path, TransferCheckpoint};
 use std::fs::File;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-#[cfg(unix)]
-use std::os::unix::io::AsRawFd;
 use socket2::{Domain, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -24,18 +23,136 @@ use tokio::time::interval;
 use tracing::{debug, info};
 
 /// Configure TCP socket for high throughput.
-pub fn configure_tcp_socket(socket: &Socket) -> Result<(), TransferError> {
-    // Set send buffer to 8MB
-    socket.set_send_buffer_size(8 * 1024 * 1024)
-        .map_err(|e| TransferError::NetworkError(format!("Failed to set SO_SNDBUF: {}", e)))?;
+///
+/// Sets socket buffer sizes, enables TCP_NODELAY, and configures
+/// platform-specific optimizations:
+/// - Linux: BBR congestion control, TCP_CORK (write batching), TCP_QUICKACK (immediate ACKs)
+/// - All platforms: SO_KEEPALIVE with tuned parameters
+pub fn configure_tcp_socket(
+    socket: &Socket,
+    send_buffer_size: Option<usize>,
+    recv_buffer_size: Option<usize>,
+) -> Result<(), TransferError> {
+    // Set send buffer size if specified
+    if let Some(size) = send_buffer_size {
+        socket.set_send_buffer_size(size)
+            .map_err(|e| TransferError::NetworkError(format!("Failed to set SO_SNDBUF: {}", e)))?;
+        debug!("Socket send buffer set to {} bytes", size);
+    }
     
-    // Set receive buffer to 8MB
-    socket.set_recv_buffer_size(8 * 1024 * 1024)
-        .map_err(|e| TransferError::NetworkError(format!("Failed to set SO_RCVBUF: {}", e)))?;
+    // Set receive buffer size if specified
+    if let Some(size) = recv_buffer_size {
+        socket.set_recv_buffer_size(size)
+            .map_err(|e| TransferError::NetworkError(format!("Failed to set SO_RCVBUF: {}", e)))?;
+        debug!("Socket receive buffer set to {} bytes", size);
+    }
     
     // Enable TCP_NODELAY to disable Nagle's algorithm
     socket.set_nodelay(true)
         .map_err(|e| TransferError::NetworkError(format!("Failed to set TCP_NODELAY: {}", e)))?;
+    
+    // Set BBR congestion control on Linux
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::CString;
+        let bbr = CString::new("bbr").map_err(|e| {
+            TransferError::NetworkError(format!("Failed to create BBR string: {}", e))
+        })?;
+        
+        use std::os::unix::io::AsRawFd;
+        let result = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_CONGESTION,
+                bbr.as_ptr() as *const libc::c_void,
+                bbr.as_bytes().len() as libc::socklen_t,
+            )
+        };
+        
+        if result != 0 {
+            // BBR might not be available (kernel < 4.9 or module not loaded)
+            // This is not a fatal error, just log a debug message
+            debug!("Failed to set TCP_CONGESTION to BBR, using default congestion control");
+        } else {
+            debug!("TCP congestion control set to BBR");
+        }
+        
+        // Enable TCP_CORK for write batching
+        // TCP_CORK batches multiple small writes into fewer packets, reducing syscall overhead
+        let cork: libc::c_int = 1;
+        let result = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_CORK,
+                &cork as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        
+        if result != 0 {
+            debug!("Failed to set TCP_CORK, continuing without write batching");
+        } else {
+            debug!("TCP_CORK enabled for write batching");
+        }
+        
+        // Enable TCP_QUICKACK to send ACKs immediately
+        // This reduces latency and improves throughput, especially on the receiver side
+        let quickack: libc::c_int = 1;
+        let result = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_QUICKACK,
+                &quickack as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        
+        if result != 0 {
+            debug!("Failed to set TCP_QUICKACK, continuing with default ACK behavior");
+        } else {
+            debug!("TCP_QUICKACK enabled for immediate ACKs");
+        }
+    }
+    
+    // Enable keepalive to detect dead connections quickly
+    socket.set_keepalive(true)
+        .map_err(|e| TransferError::NetworkError(format!("Failed to set SO_KEEPALIVE: {}", e)))?;
+    
+    // Set keepalive parameters (platform-specific)
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let keepidle: libc::c_int = 30; // Start keepalive after 30 seconds of inactivity
+        let keepintvl: libc::c_int = 10; // Send keepalive probes every 10 seconds
+        let keepcnt: libc::c_int = 3; // Send 3 probes before considering connection dead
+        
+        unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPIDLE,
+                &keepidle as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPINTVL,
+                &keepintvl as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPCNT,
+                &keepcnt as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
     
     Ok(())
 }
@@ -85,40 +202,22 @@ async fn transfer_range_tcp(
 
     // Read and send file data
     let mut offset = range.start;
-    let mut buffer = vec![0u8; config.buffer_size.min(8 * 1024 * 1024)];
+    let buffer_size = config.buffer_size.min(16 * 1024 * 1024);
+    let mut buffer = vec![0u8; buffer_size];
     let mut total_sent = 0u64;
 
     while offset < range.end {
         let remaining = (range.end - offset) as usize;
         let read_size = buffer.len().min(remaining);
 
-        // Use pread for thread-safe reads (Unix) or seek+read (other platforms)
-        #[cfg(unix)]
-        let bytes_read = {
-            let fd = file.as_raw_fd();
-            unsafe {
-                libc::pread(
-                    fd,
-                    buffer.as_mut_ptr() as *mut libc::c_void,
-                    read_size,
-                    offset as libc::off_t,
-                )
-            }
-        };
+        // Use optimized read_at function
+        let bytes_read = read_at(&file, &mut buffer[..read_size], offset)?;
 
-        #[cfg(not(unix))]
-        let bytes_read = {
-            let mut file_mut = File::try_clone(&*file)?;
-            use std::io::SeekFrom;
-            file_mut.seek(SeekFrom::Start(offset))?;
-            file_mut.read(&mut buffer[..read_size])? as i64
-        };
-
-        if bytes_read <= 0 {
+        if bytes_read == 0 {
             break;
         }
 
-        let mut data_to_send = buffer[..bytes_read as usize].to_vec();
+        let mut data_to_send = buffer[..bytes_read].to_vec();
         
         // Compress if enabled and data is compressible
         if config.enable_compression && should_compress(&data_to_send) {
@@ -139,7 +238,7 @@ async fn transfer_range_tcp(
         
         // Send packet: compression flag (1) + size (8) + data
         let mut packet = Vec::with_capacity(9 + data_to_send.len());
-        let compression_flag = if config.enable_compression && data_to_send.len() < bytes_read as usize {
+        let compression_flag = if config.enable_compression && data_to_send.len() < bytes_read {
             0x01
         } else {
             0x00
@@ -148,6 +247,7 @@ async fn transfer_range_tcp(
         packet.extend_from_slice(&(data_to_send.len() as u64).to_le_bytes());
         packet.extend_from_slice(&data_to_send);
         
+        // Write all data - tokio's write_all already handles partial writes efficiently
         writer.write_all(&packet).await
             .map_err(|e| TransferError::NetworkError(format!("Failed to send data: {}", e)))?;
 
@@ -161,6 +261,7 @@ async fn transfer_range_tcp(
     }
 
     // Flush and shutdown write side
+    // Note: shutdown() automatically flushes any TCP_CORK batched data on Linux
     writer.shutdown().await
         .map_err(|e| TransferError::NetworkError(format!("Failed to shutdown stream: {}", e)))?;
 
@@ -220,7 +321,7 @@ pub async fn receive_range_tcp(
 
     // Receive and write data
     let mut offset = start_offset;
-    let mut buffer = vec![0u8; config.buffer_size.min(8 * 1024 * 1024)];
+    let mut buffer = vec![0u8; config.buffer_size.min(16 * 1024 * 1024)];
     let mut decompress_buffer = Vec::new();
     let mut total_received = 0u64;
 
@@ -278,6 +379,7 @@ pub async fn receive_range_tcp(
         // Use pwrite for thread-safe writes (Unix) or seek+write (other platforms)
         #[cfg(unix)]
         {
+            use std::os::unix::io::AsRawFd;
             let fd = file.as_raw_fd();
             let written = unsafe {
                 libc::pwrite(
@@ -328,6 +430,7 @@ pub async fn receive_range_tcp(
     // Sync file data to ensure it's written to disk
     #[cfg(unix)]
     {
+        use std::os::unix::io::AsRawFd;
         let fd = file.as_raw_fd();
         unsafe {
             libc::fsync(fd);
@@ -406,8 +509,16 @@ pub async fn send_file_tcp(
     // Send metadata on base port
     let metadata_socket = Socket::new(Domain::IPV4, Type::STREAM, None)
         .map_err(|e| TransferError::NetworkError(format!("Failed to create socket: {}", e)))?;
-    metadata_socket.set_send_buffer_size(8 * 1024 * 1024)
-        .map_err(|e| TransferError::NetworkError(format!("Failed to set SO_SNDBUF: {}", e)))?;
+    
+    // Configure metadata socket with configurable buffer sizes
+    if let Some(size) = config.socket_send_buffer_size {
+        metadata_socket.set_send_buffer_size(size)
+            .map_err(|e| TransferError::NetworkError(format!("Failed to set SO_SNDBUF: {}", e)))?;
+    }
+    if let Some(size) = config.socket_recv_buffer_size {
+        metadata_socket.set_recv_buffer_size(size)
+            .map_err(|e| TransferError::NetworkError(format!("Failed to set SO_RCVBUF: {}", e)))?;
+    }
     metadata_socket.set_nodelay(true)
         .map_err(|e| TransferError::NetworkError(format!("Failed to set TCP_NODELAY: {}", e)))?;
 
@@ -482,7 +593,8 @@ pub async fn send_file_tcp(
         "Resuming transfer"
     );
 
-    let file = Arc::new(File::open(file_path)?);
+    // Open file with optimizations (O_DIRECT for large files on Linux)
+    let file = Arc::new(open_file_optimized(file_path, file_size)?);
 
     // Establish parallel TCP connections for data (ports base+1, base+2, ...)
     let mut handles = Vec::new();
@@ -502,7 +614,11 @@ pub async fn send_file_tcp(
             // Create and configure socket using socket2
             let socket = Socket::new(Domain::IPV4, Type::STREAM, None)
                 .map_err(|e| TransferError::NetworkError(format!("Failed to create socket: {}", e)))?;
-            configure_tcp_socket(&socket)?;
+            configure_tcp_socket(
+                &socket,
+                config.socket_send_buffer_size,
+                config.socket_recv_buffer_size,
+            )?;
 
             // Connect to server
             let server_addr = SocketAddr::new(server_ip, target_port);
@@ -614,7 +730,11 @@ pub async fn receive_file_tcp(
             // Create and configure listening socket using socket2
             let socket = Socket::new(Domain::IPV4, Type::STREAM, None)
                 .map_err(|e| TransferError::NetworkError(format!("Failed to create socket: {}", e)))?;
-            configure_tcp_socket(&socket)?;
+            configure_tcp_socket(
+                &socket,
+                config.socket_send_buffer_size,
+                config.socket_recv_buffer_size,
+            )?;
 
             let addr: SocketAddr = format!("0.0.0.0:{}", listen_port)
                 .parse()

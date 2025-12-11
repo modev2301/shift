@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use shift::Config;
+use shift::{config::DEFAULT_PARALLEL_STREAMS, Config};
 use std::path::PathBuf;
 use tracing::info;
 
@@ -116,7 +116,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let transfer_config = TransferConfig {
                     start_port: config.server.port,
                     num_streams: config.server.max_clients,
-                    buffer_size: config.server.buffer_size.unwrap_or(8 * 1024 * 1024),
+                    buffer_size: config.server.buffer_size.unwrap_or(16 * 1024 * 1024),
+                    socket_send_buffer_size: config.server.socket_send_buffer_size,
+                    socket_recv_buffer_size: config.server.socket_recv_buffer_size,
                     enable_compression: config.client.enable_compression,
                     enable_encryption: false,
                     encryption_key: None,
@@ -243,8 +245,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         let transfer_config = TransferConfig {
             start_port: remote.port.unwrap_or(8080),
-            num_streams: config.client.parallel_streams.unwrap_or(8),
-            buffer_size: config.client.buffer_size.unwrap_or(8 * 1024 * 1024),
+            num_streams: config.client.parallel_streams.unwrap_or(DEFAULT_PARALLEL_STREAMS),
+            buffer_size: config.client.buffer_size.unwrap_or(16 * 1024 * 1024),
+            socket_send_buffer_size: config.client.socket_send_buffer_size,
+            socket_recv_buffer_size: config.client.socket_recv_buffer_size,
             enable_compression: config.client.enable_compression,
             enable_encryption: false,
             encryption_key: None,

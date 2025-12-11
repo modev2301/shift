@@ -52,10 +52,14 @@ impl TcpServer {
             .map_err(|e| TransferError::NetworkError(format!("Failed to create socket: {}", e)))?;
         
         // Configure socket for high throughput
-        metadata_socket.set_send_buffer_size(8 * 1024 * 1024)
-            .map_err(|e| TransferError::NetworkError(format!("Failed to set SO_SNDBUF: {}", e)))?;
-        metadata_socket.set_recv_buffer_size(8 * 1024 * 1024)
-            .map_err(|e| TransferError::NetworkError(format!("Failed to set SO_RCVBUF: {}", e)))?;
+        if let Some(size) = self.config.socket_send_buffer_size {
+            metadata_socket.set_send_buffer_size(size)
+                .map_err(|e| TransferError::NetworkError(format!("Failed to set SO_SNDBUF: {}", e)))?;
+        }
+        if let Some(size) = self.config.socket_recv_buffer_size {
+            metadata_socket.set_recv_buffer_size(size)
+                .map_err(|e| TransferError::NetworkError(format!("Failed to set SO_RCVBUF: {}", e)))?;
+        }
         metadata_socket.set_nodelay(true)
             .map_err(|e| TransferError::NetworkError(format!("Failed to set TCP_NODELAY: {}", e)))?;
 
@@ -155,7 +159,11 @@ impl TcpServer {
                 // Create and configure listening socket
                 let socket = Socket::new(Domain::IPV4, Type::STREAM, None)
                     .map_err(|e| TransferError::NetworkError(format!("Failed to create socket: {}", e)))?;
-                configure_tcp_socket(&socket)?;
+                configure_tcp_socket(
+                    &socket,
+                    config.socket_send_buffer_size,
+                    config.socket_recv_buffer_size,
+                )?;
 
                 let addr: SocketAddr = format!("0.0.0.0:{}", data_port)
                     .parse()

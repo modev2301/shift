@@ -75,7 +75,7 @@ pub fn get_optimal_chunk_size_for_file(file_size: u64) -> usize {
     match file_size {
         0..=SMALL_FILE_THRESHOLD => 256 * 1024, // 256KB for small files
         SMALL_FILE_THRESHOLD_PLUS_ONE..=MEDIUM_FILE_THRESHOLD => 1024 * 1024, // 1MB for medium files
-        _ => 8 * 1024 * 1024, // 8MB for large files
+        _ => 16 * 1024 * 1024, // 16MB for large files
     }
 }
 
@@ -132,7 +132,7 @@ mod tests {
         );
         assert_eq!(
             get_optimal_chunk_size_for_file(200 * 1024 * 1024),
-            8 * 1024 * 1024
+            16 * 1024 * 1024
         );
     }
 }

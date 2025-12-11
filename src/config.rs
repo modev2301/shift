@@ -13,7 +13,7 @@ use std::path::PathBuf;
 // Default chunk size balances protocol overhead and memory usage.
 // Larger chunks reduce protocol overhead but increase memory requirements.
 pub const BASE_CHUNK_SIZE: usize = 1024 * 1024; // 1MB
-pub const DEFAULT_PARALLEL_STREAMS: usize = 8;
+pub const DEFAULT_PARALLEL_STREAMS: usize = 16;
 pub const MEMORY_POOL_SIZE: usize = 2000;
 pub const SIMD_CHUNK_SIZE: usize = 1024 * 1024; // 1MB for SIMD operations
 pub const ZERO_COPY_ENABLED: bool = true;
@@ -64,6 +64,10 @@ pub struct ServerConfig {
     pub max_clients: usize,
     pub parallel_streams: Option<usize>,
     pub buffer_size: Option<usize>,
+    /// Socket send buffer size in bytes (SO_SNDBUF). If None, uses system default.
+    pub socket_send_buffer_size: Option<usize>,
+    /// Socket receive buffer size in bytes (SO_RCVBUF). If None, uses system default.
+    pub socket_recv_buffer_size: Option<usize>,
     pub enable_progress_bar: bool,
     pub enable_compression: bool,
     pub enable_resume: bool,
@@ -81,6 +85,10 @@ pub struct ClientConfig {
     pub parallel_streams: Option<usize>,
     pub chunk_size: Option<usize>,
     pub buffer_size: Option<usize>,
+    /// Socket send buffer size in bytes (SO_SNDBUF). If None, uses system default.
+    pub socket_send_buffer_size: Option<usize>,
+    /// Socket receive buffer size in bytes (SO_RCVBUF). If None, uses system default.
+    pub socket_recv_buffer_size: Option<usize>,
     pub enable_compression: bool,
     pub enable_resume: bool,
     pub timeout_seconds: u64,
@@ -169,6 +177,8 @@ impl Default for ServerConfig {
             num_connections: Some(8),
             parallel_streams: Some(DEFAULT_PARALLEL_STREAMS),
             buffer_size: Some(BASE_CHUNK_SIZE),
+            socket_send_buffer_size: Some(16 * 1024 * 1024), // 16MB default
+            socket_recv_buffer_size: Some(16 * 1024 * 1024), // 16MB default
             enable_progress_bar: PROGRESS_BAR_ENABLED,
             enable_compression: true,
             enable_resume: true,
@@ -188,6 +198,8 @@ impl Default for ClientConfig {
             parallel_streams: Some(DEFAULT_PARALLEL_STREAMS),
             chunk_size: Some(BASE_CHUNK_SIZE),
             buffer_size: Some(BASE_CHUNK_SIZE),
+            socket_send_buffer_size: Some(16 * 1024 * 1024), // 16MB default
+            socket_recv_buffer_size: Some(16 * 1024 * 1024), // 16MB default
             enable_compression: true,
             enable_resume: true,
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
@@ -343,7 +355,7 @@ mod tests {
     #[test]
     fn test_constants() {
         assert_eq!(BASE_CHUNK_SIZE, 1024 * 1024); // 1MB
-        assert_eq!(DEFAULT_PARALLEL_STREAMS, 8);
+        assert_eq!(DEFAULT_PARALLEL_STREAMS, 16);
         assert_eq!(MEMORY_POOL_SIZE, 2000);
         assert_eq!(SIMD_CHUNK_SIZE, 1024 * 1024);
         assert!(ZERO_COPY_ENABLED);
