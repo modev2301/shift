@@ -59,18 +59,17 @@ pub struct Config {
 pub struct ServerConfig {
     pub address: String,
     pub port: u16,
-    pub num_connections: Option<usize>,
     pub output_directory: String,
     pub max_clients: usize,
+    /// Parallel streams (auto-calculated if not specified)
     pub parallel_streams: Option<usize>,
+    /// Buffer size (auto-calculated if not specified, default: 16MB)
     pub buffer_size: Option<usize>,
-    /// Socket send buffer size in bytes (SO_SNDBUF). If None, uses system default.
+    /// Socket send buffer size (auto-calculated if not specified, default: 16MB)
     pub socket_send_buffer_size: Option<usize>,
-    /// Socket receive buffer size in bytes (SO_RCVBUF). If None, uses system default.
+    /// Socket receive buffer size (auto-calculated if not specified, default: 16MB)
     pub socket_recv_buffer_size: Option<usize>,
-    pub enable_progress_bar: bool,
     pub enable_compression: bool,
-    pub enable_resume: bool,
     pub timeout_seconds: u64,
     pub max_file_size: Option<u64>,
     pub allowed_extensions: Option<Vec<String>>,
@@ -81,21 +80,18 @@ pub struct ServerConfig {
 pub struct ClientConfig {
     pub server_address: String,
     pub server_port: u16,
-    pub num_connections: Option<usize>,
+    /// Parallel streams (auto-calculated based on file size if not specified)
     pub parallel_streams: Option<usize>,
-    pub chunk_size: Option<usize>,
+    /// Buffer size (auto-calculated if not specified, default: 16MB)
     pub buffer_size: Option<usize>,
-    /// Socket send buffer size in bytes (SO_SNDBUF). If None, uses system default.
+    /// Socket send buffer size (auto-calculated if not specified, default: 16MB)
     pub socket_send_buffer_size: Option<usize>,
-    /// Socket receive buffer size in bytes (SO_RCVBUF). If None, uses system default.
+    /// Socket receive buffer size (auto-calculated if not specified, default: 16MB)
     pub socket_recv_buffer_size: Option<usize>,
     pub enable_compression: bool,
-    pub enable_resume: bool,
     pub timeout_seconds: u64,
     pub retry_attempts: u32,
     pub retry_delay_ms: u64,
-    pub progress_bar_enabled: bool,
-    pub detailed_logging: bool,
 }
 
 /// Security and authentication configuration.
@@ -170,20 +166,17 @@ impl Default for Config {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            address: "127.0.0.1".to_string(),
+            address: "0.0.0.0".to_string(),
             port: 8080,
             output_directory: "./downloads".to_string(),
             max_clients: 100,
-            num_connections: Some(8),
-            parallel_streams: Some(DEFAULT_PARALLEL_STREAMS),
-            buffer_size: Some(BASE_CHUNK_SIZE),
-            socket_send_buffer_size: Some(16 * 1024 * 1024), // 16MB default
-            socket_recv_buffer_size: Some(16 * 1024 * 1024), // 16MB default
-            enable_progress_bar: PROGRESS_BAR_ENABLED,
-            enable_compression: true,
-            enable_resume: true,
+            parallel_streams: None, // Auto-calculated
+            buffer_size: None, // Auto-calculated (default: 16MB)
+            socket_send_buffer_size: None, // Auto-calculated (default: 16MB)
+            socket_recv_buffer_size: None, // Auto-calculated (default: 16MB)
+            enable_compression: false,
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
-            max_file_size: Some(1024 * 1024 * 1024), // 1GB
+            max_file_size: None,
             allowed_extensions: Some(vec!["*".to_string()]),
         }
     }
@@ -194,19 +187,14 @@ impl Default for ClientConfig {
         Self {
             server_address: "127.0.0.1".to_string(),
             server_port: 8080,
-            num_connections: Some(8),
-            parallel_streams: Some(DEFAULT_PARALLEL_STREAMS),
-            chunk_size: Some(BASE_CHUNK_SIZE),
-            buffer_size: Some(BASE_CHUNK_SIZE),
-            socket_send_buffer_size: Some(16 * 1024 * 1024), // 16MB default
-            socket_recv_buffer_size: Some(16 * 1024 * 1024), // 16MB default
-            enable_compression: true,
-            enable_resume: true,
+            parallel_streams: None, // Auto-calculated based on file size
+            buffer_size: None, // Auto-calculated (default: 16MB)
+            socket_send_buffer_size: None, // Auto-calculated (default: 16MB)
+            socket_recv_buffer_size: None, // Auto-calculated (default: 16MB)
+            enable_compression: false,
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
             retry_attempts: MAX_RETRY_ATTEMPTS,
             retry_delay_ms: RETRY_DELAY_MS,
-            progress_bar_enabled: PROGRESS_BAR_ENABLED,
-            detailed_logging: DETAILED_LOGGING,
         }
     }
 }
@@ -242,7 +230,7 @@ mod tests {
     fn test_config_default() {
         let config = Config::default();
 
-        assert_eq!(config.server.address, "127.0.0.1");
+        assert_eq!(config.server.address, "0.0.0.0");
         assert_eq!(config.server.port, 8080);
         assert_eq!(config.client.server_address, "127.0.0.1");
         assert_eq!(config.client.server_port, 8080);
@@ -254,15 +242,13 @@ mod tests {
     fn test_server_config_default() {
         let config = ServerConfig::default();
 
-        assert_eq!(config.address, "127.0.0.1");
+        assert_eq!(config.address, "0.0.0.0");
         assert_eq!(config.port, 8080);
         assert_eq!(config.output_directory, "./downloads");
         assert_eq!(config.max_clients, 100);
-        assert_eq!(config.parallel_streams, Some(DEFAULT_PARALLEL_STREAMS));
-        assert_eq!(config.buffer_size, Some(BASE_CHUNK_SIZE));
-        assert!(config.enable_progress_bar);
-        assert!(config.enable_compression);
-        assert!(config.enable_resume);
+        assert_eq!(config.parallel_streams, None); // Auto-calculated
+        assert_eq!(config.buffer_size, None); // Auto-calculated
+        assert!(!config.enable_compression); // Default: false
         assert_eq!(config.timeout_seconds, DEFAULT_TIMEOUT_SECONDS);
     }
 
@@ -272,11 +258,9 @@ mod tests {
 
         assert_eq!(config.server_address, "127.0.0.1");
         assert_eq!(config.server_port, 8080);
-        assert_eq!(config.parallel_streams, Some(DEFAULT_PARALLEL_STREAMS));
-        assert_eq!(config.chunk_size, Some(BASE_CHUNK_SIZE));
-        assert_eq!(config.buffer_size, Some(BASE_CHUNK_SIZE));
-        assert!(config.enable_compression);
-        assert!(config.enable_resume);
+        assert_eq!(config.parallel_streams, None); // Auto-calculated
+        assert_eq!(config.buffer_size, None); // Auto-calculated
+        assert!(!config.enable_compression); // Default: false
         assert_eq!(config.timeout_seconds, DEFAULT_TIMEOUT_SECONDS);
         assert_eq!(config.retry_attempts, MAX_RETRY_ATTEMPTS);
         assert_eq!(config.retry_delay_ms, RETRY_DELAY_MS);
@@ -348,7 +332,7 @@ mod tests {
         let config = Config::load_or_create(&config_path).unwrap();
 
         assert!(config_path.exists());
-        assert_eq!(config.server.address, "127.0.0.1");
+        assert_eq!(config.server.address, "0.0.0.0");
         assert_eq!(config.server.port, 8080);
     }
 

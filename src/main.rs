@@ -113,13 +113,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 
                 use shift::{tcp_server::TcpServer, TransferConfig};
                 
+                // Smart defaults: 16MB buffers for optimal performance
+                let buffer_size = config.server.buffer_size.unwrap_or(16 * 1024 * 1024);
+                let socket_send_buffer = config.server.socket_send_buffer_size.unwrap_or(16 * 1024 * 1024);
+                let socket_recv_buffer = config.server.socket_recv_buffer_size.unwrap_or(16 * 1024 * 1024);
+                
                 let transfer_config = TransferConfig {
                     start_port: config.server.port,
                     num_streams: config.server.parallel_streams.unwrap_or(DEFAULT_PARALLEL_STREAMS),
-                    buffer_size: config.server.buffer_size.unwrap_or(16 * 1024 * 1024),
-                    socket_send_buffer_size: config.server.socket_send_buffer_size,
-                    socket_recv_buffer_size: config.server.socket_recv_buffer_size,
-                    enable_compression: config.client.enable_compression,
+                    buffer_size,
+                    socket_send_buffer_size: Some(socket_send_buffer),
+                    socket_recv_buffer_size: Some(socket_recv_buffer),
+                    enable_compression: config.server.enable_compression,
                     enable_encryption: false,
                     encryption_key: None,
                     timeout_seconds: config.server.timeout_seconds,
@@ -266,12 +271,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         
+        // Smart defaults: 16MB buffers for optimal performance
+        let buffer_size = config.client.buffer_size.unwrap_or(16 * 1024 * 1024);
+        let socket_send_buffer = config.client.socket_send_buffer_size.unwrap_or(16 * 1024 * 1024);
+        let socket_recv_buffer = config.client.socket_recv_buffer_size.unwrap_or(16 * 1024 * 1024);
+        
         let transfer_config = TransferConfig {
             start_port: remote.port.unwrap_or(8080),
             num_streams,
-            buffer_size: config.client.buffer_size.unwrap_or(16 * 1024 * 1024),
-            socket_send_buffer_size: config.client.socket_send_buffer_size,
-            socket_recv_buffer_size: config.client.socket_recv_buffer_size,
+            buffer_size,
+            socket_send_buffer_size: Some(socket_send_buffer),
+            socket_recv_buffer_size: Some(socket_recv_buffer),
             enable_compression: config.client.enable_compression,
             enable_encryption: false,
             encryption_key: None,

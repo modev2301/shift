@@ -66,24 +66,23 @@ Configuration is specified in TOML format. Create a `config.toml` file in the wo
 address = "0.0.0.0"
 port = 8080
 output_directory = "./downloads"
-max_clients = 10
-buffer_size = 8388608
-timeout_seconds = 30
+max_clients = 100
+# Optional: Override auto-calculated values
+# parallel_streams = 16
+# buffer_size = 16777216  # Default: 16MB
 enable_compression = false
-enable_resume = true
+timeout_seconds = 30
 
 [client]
 server_address = "127.0.0.1"
 server_port = 8080
-# parallel_streams is optional - will be auto-calculated based on file size if omitted
-# parallel_streams = 8
-buffer_size = 8388608
+# Optional: Override auto-calculated values
+# parallel_streams = 16  # Auto-calculated based on file size
+# buffer_size = 16777216  # Default: 16MB
+enable_compression = false
 timeout_seconds = 30
 retry_attempts = 3
 retry_delay_ms = 1000
-enable_compression = false
-enable_resume = true
-progress_bar_enabled = true
 
 [security]
 auth_token = "shift_default_token"
@@ -94,6 +93,7 @@ simd_enabled = true
 zero_copy_enabled = true
 memory_pool_size = 2000
 connection_pool_size = 100
+compression_level = 1
 metrics_enabled = true
 ```
 
@@ -102,26 +102,30 @@ metrics_enabled = true
 **Server Configuration**:
 - `port`: Port number to listen on (default: 8080)
 - `output_directory`: Directory to write received files (default: "./downloads")
-- `max_clients`: Maximum number of concurrent clients (default: 10)
-- `buffer_size`: Buffer size for I/O operations in bytes (default: 8MB)
-- `timeout_seconds`: Connection timeout in seconds (default: 30)
+- `max_clients`: Maximum number of concurrent clients (default: 100)
+- `parallel_streams`: Number of parallel connections (optional, auto-calculated if not specified)
+- `buffer_size`: Buffer size in bytes (optional, default: 16MB)
+- `socket_send_buffer_size`: Socket send buffer size (optional, default: 16MB)
+- `socket_recv_buffer_size`: Socket receive buffer size (optional, default: 16MB)
 - `enable_compression`: Enable LZ4 compression (default: false)
-- `enable_resume`: Enable resume support (default: true)
+- `timeout_seconds`: Connection timeout in seconds (default: 30)
 
 **Client Configuration**:
 - `server_address`: Server hostname or IP address
 - `server_port`: Server port number (default: 8080)
-- `parallel_streams`: Number of parallel TCP connections per transfer (optional, auto-calculated based on file size if not specified)
+- `parallel_streams`: Number of parallel TCP connections (optional, auto-calculated based on file size)
   - Small files (< 100MB): 4-8 streams
   - Medium files (100MB - 1GB): 8-16 streams
   - Large files (> 1GB): 16-32 streams
-- `buffer_size`: Buffer size for I/O operations in bytes (default: 8MB)
+- `buffer_size`: Buffer size in bytes (optional, default: 16MB)
+- `socket_send_buffer_size`: Socket send buffer size (optional, default: 16MB)
+- `socket_recv_buffer_size`: Socket receive buffer size (optional, default: 16MB)
+- `enable_compression`: Enable LZ4 compression (default: false)
 - `timeout_seconds`: Transfer timeout in seconds (default: 30)
 - `retry_attempts`: Number of retry attempts on failure (default: 3)
 - `retry_delay_ms`: Delay between retries in milliseconds (default: 1000)
-- `enable_compression`: Enable LZ4 compression (default: false)
-- `enable_resume`: Enable resume support (default: true)
-- `progress_bar_enabled`: Show progress bar during transfers (default: true)
+
+**Note**: Resume support and progress bars are always enabled by default and do not need to be configured.
 
 ## Architecture
 
