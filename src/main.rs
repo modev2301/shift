@@ -115,7 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 
                 let transfer_config = TransferConfig {
                     start_port: config.server.port,
-                    num_streams: config.server.max_clients,
+                    num_streams: config.server.parallel_streams.unwrap_or(DEFAULT_PARALLEL_STREAMS),
                     buffer_size: config.server.buffer_size.unwrap_or(16 * 1024 * 1024),
                     socket_send_buffer_size: config.server.socket_send_buffer_size,
                     socket_recv_buffer_size: config.server.socket_recv_buffer_size,
@@ -241,11 +241,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         // Use TCP-based transfer for maximum throughput
         use shift::{tcp_transfer::send_file_tcp, TransferConfig};
+        use shift::utils::calculate_optimal_parallel_streams;
         use std::net::ToSocketAddrs;
+        
+        // Calculate optimal parallel streams automatically if not specified
+        let num_streams = if let Some(streams) = config.client.parallel_streams {
+            streams
+        } else {
+            // Auto-calculate based on total file size
+            let total_size: u64 = files_to_transfer.iter()
+                .filter_map(|path| std::fs::metadata(path).ok().map(|m| m.len()))
+                .sum();
+            
+            if total_size > 0 {
+                let calculated = calculate_optimal_parallel_streams(total_size, None);
+                info!(
+                    total_size = total_size,
+                    calculated_streams = calculated,
+                    "Auto-calculated optimal parallel streams"
+                );
+                calculated
+            } else {
+                DEFAULT_PARALLEL_STREAMS
+            }
+        };
         
         let transfer_config = TransferConfig {
             start_port: remote.port.unwrap_or(8080),
-            num_streams: config.client.parallel_streams.unwrap_or(DEFAULT_PARALLEL_STREAMS),
+            num_streams,
             buffer_size: config.client.buffer_size.unwrap_or(16 * 1024 * 1024),
             socket_send_buffer_size: config.client.socket_send_buffer_size,
             socket_recv_buffer_size: config.client.socket_recv_buffer_size,

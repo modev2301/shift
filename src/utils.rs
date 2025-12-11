@@ -79,10 +79,55 @@ pub fn get_optimal_chunk_size_for_file(file_size: u64) -> usize {
     }
 }
 
-/// Calculate optimal number of parallel streams
+/// Calculate optimal number of parallel streams based on file size.
+///
+/// Automatically determines the best number of parallel connections to maximize
+/// throughput. Uses file size as the primary factor, with reasonable bounds.
+///
+/// # Arguments
+///
+/// * `file_size` - Size of the file in bytes
+/// * `estimated_latency_ms` - Optional network latency in milliseconds for high-latency adjustments
+///
+/// # Returns
+///
+/// Returns the optimal number of parallel streams, bounded between 4 and 32.
+pub fn calculate_optimal_parallel_streams(file_size: u64, estimated_latency_ms: Option<u64>) -> usize {
+    // Base calculation: 1 stream per 200MB for large files
+    // For small files (< 100MB), use fewer streams to avoid overhead
+    let size_based_streams = if file_size < 100 * 1024 * 1024 {
+        // Small files: 4-8 streams
+        std::cmp::max(4, (file_size / (25 * 1024 * 1024)).max(1) as usize)
+    } else if file_size < 1024 * 1024 * 1024 {
+        // Medium files (100MB - 1GB): 8-16 streams
+        std::cmp::max(8, std::cmp::min(16, (file_size / (100 * 1024 * 1024)).max(1) as usize))
+    } else {
+        // Large files (> 1GB): 16-32 streams
+        std::cmp::max(16, std::cmp::min(32, (file_size / (200 * 1024 * 1024)).max(1) as usize))
+    };
+    
+    // Adjust for high latency: more streams help fill the pipe
+    let latency_adjusted = if let Some(latency_ms) = estimated_latency_ms {
+        if latency_ms > 50 {
+            // High latency (>50ms): increase streams to fill bandwidth-delay product
+            let bdp_multiplier = (latency_ms as f64 / 50.0).min(2.0);
+            ((size_based_streams as f64) * bdp_multiplier).ceil() as usize
+        } else {
+            size_based_streams
+        }
+    } else {
+        size_based_streams
+    };
+    
+    // Bound between 4 and 32 streams
+    std::cmp::max(4, std::cmp::min(32, latency_adjusted))
+}
+
+/// Calculate optimal number of parallel streams (legacy function for compatibility).
+#[deprecated(note = "Use calculate_optimal_parallel_streams instead")]
 pub fn calculate_parallel_streams(file_size: u64, network_bandwidth_mbps: f64) -> usize {
     let optimal_streams = (network_bandwidth_mbps / 100.0).ceil() as usize;
-    let size_based_streams = (file_size / (100 * 1024 * 1024)).max(1) as usize; // 1 stream per 100MB
+    let size_based_streams = (file_size / (100 * 1024 * 1024)).max(1) as usize;
 
     std::cmp::min(
         std::cmp::max(optimal_streams, size_based_streams),
@@ -134,5 +179,31 @@ mod tests {
             get_optimal_chunk_size_for_file(200 * 1024 * 1024),
             16 * 1024 * 1024
         );
+    }
+
+    #[test]
+    fn test_calculate_optimal_parallel_streams() {
+        // Small files should use 4-8 streams
+        assert!(calculate_optimal_parallel_streams(10 * 1024 * 1024, None) >= 4);
+        assert!(calculate_optimal_parallel_streams(10 * 1024 * 1024, None) <= 8);
+        
+        // Medium files should use 8-16 streams
+        assert!(calculate_optimal_parallel_streams(500 * 1024 * 1024, None) >= 8);
+        assert!(calculate_optimal_parallel_streams(500 * 1024 * 1024, None) <= 16);
+        
+        // Large files should use 16-32 streams
+        assert!(calculate_optimal_parallel_streams(3 * 1024 * 1024 * 1024, None) >= 16);
+        assert!(calculate_optimal_parallel_streams(3 * 1024 * 1024 * 1024, None) <= 32);
+        
+        // Very large files should cap at 32
+        assert_eq!(calculate_optimal_parallel_streams(100 * 1024 * 1024 * 1024, None), 32);
+        
+        // Very small files should have minimum of 4
+        assert!(calculate_optimal_parallel_streams(1024, None) >= 4);
+        
+        // High latency should increase streams
+        let low_latency = calculate_optimal_parallel_streams(500 * 1024 * 1024, Some(10));
+        let high_latency = calculate_optimal_parallel_streams(500 * 1024 * 1024, Some(100));
+        assert!(high_latency >= low_latency);
     }
 }

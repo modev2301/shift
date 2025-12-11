@@ -8,6 +8,7 @@ Shift is a high-performance file transfer system designed for reliable, efficien
 ## Features
 
 - **Parallel TCP Connections**: Multiple concurrent connections per transfer for maximum bandwidth utilization
+- **Automatic Stream Calculation**: Automatically determines optimal number of parallel streams based on file size
 - **Thread-Safe I/O**: Uses `pread`/`pwrite` for efficient, thread-safe file operations on Unix systems
 - **Resume Support**: Track transfer progress and resume interrupted transfers
 - **LZ4 Compression**: Automatic compression of compressible data to reduce transfer time
@@ -74,7 +75,8 @@ enable_resume = true
 [client]
 server_address = "127.0.0.1"
 server_port = 8080
-parallel_streams = 8
+# parallel_streams is optional - will be auto-calculated based on file size if omitted
+# parallel_streams = 8
 buffer_size = 8388608
 timeout_seconds = 30
 retry_attempts = 3
@@ -109,7 +111,10 @@ metrics_enabled = true
 **Client Configuration**:
 - `server_address`: Server hostname or IP address
 - `server_port`: Server port number (default: 8080)
-- `parallel_streams`: Number of parallel TCP connections per transfer (default: 8)
+- `parallel_streams`: Number of parallel TCP connections per transfer (optional, auto-calculated based on file size if not specified)
+  - Small files (< 100MB): 4-8 streams
+  - Medium files (100MB - 1GB): 8-16 streams
+  - Large files (> 1GB): 16-32 streams
 - `buffer_size`: Buffer size for I/O operations in bytes (default: 8MB)
 - `timeout_seconds`: Transfer timeout in seconds (default: 30)
 - `retry_attempts`: Number of retry attempts on failure (default: 3)

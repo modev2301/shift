@@ -16,8 +16,8 @@ allowed_extensions = ["*"]
 [client]
 server_address = "3.142.69.49"
 server_port = 8080
-num_connections = 24
-parallel_streams = 24
+num_connections = 19
+parallel_streams = 19
 chunk_size = 8388608
 buffer_size = 8388608
 enable_compression = false
