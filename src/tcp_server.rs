@@ -194,12 +194,9 @@ impl TcpServer {
             data_handles.push(handle);
         }
 
-        // Now send ACK - data ports are ready
+        // Now send initial ACK - data ports are ready
         stream.write_all(&[0x01]).await
-            .map_err(|e| TransferError::NetworkError(format!("Failed to send ack: {}", e)))?;
-
-        // Close metadata connection
-        drop(stream);
+            .map_err(|e| TransferError::NetworkError(format!("Failed to send initial ack: {}", e)))?;
 
         // Wait for all data connections to complete
         let mut total_received = 0u64;
@@ -238,6 +235,10 @@ impl TcpServer {
             let file_mut = std::fs::File::try_clone(&*file)?;
             file_mut.sync_all()?;
         }
+
+        // Send final ACK after all transfers complete
+        stream.write_all(&[0x02]).await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to send final ack: {}", e)))?;
 
         info!(
             file = %filename,

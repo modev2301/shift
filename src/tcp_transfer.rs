@@ -544,16 +544,14 @@ pub async fn send_file_tcp(
     writer.write_all(&metadata).await
         .map_err(|e| TransferError::NetworkError(format!("Failed to send metadata: {}", e)))?;
 
-    // Wait for ACK
+    // Wait for initial ACK (0x01) - server is ready for data connections
     let mut ack_buf = [0u8; 1];
     reader.read_exact(&mut ack_buf).await
-        .map_err(|e| TransferError::NetworkError(format!("Failed to receive ack: {}", e)))?;
+        .map_err(|e| TransferError::NetworkError(format!("Failed to receive initial ack: {}", e)))?;
 
     if ack_buf[0] != 0x01 {
-        return Err(TransferError::ProtocolError("Invalid ACK from server".to_string()));
+        return Err(TransferError::ProtocolError("Invalid initial ACK from server".to_string()));
     }
-
-    drop(metadata_stream);
 
     // Check for existing checkpoint (resume support)
     let checkpoint_path = get_checkpoint_path(file_path);
@@ -668,6 +666,17 @@ pub async fn send_file_tcp(
             }
         }
     }
+    
+    // Wait for final ACK (0x02) - server confirms all data received
+    let mut final_ack_buf = [0u8; 1];
+    reader.read_exact(&mut final_ack_buf).await
+        .map_err(|e| TransferError::NetworkError(format!("Failed to receive final ack: {}", e)))?;
+
+    if final_ack_buf[0] != 0x02 {
+        return Err(TransferError::ProtocolError("Invalid final ACK from server".to_string()));
+    }
+
+    drop(metadata_stream);
     
     // Delete checkpoint on successful completion
     delete_checkpoint(file_path)?;
