@@ -141,6 +141,9 @@ impl TcpServer {
             "Receiving file"
         );
 
+        // Ensure output directory exists
+        std::fs::create_dir_all(&output_dir)?;
+
         // Create data listeners BEFORE sending ACK so they're ready when client connects
         let output_path = output_dir.join(&filename);
         let file = std::fs::File::create(&output_path)?;

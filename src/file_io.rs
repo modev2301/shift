@@ -8,11 +8,6 @@ use crate::error::TransferError;
 use std::fs::File;
 use std::path::Path;
 
-/// Threshold for using direct I/O (O_DIRECT).
-/// Files larger than this will use direct I/O to bypass page cache.
-#[cfg(target_os = "linux")]
-const DIRECT_IO_THRESHOLD: u64 = 100 * 1024 * 1024; // 100MB
-
 /// Disk block size for alignment (typically 512 bytes or 4KB).
 /// O_DIRECT requires buffers and offsets to be aligned to this size.
 #[cfg(target_os = "linux")]
