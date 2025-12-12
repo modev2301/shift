@@ -4,25 +4,21 @@ port = 8080
 output_directory = "./downloads"
 max_clients = 100
 # Optional: Override auto-calculated values
-# parallel_streams = 16
-# buffer_size = 16777216
-# socket_send_buffer_size = 16777216
-# socket_recv_buffer_size = 16777216
+# parallel_streams = 16  # Auto-calculated if not specified
+# buffer_size = 16777216  # Auto-calculated based on file size
+# socket_send_buffer_size = 16777216  # Auto-calculated based on file size
+# socket_recv_buffer_size = 16777216  # Auto-calculated based on file size
 enable_compression = false
-timeout_seconds = 30
 
 [client]
 server_address = "127.0.0.1"
 server_port = 8080
 # Optional: Override auto-calculated values
 # parallel_streams = 16  # Auto-calculated based on file size if not specified
-# buffer_size = 16777216  # Default: 16MB
-# socket_send_buffer_size = 16777216  # Default: 16MB
-# socket_recv_buffer_size = 16777216  # Default: 16MB
+# buffer_size = 16777216  # Auto-calculated based on file size
+# socket_send_buffer_size = 16777216  # Auto-calculated based on file size
+# socket_recv_buffer_size = 16777216  # Auto-calculated based on file size
 enable_compression = false
-timeout_seconds = 30
-retry_attempts = 3
-retry_delay_ms = 1000
 
 [security]
 auth_token = "shift_default_token"

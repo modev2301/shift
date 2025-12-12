@@ -104,11 +104,10 @@ metrics_enabled = true
 - `output_directory`: Directory to write received files (default: "./downloads")
 - `max_clients`: Maximum number of concurrent clients (default: 100)
 - `parallel_streams`: Number of parallel connections (optional, auto-calculated if not specified)
-- `buffer_size`: Buffer size in bytes (optional, default: 16MB)
-- `socket_send_buffer_size`: Socket send buffer size (optional, default: 16MB)
-- `socket_recv_buffer_size`: Socket receive buffer size (optional, default: 16MB)
+- `buffer_size`: Buffer size in bytes (optional, auto-calculated based on file size)
+- `socket_send_buffer_size`: Socket send buffer size (optional, auto-calculated)
+- `socket_recv_buffer_size`: Socket receive buffer size (optional, auto-calculated)
 - `enable_compression`: Enable LZ4 compression (default: false)
-- `timeout_seconds`: Connection timeout in seconds (default: 30)
 
 **Client Configuration**:
 - `server_address`: Server hostname or IP address
@@ -117,15 +116,15 @@ metrics_enabled = true
   - Small files (< 100MB): 4-8 streams
   - Medium files (100MB - 1GB): 8-16 streams
   - Large files (> 1GB): 16-32 streams
-- `buffer_size`: Buffer size in bytes (optional, default: 16MB)
-- `socket_send_buffer_size`: Socket send buffer size (optional, default: 16MB)
-- `socket_recv_buffer_size`: Socket receive buffer size (optional, default: 16MB)
+- `buffer_size`: Buffer size in bytes (optional, auto-calculated based on file size)
+  - Small files (< 100MB): 4-8MB buffers
+  - Medium files (100MB - 1GB): 8-16MB buffers
+  - Large files (> 1GB): 16-32MB buffers
+- `socket_send_buffer_size`: Socket send buffer size (optional, auto-calculated)
+- `socket_recv_buffer_size`: Socket receive buffer size (optional, auto-calculated)
 - `enable_compression`: Enable LZ4 compression (default: false)
-- `timeout_seconds`: Transfer timeout in seconds (default: 30)
-- `retry_attempts`: Number of retry attempts on failure (default: 3)
-- `retry_delay_ms`: Delay between retries in milliseconds (default: 1000)
 
-**Note**: Resume support and progress bars are always enabled by default and do not need to be configured.
+**Note**: Resume support, progress bars, timeouts (30s), and retry logic (3 attempts, 1s delay) are always enabled with sensible defaults and do not need to be configured.
 
 ## Architecture
 

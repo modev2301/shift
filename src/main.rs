@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use shift::{config::DEFAULT_PARALLEL_STREAMS, Config};
+use shift::{config::{DEFAULT_PARALLEL_STREAMS, DEFAULT_TIMEOUT_SECONDS}, Config};
 use std::path::PathBuf;
 use tracing::info;
 
@@ -113,21 +113,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 
                 use shift::{tcp_server::TcpServer, TransferConfig};
                 
-                // Smart defaults: 16MB buffers for optimal performance
-                let buffer_size = config.server.buffer_size.unwrap_or(16 * 1024 * 1024);
-                let socket_send_buffer = config.server.socket_send_buffer_size.unwrap_or(16 * 1024 * 1024);
-                let socket_recv_buffer = config.server.socket_recv_buffer_size.unwrap_or(16 * 1024 * 1024);
+                let num_streams = config.server.parallel_streams.unwrap_or(DEFAULT_PARALLEL_STREAMS);
+                
+                // Auto-calculate buffer sizes if not specified
+                use shift::utils::calculate_optimal_buffer_size;
+                let buffer_size = config.server.buffer_size.unwrap_or_else(|| {
+                    // Use a default file size estimate for server (1GB)
+                    calculate_optimal_buffer_size(1024 * 1024 * 1024, num_streams)
+                });
+                let socket_buffer = config.server.socket_send_buffer_size
+                    .or(config.server.socket_recv_buffer_size)
+                    .unwrap_or_else(|| calculate_optimal_buffer_size(1024 * 1024 * 1024, num_streams));
                 
                 let transfer_config = TransferConfig {
                     start_port: config.server.port,
-                    num_streams: config.server.parallel_streams.unwrap_or(DEFAULT_PARALLEL_STREAMS),
+                    num_streams,
                     buffer_size,
-                    socket_send_buffer_size: Some(socket_send_buffer),
-                    socket_recv_buffer_size: Some(socket_recv_buffer),
+                    socket_send_buffer_size: Some(socket_buffer),
+                    socket_recv_buffer_size: Some(socket_buffer),
                     enable_compression: config.server.enable_compression,
                     enable_encryption: false,
                     encryption_key: None,
-                    timeout_seconds: config.server.timeout_seconds,
+                    timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
                 };
                 
                 info!("Shift Transfer Server");
@@ -271,21 +278,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         
-        // Smart defaults: 16MB buffers for optimal performance
-        let buffer_size = config.client.buffer_size.unwrap_or(16 * 1024 * 1024);
-        let socket_send_buffer = config.client.socket_send_buffer_size.unwrap_or(16 * 1024 * 1024);
-        let socket_recv_buffer = config.client.socket_recv_buffer_size.unwrap_or(16 * 1024 * 1024);
+        // Auto-calculate buffer sizes based on file size if not specified
+        use shift::utils::calculate_optimal_buffer_size;
+        let total_size: u64 = files_to_transfer.iter()
+            .filter_map(|path| std::fs::metadata(path).ok().map(|m| m.len()))
+            .sum();
+        
+        let buffer_size = config.client.buffer_size.unwrap_or_else(|| {
+            if total_size > 0 {
+                calculate_optimal_buffer_size(total_size, num_streams)
+            } else {
+                16 * 1024 * 1024 // Default fallback
+            }
+        });
+        
+        let socket_buffer = config.client.socket_send_buffer_size
+            .or(config.client.socket_recv_buffer_size)
+            .unwrap_or_else(|| {
+                if total_size > 0 {
+                    calculate_optimal_buffer_size(total_size, num_streams)
+                } else {
+                    16 * 1024 * 1024 // Default fallback
+                }
+            });
         
         let transfer_config = TransferConfig {
             start_port: remote.port.unwrap_or(8080),
             num_streams,
             buffer_size,
-            socket_send_buffer_size: Some(socket_send_buffer),
-            socket_recv_buffer_size: Some(socket_recv_buffer),
+            socket_send_buffer_size: Some(socket_buffer),
+            socket_recv_buffer_size: Some(socket_buffer),
             enable_compression: config.client.enable_compression,
             enable_encryption: false,
             encryption_key: None,
-            timeout_seconds: config.client.timeout_seconds,
+            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
         };
         
         // Sort files by size (largest first) for better parallelism utilization

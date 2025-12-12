@@ -63,14 +63,13 @@ pub struct ServerConfig {
     pub max_clients: usize,
     /// Parallel streams (auto-calculated if not specified)
     pub parallel_streams: Option<usize>,
-    /// Buffer size (auto-calculated if not specified, default: 16MB)
+    /// Buffer size (auto-calculated if not specified)
     pub buffer_size: Option<usize>,
-    /// Socket send buffer size (auto-calculated if not specified, default: 16MB)
+    /// Socket send buffer size (auto-calculated if not specified)
     pub socket_send_buffer_size: Option<usize>,
-    /// Socket receive buffer size (auto-calculated if not specified, default: 16MB)
+    /// Socket receive buffer size (auto-calculated if not specified)
     pub socket_recv_buffer_size: Option<usize>,
     pub enable_compression: bool,
-    pub timeout_seconds: u64,
     pub max_file_size: Option<u64>,
     pub allowed_extensions: Option<Vec<String>>,
 }
@@ -82,16 +81,13 @@ pub struct ClientConfig {
     pub server_port: u16,
     /// Parallel streams (auto-calculated based on file size if not specified)
     pub parallel_streams: Option<usize>,
-    /// Buffer size (auto-calculated if not specified, default: 16MB)
+    /// Buffer size (auto-calculated if not specified)
     pub buffer_size: Option<usize>,
-    /// Socket send buffer size (auto-calculated if not specified, default: 16MB)
+    /// Socket send buffer size (auto-calculated if not specified)
     pub socket_send_buffer_size: Option<usize>,
-    /// Socket receive buffer size (auto-calculated if not specified, default: 16MB)
+    /// Socket receive buffer size (auto-calculated if not specified)
     pub socket_recv_buffer_size: Option<usize>,
     pub enable_compression: bool,
-    pub timeout_seconds: u64,
-    pub retry_attempts: u32,
-    pub retry_delay_ms: u64,
 }
 
 /// Security and authentication configuration.
@@ -171,11 +167,10 @@ impl Default for ServerConfig {
             output_directory: "./downloads".to_string(),
             max_clients: 100,
             parallel_streams: None, // Auto-calculated
-            buffer_size: None, // Auto-calculated (default: 16MB)
-            socket_send_buffer_size: None, // Auto-calculated (default: 16MB)
-            socket_recv_buffer_size: None, // Auto-calculated (default: 16MB)
+            buffer_size: None, // Auto-calculated
+            socket_send_buffer_size: None, // Auto-calculated
+            socket_recv_buffer_size: None, // Auto-calculated
             enable_compression: false,
-            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
             max_file_size: None,
             allowed_extensions: Some(vec!["*".to_string()]),
         }
@@ -188,13 +183,10 @@ impl Default for ClientConfig {
             server_address: "127.0.0.1".to_string(),
             server_port: 8080,
             parallel_streams: None, // Auto-calculated based on file size
-            buffer_size: None, // Auto-calculated (default: 16MB)
-            socket_send_buffer_size: None, // Auto-calculated (default: 16MB)
-            socket_recv_buffer_size: None, // Auto-calculated (default: 16MB)
+            buffer_size: None, // Auto-calculated
+            socket_send_buffer_size: None, // Auto-calculated
+            socket_recv_buffer_size: None, // Auto-calculated
             enable_compression: false,
-            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
-            retry_attempts: MAX_RETRY_ATTEMPTS,
-            retry_delay_ms: RETRY_DELAY_MS,
         }
     }
 }
@@ -249,7 +241,6 @@ mod tests {
         assert_eq!(config.parallel_streams, None); // Auto-calculated
         assert_eq!(config.buffer_size, None); // Auto-calculated
         assert!(!config.enable_compression); // Default: false
-        assert_eq!(config.timeout_seconds, DEFAULT_TIMEOUT_SECONDS);
     }
 
     #[test]
@@ -261,9 +252,6 @@ mod tests {
         assert_eq!(config.parallel_streams, None); // Auto-calculated
         assert_eq!(config.buffer_size, None); // Auto-calculated
         assert!(!config.enable_compression); // Default: false
-        assert_eq!(config.timeout_seconds, DEFAULT_TIMEOUT_SECONDS);
-        assert_eq!(config.retry_attempts, MAX_RETRY_ATTEMPTS);
-        assert_eq!(config.retry_delay_ms, RETRY_DELAY_MS);
     }
 
     #[test]
