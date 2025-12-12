@@ -10,7 +10,7 @@ pub struct TransferProgress {
     total_bytes: u64,
     transferred: Arc<AtomicU64>,
     pub(crate) start_time: Instant,
-    progress_bar: Option<ProgressBar>,
+    pub(crate) progress_bar: Option<ProgressBar>,
 }
 
 impl TransferProgress {
@@ -20,10 +20,11 @@ impl TransferProgress {
             let pb = ProgressBar::new(total_bytes);
             pb.set_style(
                 ProgressStyle::default_bar()
-                    .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
+                    .template("{msg} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, ETA: {eta})")
                     .unwrap()
-                    .progress_chars("#>-"),
+                    .progress_chars("█▉▊▋▌▍▎▏  "),
             );
+            pb.set_message("Transferring");
             Some(pb)
         } else {
             None
@@ -76,7 +77,7 @@ impl TransferProgress {
     /// Finish the progress bar.
     pub fn finish(&self) {
         if let Some(ref pb) = self.progress_bar {
-            pb.finish_with_message("Transfer complete");
+            pb.finish_with_message("Complete");
         }
     }
 }

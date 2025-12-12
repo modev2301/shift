@@ -166,7 +166,7 @@ async fn transfer_range_tcp(
     config: TransferConfig,
     progress: Option<ProgressHandle>,
 ) -> Result<u64, TransferError> {
-    info!(
+    tracing::debug!(
         thread_id,
         start = range.start,
         end = range.end,
@@ -476,20 +476,23 @@ pub async fn send_file_tcp(
         file = %filename,
         size = file_size,
         connections = config.num_streams,
-        "Starting TCP file transfer"
+        "Starting transfer"
     );
 
-    // Create progress tracker
+    // Create progress tracker with filename in message
     let progress = TransferProgress::new(file_size, true);
+    if let Some(ref pb) = progress.progress_bar {
+        pb.set_message(format!("{}", filename));
+    }
     let progress_handle = progress.handle();
     
-    // Spawn throughput logger
+    // Spawn throughput logger (only for debug logging, not visible in normal operation)
     let progress_for_logger = progress.handle();
     let filename_for_logger = filename.clone();
     let total_bytes = file_size;
     let start_time = std::time::Instant::now();
     let logger_handle = tokio::spawn(async move {
-        let mut interval = interval(Duration::from_secs(1));
+        let mut interval = interval(Duration::from_secs(5)); // Log every 5 seconds instead of 1
         loop {
             interval.tick().await;
             let transferred = progress_for_logger.transferred.load(std::sync::atomic::Ordering::Relaxed);
@@ -500,7 +503,8 @@ pub async fn send_file_tcp(
                 let elapsed = start_time.elapsed().as_secs_f64();
                 if elapsed > 0.0 {
                     let mbps = (transferred as f64 / (1024.0 * 1024.0)) / elapsed;
-                    info!(file = %filename_for_logger, throughput_mbps = mbps, transferred = transferred, total = total_bytes, "Transfer progress");
+                    // Use debug level instead of info to reduce noise
+                    tracing::debug!(file = %filename_for_logger, throughput_mbps = mbps, transferred = transferred, total = total_bytes, "Transfer progress");
                 }
             }
         }
@@ -556,16 +560,16 @@ pub async fn send_file_tcp(
     // Check for existing checkpoint (resume support)
     let checkpoint_path = get_checkpoint_path(file_path);
     let mut checkpoint = if checkpoint_path.exists() {
-        info!("Found checkpoint file, attempting to resume transfer");
+        tracing::debug!("Found checkpoint file, attempting to resume transfer");
         match TransferCheckpoint::load(&checkpoint_path) {
             Ok(cp) if cp.file_size == file_size => cp,
             Ok(_) => {
-                info!("Checkpoint file size mismatch, starting fresh transfer");
+                tracing::debug!("Checkpoint file size mismatch, starting fresh transfer");
                 delete_checkpoint(file_path)?;
                 TransferCheckpoint::new(file_size)
             }
             Err(e) => {
-                info!(error = %e, "Failed to load checkpoint, starting fresh transfer");
+                tracing::debug!(error = %e, "Failed to load checkpoint, starting fresh transfer");
                 delete_checkpoint(file_path)?;
                 TransferCheckpoint::new(file_size)
             }
@@ -579,17 +583,18 @@ pub async fn send_file_tcp(
     let missing_ranges = checkpoint.get_missing_ranges(&all_ranges);
     
     if missing_ranges.is_empty() {
-        info!("All ranges already completed, transfer is complete");
+        info!("Transfer already complete");
         delete_checkpoint(file_path)?;
         return Ok(file_size);
     }
 
-    info!(
-        total_ranges = all_ranges.len(),
-        completed_ranges = checkpoint.completed_ranges.len(),
-        missing_ranges = missing_ranges.len(),
-        "Resuming transfer"
-    );
+    if checkpoint.completed_ranges.len() > 0 {
+        info!(
+            completed = checkpoint.completed_ranges.len(),
+            remaining = missing_ranges.len(),
+            "Resuming transfer"
+        );
+    }
 
     // Open file with optimizations (O_DIRECT for large files on Linux)
     let file = Arc::new(open_file_optimized(file_path, file_size)?);
@@ -648,7 +653,7 @@ pub async fn send_file_tcp(
                     checkpoint.mark_completed(missing_ranges[idx]);
                     checkpoint.save(&checkpoint_path)?;
                 }
-                info!(
+                tracing::debug!(
                     thread_id = idx,
                     bytes,
                     "Connection completed"
