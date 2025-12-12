@@ -123,6 +123,58 @@ pub fn calculate_optimal_parallel_streams(file_size: u64, estimated_latency_ms: 
     std::cmp::max(4, std::cmp::min(32, latency_adjusted))
 }
 
+/// Calculate optimal buffer size based on file size and number of streams.
+///
+/// Automatically determines the best buffer size to balance memory usage
+/// and performance. Larger buffers improve throughput but increase memory usage.
+///
+/// # Arguments
+///
+/// * `file_size` - Size of the file in bytes
+/// * `num_streams` - Number of parallel streams being used
+///
+/// # Returns
+///
+/// Returns the optimal buffer size in bytes, bounded between 1MB and 32MB.
+pub fn calculate_optimal_buffer_size(file_size: u64, num_streams: usize) -> usize {
+    // Base calculation: scale buffer size with file size
+    // Small files (< 100MB): 4-8MB buffers
+    // Medium files (100MB - 1GB): 8-16MB buffers
+    // Large files (> 1GB): 16-32MB buffers
+    
+    let base_buffer = if file_size < 100 * 1024 * 1024 {
+        // Small files: 4-8MB
+        std::cmp::max(4 * 1024 * 1024, std::cmp::min(8 * 1024 * 1024, 
+            (file_size / 25).max(4 * 1024 * 1024) as usize))
+    } else if file_size < 1024 * 1024 * 1024 {
+        // Medium files: 8-16MB
+        std::cmp::max(8 * 1024 * 1024, std::cmp::min(16 * 1024 * 1024,
+            (file_size / 12).max(8 * 1024 * 1024) as usize))
+    } else {
+        // Large files: 16-32MB
+        std::cmp::max(16 * 1024 * 1024, std::cmp::min(32 * 1024 * 1024,
+            (file_size / 8).max(16 * 1024 * 1024) as usize))
+    };
+    
+    // Adjust for number of streams: more streams = slightly smaller buffers per stream
+    // to keep total memory usage reasonable
+    let stream_adjusted = if num_streams > 16 {
+        // Many streams: cap buffer size to avoid excessive memory
+        std::cmp::min(base_buffer, 16 * 1024 * 1024)
+    } else if num_streams > 8 {
+        // Moderate streams: slightly reduce buffer
+        std::cmp::min(base_buffer, 24 * 1024 * 1024)
+    } else {
+        base_buffer
+    };
+    
+    // Round to nearest MB for alignment
+    let mb_aligned = ((stream_adjusted + 512 * 1024) / (1024 * 1024)) * (1024 * 1024);
+    
+    // Bound between 1MB and 32MB
+    std::cmp::max(1024 * 1024, std::cmp::min(32 * 1024 * 1024, mb_aligned))
+}
+
 /// Calculate optimal number of parallel streams (legacy function for compatibility).
 #[deprecated(note = "Use calculate_optimal_parallel_streams instead")]
 pub fn calculate_parallel_streams(file_size: u64, network_bandwidth_mbps: f64) -> usize {
