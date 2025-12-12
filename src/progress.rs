@@ -20,9 +20,9 @@ impl TransferProgress {
             let pb = ProgressBar::new(total_bytes);
             pb.set_style(
                 ProgressStyle::default_bar()
-                    .template("{msg} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, ETA: {eta})")
+                    .template("{msg:25.25} {bytes:>10}/{total_bytes:>10} {percent:>5}% {bytes_per_sec:>12} {eta:>8}")
                     .unwrap()
-                    .progress_chars("█▉▊▋▌▍▎▏  "),
+                    .progress_chars("█▉▊▋▌▍▎▏ "),
             );
             pb.set_message("Transferring");
             Some(pb)
@@ -77,7 +77,9 @@ impl TransferProgress {
     /// Finish the progress bar.
     pub fn finish(&self) {
         if let Some(ref pb) = self.progress_bar {
-            pb.finish_with_message("Complete");
+            // Keep the filename in the message
+            let msg = pb.message();
+            pb.finish_with_message(msg);
         }
     }
 }

@@ -472,7 +472,8 @@ pub async fn send_file_tcp(
         .unwrap_or("unknown")
         .to_string();
 
-    info!(
+    // Only log if multiple files or debug mode
+    tracing::debug!(
         file = %filename,
         size = file_size,
         connections = config.num_streams,
@@ -583,13 +584,12 @@ pub async fn send_file_tcp(
     let missing_ranges = checkpoint.get_missing_ranges(&all_ranges);
     
     if missing_ranges.is_empty() {
-        info!("Transfer already complete");
         delete_checkpoint(file_path)?;
         return Ok(file_size);
     }
 
     if checkpoint.completed_ranges.len() > 0 {
-        info!(
+        tracing::debug!(
             completed = checkpoint.completed_ranges.len(),
             remaining = missing_ranges.len(),
             "Resuming transfer"
@@ -698,12 +698,12 @@ pub async fn send_file_tcp(
         0.0
     };
 
-    info!(
+    tracing::debug!(
         file = %filename,
         bytes = total_sent,
         duration_secs = duration.as_secs_f64(),
         throughput_mbps = throughput_mbps,
-        "TCP transfer completed"
+        "Transfer completed"
     );
 
     Ok(total_sent)

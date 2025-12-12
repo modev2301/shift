@@ -249,7 +249,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("No files to transfer".into());
         }
         
-        info!("Transferring {} files", files_to_transfer.len());
+        if files_to_transfer.len() > 1 {
+            // Only show file count for multiple files
+        if files_to_transfer.len() > 1 {
+            eprintln!("Transferring {} files", files_to_transfer.len());
+        }
+        }
         
         // Use TCP-based transfer for maximum throughput
         use shift::{tcp_transfer::send_file_tcp, TransferConfig};
@@ -266,13 +271,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .sum();
             
             if total_size > 0 {
-                let calculated = calculate_optimal_parallel_streams(total_size, None);
-                info!(
-                    total_size = total_size,
-                    calculated_streams = calculated,
-                    "Auto-calculated optimal parallel streams"
-                );
-                calculated
+                calculate_optimal_parallel_streams(total_size, None)
             } else {
                 DEFAULT_PARALLEL_STREAMS
             }
@@ -327,7 +326,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let file_idx = idx + 1;
             let total_files = files_to_transfer.len();
             
-            info!("[{}/{}] Starting transfer: {}", file_idx, total_files, local_file.display());
+            if total_files > 1 {
+                eprintln!("[{}/{}] {}", file_idx, total_files, local_file.display());
+            }
             
             let server_addr_str = format!("{}:{}", remote.host, remote.port.unwrap_or(8080));
             let server_addr = server_addr_str
@@ -338,7 +339,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Transfer file using TCP
             match rt.block_on(send_file_tcp(local_file, server_addr, transfer_config.clone())) {
                 Ok(_) => {
-                    info!("[{}/{}] Transfer complete: {}", file_idx, total_files, local_file.display());
+                    // Progress bar already shows completion, no need for extra message
                 }
                 Err(e) => {
                     eprintln!("[{}/{}] Transfer failed: {} - {}", file_idx, total_files, local_file.display(), e);
@@ -346,7 +347,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         
-        info!("All transfers completed");
+        // Progress bars already show completion
     } else {
         return Err("At least one path must be remote (user@host:/path)".into());
     }
