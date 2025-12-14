@@ -12,7 +12,7 @@ use std::sync::Arc;
 use socket2::{Domain, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tracing::{error, info};
+use tracing::error;
 
 /// TCP server that handles file transfers using parallel connections.
 pub struct TcpServer {
@@ -40,13 +40,6 @@ impl TcpServer {
 
     /// Run the server forever, accepting connections.
     pub async fn run_forever(&self) -> Result<(), TransferError> {
-        info!(
-            port = self.base_port,
-            connections = self.num_connections,
-            output_dir = %self.output_dir.display(),
-            "TCP server started"
-        );
-
         // Create and configure metadata listener on base port
         let metadata_socket = Socket::new(Domain::IPV4, Type::STREAM, None)
             .map_err(|e| TransferError::NetworkError(format!("Failed to create socket: {}", e)))?;
@@ -79,13 +72,14 @@ impl TcpServer {
         let listener = TcpListener::from_std(std_listener)
             .map_err(|e| TransferError::NetworkError(format!("Failed to convert to tokio listener: {}", e)))?;
 
-        info!("Listening for connections on port {}", self.base_port);
+        eprintln!("Shift server listening on port {}", self.base_port);
+        eprintln!("Output directory: {}", self.output_dir.display());
 
         // Accept metadata connections
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) => {
-                    info!(remote = %addr, "New metadata connection accepted");
+                    tracing::debug!(remote = %addr, "New metadata connection accepted");
                     let output_dir = self.output_dir.clone();
                     let config = self.config.clone();
                     let num_connections = self.num_connections;
@@ -134,12 +128,8 @@ impl TcpServer {
             .map_err(|e| TransferError::NetworkError(format!("Failed to read num streams: {}", e)))?;
         let num_streams = u64::from_le_bytes(num_streams_buf) as usize;
 
-        info!(
-            file = %filename,
-            size = file_size,
-            streams = num_streams,
-            "Receiving file"
-        );
+        // Minimal logging - just the filename
+        eprintln!("Receiving: {}", filename);
 
         // Ensure output directory exists
         std::fs::create_dir_all(&output_dir)?;
@@ -204,7 +194,7 @@ impl TcpServer {
             match handle.await {
                 Ok(Ok(bytes)) => {
                     total_received += bytes;
-                    info!(
+                    tracing::debug!(
                         thread_id,
                         bytes,
                         "Data connection completed"
@@ -240,12 +230,8 @@ impl TcpServer {
         stream.write_all(&[0x02]).await
             .map_err(|e| TransferError::NetworkError(format!("Failed to send final ack: {}", e)))?;
 
-        info!(
-            file = %filename,
-            bytes = total_received,
-            expected = file_size,
-            "File transfer completed"
-        );
+        // Minimal completion message
+        eprintln!("Received: {} ({} bytes)", filename, total_received);
 
         Ok(())
     }

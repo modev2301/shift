@@ -137,16 +137,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
                 };
                 
-                info!("Shift Transfer Server");
-                info!(
-                    port = transfer_config.start_port,
-                    streams = transfer_config.num_streams,
-                    "Server starting"
-                );
-                info!(
-                    output_dir = %config.server.output_directory,
-                    "Output directory configured"
-                );
+                eprintln!("Shift Transfer Server");
+                eprintln!("Port: {}", transfer_config.start_port);
+                eprintln!("Output directory: {}", config.server.output_directory);
                 
                 let server = TcpServer::new(
                     transfer_config.start_port,

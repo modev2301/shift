@@ -311,7 +311,7 @@ pub async fn receive_range_tcp(
         None
     };
 
-    info!(
+    tracing::debug!(
         thread_id,
         start = start_offset,
         end = end_offset,
@@ -443,7 +443,7 @@ pub async fn receive_range_tcp(
         file_mut.sync_all()?;
     }
 
-    info!(
+    tracing::debug!(
         thread_id,
         bytes = total_received,
         expected = expected_size,
