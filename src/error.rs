@@ -74,6 +74,10 @@ pub enum TransferError {
     /// A memory allocation failed (out of memory, allocation limit exceeded, etc.).
     #[error("Memory allocation error: {0}")]
     MemoryError(String),
+
+    /// End-to-end integrity check failed (e.g. BLAKE3 hash mismatch after transfer).
+    #[error("Integrity check failed: {0}")]
+    IntegrityCheckFailed(String),
 }
 
 #[cfg(test)]
@@ -207,6 +211,14 @@ mod tests {
         let error = TransferError::MemoryError("Out of memory".to_string());
         let error_string = error.to_string();
         assert!(error_string.contains("Out of memory"));
+    }
+
+    #[test]
+    fn test_integrity_check_failed() {
+        let error = TransferError::IntegrityCheckFailed("BLAKE3 mismatch".to_string());
+        let error_string = error.to_string();
+        assert!(error_string.contains("Integrity check failed"));
+        assert!(error_string.contains("BLAKE3 mismatch"));
     }
 
     #[test]

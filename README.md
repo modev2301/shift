@@ -3,45 +3,46 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 
-Shift is a high-performance file transfer system designed for reliable, efficient data movement over TCP. Built with Rust, Shift leverages parallel connections, optimized socket settings, and zero-copy I/O to achieve maximum throughput while maintaining data integrity and security. Cross-platform support for Linux, macOS, and Windows.
+Shift is a high-performance file transfer system designed for reliable, efficient data movement over TCP (and optionally QUIC). Built with Rust, it uses parallel connections, optimized socket settings, and zero-copy I/O to maximize throughput while guaranteeing data integrity. Cross-platform: Linux, macOS, and Windows.
 
 ## Features
 
-- **Parallel TCP Connections**: Multiple concurrent connections per transfer for maximum bandwidth utilization
-- **Automatic Stream Calculation**: Automatically determines optimal number of parallel streams based on file size
-- **Thread-Safe I/O**: Uses `pread`/`pwrite` for efficient, thread-safe file operations on Unix systems
-- **Resume Support**: Track transfer progress and resume interrupted transfers
-- **LZ4 Compression**: Automatic compression of compressible data to reduce transfer time
-- **AES-256-GCM Encryption**: Optional authenticated encryption for secure transfers
-- **Progress Tracking**: Real-time progress bars and throughput logging
-- **High Throughput**: Optimized for wire-speed transfers with minimal overhead
-- **Configurable**: Flexible configuration for different network conditions and use cases
+- **Parallel TCP connections** — Multiple concurrent connections per transfer for maximum bandwidth
+- **End-to-end integrity** — BLAKE3 hash of bytes actually sent; server verifies and replies OK or mismatch (client keeps checkpoint on mismatch)
+- **Resume with per-range verification** — SQLite checkpoint (WAL mode) stores completed ranges and per-range BLAKE3 hashes; server re-verifies before accepting data; safe for retry after disconnect
+- **Capability negotiation** — Client sends capabilities (compression, encryption, streams, buffer); server responds with negotiated intersection so both sides use compatible settings
+- **Smart compression** — Compression disabled automatically for already-compressed types (zip, gz, mp4, jpg, etc.) via `is_file_compressible()`
+- **LZ4 compression** — Optional compression for compressible data
+- **AES-256-GCM encryption** — Optional authenticated encryption
+- **Progress and resume** — Real-time progress, checkpoint/resume with SQLite (crash-safe), automatic retry
+- **Transport abstraction** — `Transport` / `Connection` / `Stream` traits; TCP implemented today; QUIC (quinn) available as optional feature with probe + TCP fallback
+- **Configurable** — Buffer sizes, stream count, timeouts, socket options via TOML
 
 ## Quick Start
 
 ### Installation
 
-Build from source:
-
 ```bash
 cargo build --release
 ```
 
-The resulting binary is located at `target/release/shift`.
+Binary: `target/release/shift`.
+
+Optional QUIC support (crates.io quinn):
+
+```bash
+cargo build --release --features quic
+```
 
 ### Usage
 
-#### Start the Server
+**Server** (listens on address/port from `config.toml`, default `0.0.0.0:8080`):
 
 ```bash
 ./target/release/shift server
 ```
 
-The server listens on the address and port specified in `config.toml` (default: `0.0.0.0:8080`).
-
-#### Transfer Files
-
-Transfer files using SCP-like syntax:
+**Transfer files** (SCP-like):
 
 ```bash
 # Single file
@@ -50,16 +51,16 @@ Transfer files using SCP-like syntax:
 # Multiple files
 ./target/release/shift file1.txt file2.txt host:/backup/
 
-# Recursive directory transfer
+# Recursive directory
 ./target/release/shift -r ./local_dir/ user@host:/remote/path/
 
-# Using glob patterns
+# Glob patterns
 ./target/release/shift *.log host:/logs/
 ```
 
 ## Configuration
 
-Configuration is specified in TOML format. Create a `config.toml` file in the working directory:
+Create `config.toml` in the working directory. Example:
 
 ```toml
 [server]
@@ -67,18 +68,16 @@ address = "0.0.0.0"
 port = 8080
 output_directory = "./downloads"
 max_clients = 100
-# Optional: Override auto-calculated values
 # parallel_streams = 16
-# buffer_size = 16777216  # Default: 16MB
+# buffer_size = 16777216
 enable_compression = false
 timeout_seconds = 30
 
 [client]
 server_address = "127.0.0.1"
 server_port = 8080
-# Optional: Override auto-calculated values
-# parallel_streams = 16  # Auto-calculated based on file size
-# buffer_size = 16777216  # Default: 16MB
+# parallel_streams = 16
+# buffer_size = 16777216
 enable_compression = false
 timeout_seconds = 30
 retry_attempts = 3
@@ -97,98 +96,32 @@ compression_level = 1
 metrics_enabled = true
 ```
 
-### Configuration Options
-
-**Server Configuration**:
-- `port`: Port number to listen on (default: 8080)
-- `output_directory`: Directory to write received files (default: "./downloads")
-- `max_clients`: Maximum number of concurrent clients (default: 100)
-- `parallel_streams`: Number of parallel connections (optional, auto-calculated if not specified)
-- `buffer_size`: Buffer size in bytes (optional, auto-calculated based on file size)
-- `socket_send_buffer_size`: Socket send buffer size (optional, auto-calculated)
-- `socket_recv_buffer_size`: Socket receive buffer size (optional, auto-calculated)
-- `enable_compression`: Enable LZ4 compression (default: false)
-
-**Client Configuration**:
-- `server_address`: Server hostname or IP address
-- `server_port`: Server port number (default: 8080)
-- `parallel_streams`: Number of parallel TCP connections (optional, auto-calculated based on file size)
-  - Small files (< 100MB): 4-8 streams
-  - Medium files (100MB - 1GB): 8-16 streams
-  - Large files (> 1GB): 16-32 streams
-- `buffer_size`: Buffer size in bytes (optional, auto-calculated based on file size)
-  - Small files (< 100MB): 4-8MB buffers
-  - Medium files (100MB - 1GB): 8-16MB buffers
-  - Large files (> 1GB): 16-32MB buffers
-- `socket_send_buffer_size`: Socket send buffer size (optional, auto-calculated)
-- `socket_recv_buffer_size`: Socket receive buffer size (optional, auto-calculated)
-- `enable_compression`: Enable LZ4 compression (default: false)
-
-**Note**: Resume support, progress bars, timeouts (30s), and retry logic (3 attempts, 1s delay) are always enabled with sensible defaults and do not need to be configured.
+See the repo for full option descriptions. Resume, progress, timeouts, and retries use sensible defaults.
 
 ## Architecture
 
-Shift uses parallel TCP connections for transport, providing:
+- **Protocol** — Metadata on base port: capability handshake (fixed-size `Capabilities`), then filename/size/stream count; server replies with negotiated caps and READY; optional per-range hash verification (0x06/0x07) for resume; then parallel data streams; final BLAKE3 hash (0x03) and server reply 0x04 (OK) or 0x05 (mismatch).
+- **Integrity** — Sender hasher task over bytes sent (BTreeMap by offset); hash sent after all data; server hasher on received bytes; comparison order and framing in `docs/INTEGRITY_DESIGN.md`.
+- **Resume** — SQLite DB per transfer (`.shift_checkpoint`), WAL mode; `transfer` + `range_state` tables; per-range BLAKE3 stored and verified on reconnect; legacy JSON checkpoints migrated on load.
+- **Transport** — `Transport` / `Connection` / `Stream` in `src/transport.rs`; TCP implementation included; optional `quic` feature adds quinn-based QUIC and `create_transport(config, force_tcp)` with probe and TCP fallback.
 
-**TCP Benefits**:
-- Reliable, ordered delivery
-- Widely supported and firewall-friendly
-- Optimized socket settings (8MB buffers, TCP_NODELAY)
-- Thread-safe file I/O with `pread`/`pwrite`
+## Implementation notes
 
-**Client Components**:
-- Parallel TCP connection management for file range distribution
-- Thread-safe file reading using `pread` (Unix) or seek-based I/O
-- Automatic retry and error recovery
-- Resume support with checkpoint tracking
-- Optional compression and encryption
+- **File I/O** — Unix: `pread`/`pwrite`; Windows: seek-based I/O.
+- **Compression** — Only when `enable_compression` and `is_file_compressible(path)`; skips zip, gz, mp4, jpg, etc.
+- **Checkpoints** — One SQLite file per file path (WAL); v1 checkpoints cleared on load (full retransfer).
 
-**Server Components**:
-- TCP server accepting multiple concurrent transfers
-- Thread-safe file writing using `pwrite` (Unix) or seek-based I/O
-- Connection coordination for parallel data reception
-- Checkpoint management for resume support
+## Roadmap
 
-**Protocol**:
-- Binary encoding for file metadata (filename, size, ranges)
-- Per-range flags for compression and encryption
-- Minimal protocol overhead for maximum throughput
-
-## Implementation Details
-
-**File Range Distribution**: Files are split into ranges, with each range transferred over a separate TCP connection. This enables parallel transfer and optimal bandwidth utilization.
-
-**Thread-Safe I/O**: On Unix systems (Linux, macOS), uses `pread` and `pwrite` for thread-safe, offset-based file operations. On Windows, uses seek-based I/O with file cloning for compatibility.
-
-**Resume Support**: Checkpoint files (`.shift_checkpoint`) track completed ranges, allowing transfers to resume from where they left off after interruption.
-
-**Compression**: LZ4 compression is applied automatically to compressible data chunks, reducing transfer time for text and other compressible content.
-
-**Encryption**: Optional AES-256-GCM encryption provides authenticated encryption with thread-specific nonces to prevent nonce reuse.
-
-**Error Handling**: Failed connections are automatically retried. Transfer sessions maintain state to enable resumption after connection failures.
+See **`docs/ROADMAP.md`** for the full sequence: completed (compressible check, capability handshake, SQLite checkpoint, transport traits, QUIC via quinn) and planned (Windows OVERLAPPED I/O, MsQUIC on Windows, VSS, Windows Service, Prometheus, bandwidth scheduling).
 
 ## Testing
 
-Run the test suite:
-
 ```bash
-cargo test --release
+cargo test
 ```
 
-Tests cover error handling, configuration parsing, transfer logic, file I/O operations, compression, encryption, and resume functionality.
-
-## Performance
-
-Performance depends on network conditions, file characteristics, and system resources. Key performance factors:
-
-- **Connection Count**: More parallel connections enable better bandwidth utilization
-- **Buffer Size**: Larger buffers reduce system call overhead (default: 8MB)
-- **Network Conditions**: TCP adapts to network conditions automatically
-- **File I/O**: Thread-safe I/O operations enable efficient parallel transfers
-- **Compression**: Can significantly reduce transfer time for compressible data
-
-Network transfer performance should be measured end-to-end under actual network conditions. The system is designed to saturate available bandwidth through parallel connections and optimized socket settings.
+Tests cover config, compression, encryption, resume (including SQLite save/load), integrity, and transfer logic.
 
 ## License
 

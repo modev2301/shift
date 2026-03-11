@@ -4,13 +4,17 @@
 //! parallel TCP connections, optimized socket settings, and zero-copy
 //! file I/O where possible.
 
+use crate::base::msg;
 use crate::error::TransferError;
 use crate::base::{split_file_ranges, FileRange, TransferConfig};
 use crate::compression::{compress, decompress, should_compress};
 use crate::encryption::{Decryptor, Encryptor};
 use crate::file_io::{open_file_optimized, read_at};
+use crate::integrity::{hash_file, hash_file_range_path, BLAKE3_LEN};
 use crate::progress::{ProgressHandle, TransferProgress};
 use crate::resume::{delete_checkpoint, get_checkpoint_path, TransferCheckpoint};
+use crate::utils::is_file_compressible;
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -19,8 +23,59 @@ use socket2::{Domain, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tokio::time::interval;
 use tracing::{debug, info};
+
+/// Runs in a dedicated task: receives (offset, plaintext) from range senders/receivers,
+/// reassembles in file order, and hashes with BLAKE3. Used for both send (bytes sent)
+/// and receive (bytes written). Channel must be bounded for backpressure.
+/// BTreeMap worst case: one range (file_size/num_streams), e.g. 671 MB for 10 GB/16.
+/// See docs/INTEGRITY_DESIGN.md.
+pub(crate) async fn run_ordered_hasher(
+    mut rx: mpsc::Receiver<(u64, Vec<u8>)>,
+    file_size: u64,
+) -> Result<[u8; BLAKE3_LEN], TransferError> {
+    let mut buf: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    let mut current_pos = 0u64;
+    let mut hasher = blake3::Hasher::new();
+
+    fn drain_contiguous(
+        buf: &mut BTreeMap<u64, Vec<u8>>,
+        hasher: &mut blake3::Hasher,
+        current_pos: &mut u64,
+    ) {
+        while let Some((&pos, _)) = buf.first_key_value() {
+            if pos != *current_pos {
+                break;
+            }
+            let data = buf.remove(&pos).expect("just saw it");
+            hasher.update(&data);
+            *current_pos += data.len() as u64;
+        }
+    }
+
+    while let Some((offset, data)) = rx.recv().await {
+        buf.insert(offset, data);
+        drain_contiguous(&mut buf, &mut hasher, &mut current_pos);
+    }
+    drain_contiguous(&mut buf, &mut hasher, &mut current_pos);
+
+    if current_pos != file_size {
+        return Err(TransferError::ProtocolError(format!(
+            "Send hasher: expected {} bytes, got {} (gap or duplicate)",
+            file_size, current_pos
+        )));
+    }
+    if !buf.is_empty() {
+        return Err(TransferError::ProtocolError(
+            "Send hasher: leftover buffered chunks".to_string(),
+        ));
+    }
+
+    let hash = hasher.finalize();
+    Ok(*hash.as_bytes())
+}
 
 /// Configure TCP socket for high throughput.
 ///
@@ -158,6 +213,8 @@ pub fn configure_tcp_socket(
 }
 
 /// Transfer a file range over a single TCP connection.
+/// If `hasher_tx` is Some, the plaintext bytes actually sent (before compression/encryption)
+/// are fed to the hasher so the final hash is of bytes-sent, not a pre-send read.
 async fn transfer_range_tcp(
     thread_id: usize,
     range: FileRange,
@@ -165,6 +222,7 @@ async fn transfer_range_tcp(
     mut stream: tokio::net::TcpStream,
     config: TransferConfig,
     progress: Option<ProgressHandle>,
+    hasher_tx: Option<mpsc::Sender<(u64, Vec<u8>)>>,
 ) -> Result<u64, TransferError> {
     tracing::debug!(
         thread_id,
@@ -215,6 +273,12 @@ async fn transfer_range_tcp(
 
         if bytes_read == 0 {
             break;
+        }
+
+        // Feed plaintext to hasher: per-read chunk (same granularity as send), not per-range.
+        if let Some(ref tx) = hasher_tx {
+            let plaintext = buffer[..bytes_read].to_vec();
+            let _ = tx.send((offset, plaintext)).await; // backpressure: bounded channel
         }
 
         let mut data_to_send = buffer[..bytes_read].to_vec();
@@ -275,12 +339,14 @@ async fn transfer_range_tcp(
 }
 
 /// Receive a file range over a single TCP connection.
+/// If `hasher_tx` is Some, plaintext bytes written are fed to the receive-side hasher (bytes actually written).
 pub async fn receive_range_tcp(
     thread_id: usize,
     file: Arc<File>,
     mut stream: tokio::net::TcpStream,
     config: TransferConfig,
     progress: Option<ProgressHandle>,
+    hasher_tx: Option<mpsc::Sender<(u64, Vec<u8>)>>,
 ) -> Result<u64, TransferError> {
     let (mut reader, _writer) = stream.split();
 
@@ -375,6 +441,11 @@ pub async fn receive_range_tcp(
         } else {
             &buffer[..bytes_read]
         };
+
+        // Feed plaintext to receive-side hasher (same granularity as write). See docs/INTEGRITY_DESIGN.md.
+        if let Some(ref tx) = hasher_tx {
+            let _ = tx.send((offset, data.to_vec())).await;
+        }
 
         // Use pwrite for thread-safe writes (Unix) or seek+write (other platforms)
         #[cfg(unix)]
@@ -472,6 +543,11 @@ pub async fn send_file_tcp(
         .unwrap_or("unknown")
         .to_string();
 
+    let mut config = config;
+    if !is_file_compressible(file_path) {
+        config.enable_compression = false;
+    }
+
     // Only log if multiple files or debug mode
     tracing::debug!(
         file = %filename,
@@ -537,15 +613,29 @@ pub async fn send_file_tcp(
     let mut metadata_stream = TcpStream::from_std(std_stream)
         .map_err(|e| TransferError::NetworkError(format!("Failed to convert to tokio stream: {}", e)))?;
 
-    // Send metadata: filename_len (8) + filename + file_size (8) + num_streams (8)
-    let filename_bytes = filename.as_bytes();
-    let mut metadata = Vec::new();
-    metadata.extend_from_slice(&(filename_bytes.len() as u64).to_le_bytes());
-    metadata.extend_from_slice(filename_bytes);
-    metadata.extend_from_slice(&file_size.to_le_bytes());
-    metadata.extend_from_slice(&(config.num_streams as u64).to_le_bytes());
-
     let (mut reader, mut writer) = metadata_stream.split();
+
+    // Capability handshake: client sends, server responds with negotiated; both use intersection.
+    let client_caps = crate::base::capabilities_from_config(&config);
+    writer.write_all(&client_caps.to_bytes()).await
+        .map_err(|e| TransferError::NetworkError(format!("Failed to send capabilities: {}", e)))?;
+    let mut cap_buf = [0u8; crate::base::CAPABILITIES_WIRE_LEN];
+    reader.read_exact(&mut cap_buf).await
+        .map_err(|e| TransferError::NetworkError(format!("Failed to read negotiated capabilities: {}", e)))?;
+    let negotiated = crate::base::Capabilities::from_bytes(&cap_buf)
+        .ok_or_else(|| TransferError::ProtocolError("Invalid capabilities from server".to_string()))?;
+    let config = crate::base::apply_capabilities_to_config(&config, negotiated);
+
+    // Send metadata: filename_len (8) + filename + file_size (8) + num_streams (8)
+    let metadata = {
+        let filename_bytes = filename.as_bytes();
+        let mut m = Vec::new();
+        m.extend_from_slice(&(filename_bytes.len() as u64).to_le_bytes());
+        m.extend_from_slice(filename_bytes);
+        m.extend_from_slice(&file_size.to_le_bytes());
+        m.extend_from_slice(&(config.num_streams as u64).to_le_bytes());
+        m
+    };
     writer.write_all(&metadata).await
         .map_err(|e| TransferError::NetworkError(format!("Failed to send metadata: {}", e)))?;
 
@@ -554,7 +644,7 @@ pub async fn send_file_tcp(
     reader.read_exact(&mut ack_buf).await
         .map_err(|e| TransferError::NetworkError(format!("Failed to receive initial ack: {}", e)))?;
 
-    if ack_buf[0] != 0x01 {
+    if ack_buf[0] != msg::READY {
         return Err(TransferError::ProtocolError("Invalid initial ACK from server".to_string()));
     }
 
@@ -579,16 +669,72 @@ pub async fn send_file_tcp(
         TransferCheckpoint::new(file_size)
     };
 
-    // Split file into ranges
     let all_ranges = split_file_ranges(file_size, config.num_streams);
+
+    // Per-range verification (before opening data streams): send 0x06 if we have completed ranges with hashes.
+    let completed_ordered = checkpoint.completed_ranges_ordered(&all_ranges);
+    if !completed_ordered.is_empty() {
+        writer.write_all(&[msg::RANGE_HASHES]).await.map_err(|e| {
+            TransferError::NetworkError(format!("Failed to send range hashes type: {}", e))
+        })?;
+        writer
+            .write_all(&(completed_ordered.len() as u64).to_le_bytes())
+            .await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to send num_ranges: {}", e)))?;
+        for (range, hash) in &completed_ordered {
+            writer.write_all(&range.start.to_le_bytes()).await.map_err(|e| {
+                TransferError::NetworkError(format!("Failed to send range start: {}", e))
+            })?;
+            writer.write_all(&range.end.to_le_bytes()).await.map_err(|e| {
+                TransferError::NetworkError(format!("Failed to send range end: {}", e))
+            })?;
+            writer.write_all(hash).await.map_err(|e| {
+                TransferError::NetworkError(format!("Failed to send range hash: {}", e))
+            })?;
+        }
+        let mut resp = [0u8; 1];
+        reader.read_exact(&mut resp).await.map_err(|e| {
+            TransferError::NetworkError(format!("Failed to read range verify result type: {}", e))
+        })?;
+        if resp[0] != msg::RANGE_VERIFY_RESULT {
+            return Err(TransferError::ProtocolError(format!(
+                "Expected range verify result (0x07), got 0x{:02x}",
+                resp[0]
+            )));
+        }
+        let mut num_failed_buf = [0u8; 8];
+        reader.read_exact(&mut num_failed_buf).await.map_err(|e| {
+            TransferError::NetworkError(format!("Failed to read num_failed: {}", e))
+        })?;
+        let num_failed = u64::from_le_bytes(num_failed_buf) as usize;
+        for _ in 0..num_failed {
+            let mut start_buf = [0u8; 8];
+            let mut end_buf = [0u8; 8];
+            reader.read_exact(&mut start_buf).await.map_err(|e| {
+                TransferError::NetworkError(format!("Failed to read failed range start: {}", e))
+            })?;
+            reader.read_exact(&mut end_buf).await.map_err(|e| {
+                TransferError::NetworkError(format!("Failed to read failed range end: {}", e))
+            })?;
+            let start = u64::from_le_bytes(start_buf);
+            let end = u64::from_le_bytes(end_buf);
+            checkpoint.remove_completed(&FileRange { start, end });
+        }
+        checkpoint.save(&checkpoint_path)?;
+    } else {
+        writer.write_all(&[msg::NO_RANGE_VERIFY]).await.map_err(|e| {
+            TransferError::NetworkError(format!("Failed to send no range verify: {}", e))
+        })?;
+    }
+
     let missing_ranges = checkpoint.get_missing_ranges(&all_ranges);
-    
     if missing_ranges.is_empty() {
         delete_checkpoint(file_path)?;
         return Ok(file_size);
     }
 
-    if checkpoint.completed_ranges.len() > 0 {
+    let is_resume = checkpoint.completed_ranges.len() > 0;
+    if is_resume {
         tracing::debug!(
             completed = checkpoint.completed_ranges.len(),
             remaining = missing_ranges.len(),
@@ -598,6 +744,23 @@ pub async fn send_file_tcp(
 
     // Open file with optimizations (O_DIRECT for large files on Linux)
     let file = Arc::new(open_file_optimized(file_path, file_size)?);
+
+    // Full transfer: hash = bytes we actually send (hasher task). Resume: we only send
+    // missing ranges so we can't get full-file hash from bytes-sent; use one read at start.
+    let resume_hash = if is_resume {
+        Some(hash_file(file_path, file_size)?)
+    } else {
+        None
+    };
+    // Bounded channel so fast senders can't flood the hasher (backpressure). Each chunk is
+    // at most buffer_size; 64 slots cap memory. See docs/INTEGRITY_DESIGN.md.
+    let (hasher_tx, hasher_handle) = if resume_hash.is_none() {
+        let (tx, rx) = mpsc::channel(64);
+        let handle = tokio::spawn(async move { run_ordered_hasher(rx, file_size).await });
+        (Some(tx), Some(handle))
+    } else {
+        (None, None)
+    };
 
     // Establish parallel TCP connections for data (ports base+1, base+2, ...)
     let mut handles = Vec::new();
@@ -612,6 +775,7 @@ pub async fn send_file_tcp(
         let config = config.clone();
         let target_port = base_port + 1 + thread_id as u16;
         let progress_clone = progress_handle.clone();
+        let range_hasher_tx = hasher_tx.clone();
 
         let handle = tokio::spawn(async move {
             // Create and configure socket using socket2
@@ -636,7 +800,16 @@ pub async fn send_file_tcp(
             let stream = TcpStream::from_std(std_stream)
                 .map_err(|e| TransferError::NetworkError(format!("Failed to convert to tokio stream: {}", e)))?;
 
-            transfer_range_tcp(thread_id, range, file, stream, config, Some(progress_clone)).await
+            transfer_range_tcp(
+                thread_id,
+                range,
+                file,
+                stream,
+                config,
+                Some(progress_clone),
+                range_hasher_tx,
+            )
+            .await
         });
 
         handles.push(handle);
@@ -648,9 +821,10 @@ pub async fn send_file_tcp(
         match handle.await {
             Ok(Ok(bytes)) => {
                 total_sent += bytes;
-                // Mark range as completed in checkpoint
                 if idx < missing_ranges.len() {
-                    checkpoint.mark_completed(missing_ranges[idx]);
+                    let range = missing_ranges[idx];
+                    let range_hash = hash_file_range_path(file_path, range.start, range.end)?;
+                    checkpoint.mark_completed(range, range_hash);
                     checkpoint.save(&checkpoint_path)?;
                 }
                 tracing::debug!(
@@ -660,30 +834,63 @@ pub async fn send_file_tcp(
                 );
             }
             Ok(Err(e)) => {
-                // Save checkpoint before returning error
+                drop(hasher_tx); // close channel so hasher task exits instead of hanging
                 let _ = checkpoint.save(&checkpoint_path);
                 return Err(e);
             }
             Err(e) => {
-                // Save checkpoint before returning error
+                drop(hasher_tx);
                 let _ = checkpoint.save(&checkpoint_path);
                 return Err(TransferError::NetworkError(format!("Connection panicked: {:?}", e)));
             }
         }
     }
-    
-    // Wait for final ACK (0x02) - server confirms all data received
-    let mut final_ack_buf = [0u8; 1];
-    reader.read_exact(&mut final_ack_buf).await
-        .map_err(|e| TransferError::NetworkError(format!("Failed to receive final ack: {}", e)))?;
 
-    if final_ack_buf[0] != 0x02 {
-        return Err(TransferError::ProtocolError("Invalid final ACK from server".to_string()));
+    // Hash: full transfer = bytes we just sent; resume = full file at start of this run
+    let file_hash = match (resume_hash, hasher_handle) {
+        (Some(h), _) => h,
+        (None, Some(handle)) => {
+            drop(hasher_tx);
+            handle
+                .await
+                .map_err(|e| TransferError::NetworkError(format!("Hasher task panicked: {:?}", e)))?
+                .map_err(|e| TransferError::ProtocolError(format!("Hasher: {}", e)))?
+        }
+        (None, None) => unreachable!("full transfer always spawns hasher"),
+    };
+    // Framed hash message: 0x03 (type) + 32 bytes (BLAKE3). See docs/INTEGRITY_DESIGN.md.
+    writer.write_all(&[msg::HASH]).await.map_err(|e| {
+        TransferError::NetworkError(format!("Failed to send hash message type: {}", e))
+    })?;
+    writer
+        .write_all(&file_hash)
+        .await
+        .map_err(|e| TransferError::NetworkError(format!("Failed to send file hash: {}", e)))?;
+
+    // Server replies 0x04 (hash OK) or 0x05 (hash MISMATCH). On 0x05 keep checkpoint.
+    let mut response_buf = [0u8; 1];
+    reader.read_exact(&mut response_buf).await.map_err(|e| {
+        TransferError::NetworkError(format!("Failed to receive hash response: {}", e))
+    })?;
+
+    match response_buf[0] {
+        msg::HASH_OK => {}
+        msg::HASH_MISMATCH => {
+            return Err(TransferError::IntegrityCheckFailed(
+                "Server reported BLAKE3 mismatch; checkpoint kept for retry".to_string(),
+            ));
+        }
+        _ => {
+            return Err(TransferError::ProtocolError(format!(
+                "Invalid hash response from server: 0x{:02x}",
+                response_buf[0]
+            )));
+        }
     }
 
     drop(metadata_stream);
-    
-    // Delete checkpoint on successful completion
+
+    // Delete checkpoint only on hash OK
     delete_checkpoint(file_path)?;
 
     // Wait for logger to finish
@@ -710,12 +917,20 @@ pub async fn send_file_tcp(
 }
 
 /// Receive a file using parallel TCP connections.
+///
+/// **Integrity contract:** Pass `Some(hash)` when the sender sends the integrity hash
+/// (current protocol: 0x03 + 32 bytes). The receiver must obtain the expected hash
+/// (from the metadata exchange or out-of-band). Pass `None` only for **legacy senders**
+/// that do not send a hash (pre-integrity protocol); in that case integrity is not
+/// verified. Do not pass `None` when receiving from our own `send_file_tcp` — that
+/// bypasses integrity. See docs/INTEGRITY_DESIGN.md §10.
 pub async fn receive_file_tcp(
     output_path: &std::path::Path,
     base_port: u16,
     num_connections: usize,
     file_size: u64,
     config: TransferConfig,
+    expected_hash: Option<[u8; BLAKE3_LEN]>,
 ) -> Result<u64, TransferError> {
     info!(
         file = %output_path.display(),
@@ -732,16 +947,22 @@ pub async fn receive_file_tcp(
     // Split file into ranges
     let ranges = split_file_ranges(file_size, num_connections);
 
-    // Accept parallel TCP connections
-    let mut handles = Vec::new();
+    // Optional receive-side hasher for integrity (symmetric with server path).
+    let (hasher_tx, hasher_rx) = if expected_hash.is_some() {
+        let (tx, rx) = mpsc::channel(64);
+        (Some(tx), Some(tokio::spawn(async move { run_ordered_hasher(rx, file_size).await })))
+    } else {
+        (None, None)
+    };
 
+    let mut handles = Vec::new();
     for (thread_id, _range) in ranges.into_iter().enumerate() {
         let file = Arc::clone(&file);
         let config = config.clone();
         let listen_port = base_port + thread_id as u16;
+        let range_hasher_tx = hasher_tx.clone();
 
         let handle = tokio::spawn(async move {
-            // Create and configure listening socket using socket2
             let socket = Socket::new(Domain::IPV4, Type::STREAM, None)
                 .map_err(|e| TransferError::NetworkError(format!("Failed to create socket: {}", e)))?;
             configure_tcp_socket(
@@ -760,7 +981,6 @@ pub async fn receive_file_tcp(
             socket.listen(1)
                 .map_err(|e| TransferError::NetworkError(format!("Failed to listen: {}", e)))?;
 
-            // Convert to tokio TcpListener
             socket.set_nonblocking(true)
                 .map_err(|e| TransferError::NetworkError(format!("Failed to set nonblocking: {}", e)))?;
             
@@ -768,34 +988,43 @@ pub async fn receive_file_tcp(
             let listener = TcpListener::from_std(std_listener)
                 .map_err(|e| TransferError::NetworkError(format!("Failed to convert to tokio listener: {}", e)))?;
 
-            // Accept connection
             let (stream, _) = listener.accept().await
                 .map_err(|e| TransferError::NetworkError(format!("Accept failed: {}", e)))?;
 
-            receive_range_tcp(thread_id, file, stream, config, None).await
+            receive_range_tcp(thread_id, file, stream, config, None, range_hasher_tx).await
         });
 
         handles.push(handle);
     }
 
-    // Wait for all connections to complete
     let mut total_received = 0u64;
     for (thread_id, handle) in handles.into_iter().enumerate() {
         match handle.await {
             Ok(Ok(bytes)) => {
                 total_received += bytes;
-                info!(
-                    thread_id,
-                    bytes,
-                    "Connection completed"
-                );
+                info!(thread_id, bytes, "Connection completed");
             }
             Ok(Err(e)) => {
+                drop(hasher_tx);
                 return Err(e);
             }
             Err(e) => {
+                drop(hasher_tx);
                 return Err(TransferError::NetworkError(format!("Connection panicked: {:?}", e)));
             }
+        }
+    }
+
+    if let (Some(expected), Some(hasher_handle)) = (expected_hash, hasher_rx) {
+        drop(hasher_tx);
+        let actual_hash = hasher_handle
+            .await
+            .map_err(|e| TransferError::NetworkError(format!("Receive hasher task panicked: {:?}", e)))?
+            .map_err(|e| TransferError::ProtocolError(format!("Receive hasher: {}", e)))?;
+        if actual_hash != expected {
+            return Err(TransferError::IntegrityCheckFailed(
+                "BLAKE3 mismatch on standalone receive".to_string(),
+            ));
         }
     }
 

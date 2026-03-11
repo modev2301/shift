@@ -3,15 +3,19 @@
 //! The server listens on multiple ports: port 8080 for metadata,
 //! and ports 8081-808N for parallel data connections.
 
+use crate::base::msg;
+use crate::base::{apply_capabilities_to_config, capabilities_from_config, Capabilities, CAPABILITIES_WIRE_LEN};
 use crate::error::TransferError;
 use crate::base::TransferConfig;
-use crate::tcp_transfer::{configure_tcp_socket, receive_range_tcp};
+use crate::integrity::{hash_file_range_path, BLAKE3_LEN};
+use crate::tcp_transfer::{configure_tcp_socket, receive_range_tcp, run_ordered_hasher};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use socket2::{Domain, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tracing::error;
 
 /// TCP server that handles file transfers using parallel connections.
@@ -106,6 +110,18 @@ impl TcpServer {
         base_port: u16,
         config: TransferConfig,
     ) -> Result<(), TransferError> {
+        // Capability handshake: read client caps, negotiate, send negotiated, apply to config.
+        let mut cap_buf = [0u8; CAPABILITIES_WIRE_LEN];
+        stream.read_exact(&mut cap_buf).await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to read client capabilities: {}", e)))?;
+        let client_caps = Capabilities::from_bytes(&cap_buf)
+            .ok_or_else(|| TransferError::ProtocolError("Invalid client capabilities".to_string()))?;
+        let server_caps = capabilities_from_config(&config);
+        let negotiated = Capabilities::negotiate(client_caps, server_caps);
+        stream.write_all(&negotiated.to_bytes()).await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to send negotiated capabilities: {}", e)))?;
+        let config = apply_capabilities_to_config(&config, negotiated);
+
         // Read metadata: filename_len (8) + filename + file_size (8) + num_streams (8)
         let mut filename_len_buf = [0u8; 8];
         stream.read_exact(&mut filename_len_buf).await
@@ -143,10 +159,15 @@ impl TcpServer {
         let ranges = crate::base::split_file_ranges(file_size, num_streams);
         let mut data_handles = Vec::new();
 
+        // Receive-side hasher: hash bytes as written (symmetric with sender). Bounded channel 64.
+        let (hasher_tx, hasher_rx) = mpsc::channel(64);
+        let hasher_handle = tokio::spawn(async move { run_ordered_hasher(hasher_rx, file_size).await });
+
         for (thread_id, _range) in ranges.into_iter().enumerate() {
             let file = Arc::clone(&file);
             let config = config.clone();
             let data_port = base_port + 1 + thread_id as u16;
+            let range_hasher_tx = hasher_tx.clone();
 
             let handle = tokio::spawn(async move {
                 // Create and configure listening socket
@@ -178,15 +199,54 @@ impl TcpServer {
                 let (data_stream, _) = listener.accept().await
                     .map_err(|e| TransferError::NetworkError(format!("Accept failed: {}", e)))?;
 
-                receive_range_tcp(thread_id, file, data_stream, config, None).await
+                receive_range_tcp(thread_id, file, data_stream, config, None, Some(range_hasher_tx)).await
             });
 
             data_handles.push(handle);
         }
 
-        // Now send initial ACK - data ports are ready
-        stream.write_all(&[0x01]).await
+        stream.write_all(&[msg::READY]).await
             .map_err(|e| TransferError::NetworkError(format!("Failed to send initial ack: {}", e)))?;
+
+        // Optional per-range verification (0x06) before data streams. Client sends 0x00 or 0x06.
+        let mut range_verify_byte = [0u8; 1];
+        stream.read_exact(&mut range_verify_byte).await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to read range verify byte: {}", e)))?;
+        if range_verify_byte[0] == msg::RANGE_HASHES {
+            let mut num_ranges_buf = [0u8; 8];
+            stream.read_exact(&mut num_ranges_buf).await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to read num_ranges: {}", e)))?;
+            let num_ranges = u64::from_le_bytes(num_ranges_buf) as usize;
+            let mut failed: Vec<(u64, u64)> = Vec::new();
+            for _ in 0..num_ranges {
+                let mut start_buf = [0u8; 8];
+                let mut end_buf = [0u8; 8];
+                let mut expected_hash = [0u8; BLAKE3_LEN];
+                stream.read_exact(&mut start_buf).await
+                    .map_err(|e| TransferError::NetworkError(format!("Failed to read range start: {}", e)))?;
+                stream.read_exact(&mut end_buf).await
+                    .map_err(|e| TransferError::NetworkError(format!("Failed to read range end: {}", e)))?;
+                stream.read_exact(&mut expected_hash).await
+                    .map_err(|e| TransferError::NetworkError(format!("Failed to read range hash: {}", e)))?;
+                let start = u64::from_le_bytes(start_buf);
+                let end = u64::from_le_bytes(end_buf);
+                match hash_file_range_path(&output_path, start, end) {
+                    Ok(actual) if actual == expected_hash => {}
+                    _ => failed.push((start, end)),
+                }
+            }
+            stream.write_all(&[msg::RANGE_VERIFY_RESULT]).await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to send range verify result: {}", e)))?;
+            stream.write_all(&(failed.len() as u64).to_le_bytes()).await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to send num_failed: {}", e)))?;
+            for (start, end) in &failed {
+                stream.write_all(&start.to_le_bytes()).await
+                    .map_err(|e| TransferError::NetworkError(format!("Failed to send failed start: {}", e)))?;
+                stream.write_all(&end.to_le_bytes()).await
+                    .map_err(|e| TransferError::NetworkError(format!("Failed to send failed end: {}", e)))?;
+            }
+        }
+        // else 0x00: no range verify, proceed to data listeners
 
         // Wait for all data connections to complete
         let mut total_received = 0u64;
@@ -201,9 +261,11 @@ impl TcpServer {
                     );
                 }
                 Ok(Err(e)) => {
+                    drop(hasher_tx);
                     return Err(e);
                 }
                 Err(e) => {
+                    drop(hasher_tx);
                     return Err(TransferError::NetworkError(format!("Data connection panicked: {:?}", e)));
                 }
             }
@@ -226,9 +288,38 @@ impl TcpServer {
             file_mut.sync_all()?;
         }
 
-        // Send final ACK after all transfers complete
-        stream.write_all(&[0x02]).await
-            .map_err(|e| TransferError::NetworkError(format!("Failed to send final ack: {}", e)))?;
+        // Hash comparison order (docs/INTEGRITY_DESIGN.md §9): all data streams are complete
+        // and fsync done above. Only then read expected_hash from client, then finalize our hasher.
+        let mut hash_type_buf = [0u8; 1];
+        stream.read_exact(&mut hash_type_buf).await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to read hash message type: {}", e)))?;
+        if hash_type_buf[0] != msg::HASH {
+            return Err(TransferError::ProtocolError(format!(
+                "Expected hash message (0x03), got 0x{:02x}",
+                hash_type_buf[0]
+            )));
+        }
+        let mut expected_hash = [0u8; BLAKE3_LEN];
+        stream.read_exact(&mut expected_hash).await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to read file hash: {}", e)))?;
+
+        // Finalize receive-side hasher (channel close + drain BTreeMap) → actual_hash.
+        drop(hasher_tx);
+        let actual_hash = hasher_handle
+            .await
+            .map_err(|e| TransferError::NetworkError(format!("Receive hasher task panicked: {:?}", e)))?
+            .map_err(|e| TransferError::ProtocolError(format!("Receive hasher: {}", e)))?;
+        if actual_hash != expected_hash {
+            // Tell client to keep checkpoint for retry (0x05), then return error.
+            let _ = stream.write_all(&[msg::HASH_MISMATCH]).await;
+            return Err(TransferError::IntegrityCheckFailed(format!(
+                "BLAKE3 mismatch for {} (transfer may be corrupted)",
+                filename
+            )));
+        }
+
+        stream.write_all(&[msg::HASH_OK]).await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to send hash OK: {}", e)))?;
 
         // Minimal completion message
         eprintln!("Received: {} ({} bytes)", filename, total_received);

@@ -23,6 +23,8 @@
 //!         start_port: config.server.port,
 //!         num_streams: 16,
 //!         buffer_size: 16 * 1024 * 1024,
+//!         socket_send_buffer_size: Some(16 * 1024 * 1024),
+//!         socket_recv_buffer_size: Some(16 * 1024 * 1024),
 //!         enable_compression: false,
 //!         enable_encryption: false,
 //!         encryption_key: None,
@@ -42,9 +44,13 @@
 pub mod base;
 pub mod compression;
 pub mod config;
+#[cfg(feature = "quic")]
+pub mod quinn_transport;
+pub mod transport;
 pub mod encryption;
 pub mod error;
 pub mod file_io;
+pub mod integrity;
 pub mod progress;
 pub mod resume;
 pub mod tcp_server;
@@ -54,6 +60,9 @@ pub mod utils;
 pub use base::{FileRange, TransferConfig, TransferStats};
 pub use config::Config;
 pub use error::TransferError;
+pub use transport::{create_transport, Connection, Listener, Platform, Stream, Transport, TcpTransport};
+#[cfg(feature = "quic")]
+pub use quinn_transport::QuicTransport;
 
 // Re-export commonly used types for convenience
 pub use bytes;
