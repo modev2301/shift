@@ -54,12 +54,25 @@ pub trait Transport: Send + Sync {
     async fn connect(&self, addr: SocketAddr) -> Result<Box<dyn Connection>, TransferError>;
     async fn listen(&self, addr: SocketAddr) -> Result<Box<dyn Listener>, TransferError>;
 
-    /// Establish channels for file transfer: one metadata (split into reader/writer) and N data streams.
+    /// Establish channels for file transfer: one metadata (split into reader/writer) and optionally data streams.
+    /// TCP: returns only metadata; data streams must be opened after READY via open_data_connections (server opens data ports only after sending READY).
+    /// QUIC: returns metadata and all data streams (opened in parallel on the same connection).
     async fn connect_for_transfer(
         &self,
         addr: SocketAddr,
         num_data_streams: usize,
     ) -> Result<(TransferMetaChannels, Vec<Box<dyn Stream>>), TransferError>;
+
+    /// Open data connections (TCP only). Call after metadata handshake and READY. Default: error (QUIC uses streams from connect_for_transfer).
+    async fn open_data_connections(
+        &self,
+        _addr: SocketAddr,
+        _num: usize,
+    ) -> Result<Vec<Box<dyn Stream>>, TransferError> {
+        Err(TransferError::ProtocolError(
+            "open_data_connections not supported for this transport".to_string(),
+        ))
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -291,7 +304,7 @@ impl Transport for TcpTransport {
     async fn connect_for_transfer(
         &self,
         addr: SocketAddr,
-        num_data_streams: usize,
+        _num_data_streams: usize,
     ) -> Result<(TransferMetaChannels, Vec<Box<dyn Stream>>), TransferError> {
         let connect_one = |target: SocketAddr,
                           send_buf: Option<usize>,
@@ -318,25 +331,53 @@ impl Transport for TcpTransport {
             writer: Box::new(writer),
         };
 
+        // TCP server only opens data ports after sending READY; open data connections later via open_data_connections
+        Ok((meta, vec![]))
+    }
+
+    async fn open_data_connections(
+        &self,
+        addr: SocketAddr,
+        num: usize,
+    ) -> Result<Vec<Box<dyn Stream>>, TransferError> {
+        let connect_one = |target: SocketAddr,
+                          send_buf: Option<usize>,
+                          recv_buf: Option<usize>|
+         -> Result<TokioTcpStream, TransferError> {
+            let socket = Socket::new(Domain::IPV4, Type::STREAM, None)
+                .map_err(|e| TransferError::NetworkError(format!("Socket: {}", e)))?;
+            configure_tcp_socket(&socket, send_buf, recv_buf)?;
+            socket
+                .connect(&target.into())
+                .map_err(|e| TransferError::NetworkError(format!("Connect: {}", e)))?;
+            socket
+                .set_nonblocking(true)
+                .map_err(|e| TransferError::NetworkError(format!("Nonblocking: {}", e)))?;
+            let std_stream = std::net::TcpStream::from(socket);
+            TokioTcpStream::from_std(std_stream)
+                .map_err(|e| TransferError::NetworkError(format!("Tokio stream: {}", e)))
+        };
+
         let base_port = addr.port();
         let ip = addr.ip();
         let send_buf = self.config.socket_send_buffer_size;
         let recv_buf = self.config.socket_recv_buffer_size;
-        let mut join_handles = Vec::with_capacity(num_data_streams);
-        for i in 0..num_data_streams {
+        let mut join_handles = Vec::with_capacity(num);
+        for i in 0..num {
             let data_addr = SocketAddr::new(ip, base_port + 1 + i as u16);
             let (sb, rb) = (send_buf, recv_buf);
             join_handles.push(tokio::task::spawn_blocking(move || connect_one(data_addr, sb, rb)));
         }
-        let mut data_streams: Vec<Box<dyn Stream>> = Vec::with_capacity(num_data_streams);
+        let mut data_streams: Vec<Box<dyn Stream>> = Vec::with_capacity(num);
         for h in join_handles {
             let stream = h.await.map_err(|e| {
                 TransferError::NetworkError(format!("TCP connect task panicked: {:?}", e))
-            })??;
+            })?;
+            let stream = stream.map_err(|e| TransferError::NetworkError(format!("TCP data connect: {}", e)))?;
             data_streams.push(Box::new(TcpStreamImpl::new(stream)));
         }
 
-        Ok((meta, data_streams))
+        Ok(data_streams)
     }
 }
 

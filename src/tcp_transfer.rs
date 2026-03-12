@@ -1287,7 +1287,7 @@ pub async fn send_file_over_transport(
         }
     });
 
-    let (meta, data_streams) = transport
+    let (meta, mut data_streams) = transport
         .connect_for_transfer(server_addr, config.num_streams)
         .await?;
 
@@ -1322,6 +1322,13 @@ pub async fn send_file_over_transport(
 
     if ack_buf[0] != msg::READY {
         return Err(TransferError::ProtocolError("Invalid initial ACK from server".to_string()));
+    }
+
+    // TCP: server only opens data ports after READY; open data connections now
+    if data_streams.is_empty() {
+        data_streams = transport
+            .open_data_connections(server_addr, config.num_streams)
+            .await?;
     }
 
     let checkpoint_path = get_checkpoint_path(file_path);
