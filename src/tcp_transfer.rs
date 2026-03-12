@@ -311,9 +311,30 @@ async fn transfer_range_tcp(
         packet.extend_from_slice(&(data_to_send.len() as u64).to_le_bytes());
         packet.extend_from_slice(&data_to_send);
         
-        // Write all data - tokio's write_all already handles partial writes efficiently
-        writer.write_all(&packet).await
-            .map_err(|e| TransferError::NetworkError(format!("Failed to send data: {}", e)))?;
+        // Write all data; retry on ENOBUFS (55) / WouldBlock so kernel can drain (e.g. macOS over many streams)
+        const SEND_RETRY_DELAY_MS: u64 = 50;
+        const SEND_RETRY_MAX: u32 = 120; // ~6s of retries then fail
+        let mut written = 0usize;
+        let mut retries = 0u32;
+        while written < packet.len() {
+            match writer.write(&packet[written..]).await {
+                Ok(0) => return Err(TransferError::NetworkError("Connection closed during send".to_string())),
+                Ok(n) => {
+                    written += n;
+                    retries = 0;
+                }
+                Err(e) => {
+                    let retryable = e.raw_os_error() == Some(55) // ENOBUFS on macOS/Darwin
+                        || e.kind() == std::io::ErrorKind::WouldBlock;
+                    if retryable && retries < SEND_RETRY_MAX {
+                        retries += 1;
+                        tokio::time::sleep(Duration::from_millis(SEND_RETRY_DELAY_MS)).await;
+                    } else {
+                        return Err(TransferError::NetworkError(format!("Failed to send data: {}", e)));
+                    }
+                }
+            }
+        }
 
         offset += bytes_read as u64;
         total_sent += bytes_read as u64;

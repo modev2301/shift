@@ -111,10 +111,6 @@ See the repo for full option descriptions. Resume, progress, timeouts, and retri
 - **Compression** — Only when `enable_compression` and `is_file_compressible(path)`; skips zip, gz, mp4, jpg, etc.
 - **Checkpoints** — One SQLite file per file path (WAL); v1 checkpoints cleared on load (full retransfer).
 
-## Roadmap
-
-See **`docs/ROADMAP.md`** for the full sequence: completed (compressible check, capability handshake, SQLite checkpoint, transport traits, QUIC via quinn) and planned (Windows OVERLAPPED I/O, MsQUIC on Windows, VSS, Windows Service, Prometheus, bandwidth scheduling).
-
 ## Testing
 
 ```bash
