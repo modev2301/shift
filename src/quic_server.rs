@@ -230,6 +230,8 @@ impl QuicServer {
 
         meta_stream.write_all(&[msg::HASH_OK]).await
             .map_err(|e| TransferError::NetworkError(format!("Failed to send hash OK: {}", e)))?;
+        meta_stream.flush().await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to flush hash OK: {}", e)))?;
 
         eprintln!("Received: {} ({} bytes)", filename, total_received);
 

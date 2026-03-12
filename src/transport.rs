@@ -340,43 +340,36 @@ impl Transport for TcpTransport {
         addr: SocketAddr,
         num: usize,
     ) -> Result<Vec<Box<dyn Stream>>, TransferError> {
-        let connect_one = |target: SocketAddr,
-                          send_buf: Option<usize>,
-                          recv_buf: Option<usize>|
-         -> Result<TokioTcpStream, TransferError> {
-            let socket = Socket::new(Domain::IPV4, Type::STREAM, None)
-                .map_err(|e| TransferError::NetworkError(format!("Socket: {}", e)))?;
-            configure_tcp_socket(&socket, send_buf, recv_buf)?;
-            socket
-                .connect(&target.into())
-                .map_err(|e| TransferError::NetworkError(format!("Connect: {}", e)))?;
-            socket
-                .set_nonblocking(true)
-                .map_err(|e| TransferError::NetworkError(format!("Nonblocking: {}", e)))?;
-            let std_stream = std::net::TcpStream::from(socket);
-            TokioTcpStream::from_std(std_stream)
-                .map_err(|e| TransferError::NetworkError(format!("Tokio stream: {}", e)))
-        };
-
         let base_port = addr.port();
         let ip = addr.ip();
         let send_buf = self.config.socket_send_buffer_size;
         let recv_buf = self.config.socket_recv_buffer_size;
-        let mut join_handles = Vec::with_capacity(num);
-        for i in 0..num {
-            let data_addr = SocketAddr::new(ip, base_port + 1 + i as u16);
-            let (sb, rb) = (send_buf, recv_buf);
-            join_handles.push(tokio::task::spawn_blocking(move || connect_one(data_addr, sb, rb)));
-        }
-        let mut data_streams: Vec<Box<dyn Stream>> = Vec::with_capacity(num);
-        for h in join_handles {
-            let stream = h.await.map_err(|e| {
-                TransferError::NetworkError(format!("TCP connect task panicked: {:?}", e))
-            })?;
-            let stream = stream.map_err(|e| TransferError::NetworkError(format!("TCP data connect: {}", e)))?;
-            data_streams.push(Box::new(TcpStreamImpl::new(stream)));
-        }
-
+        let streams: Vec<TokioTcpStream> = tokio::task::spawn_blocking(move || {
+            let mut out = Vec::with_capacity(num);
+            for i in 0..num {
+                let data_addr = SocketAddr::new(ip, base_port + 1 + i as u16);
+                let socket = Socket::new(Domain::IPV4, Type::STREAM, None)
+                    .map_err(|e| TransferError::NetworkError(format!("Socket: {}", e)))?;
+                configure_tcp_socket(&socket, send_buf, recv_buf)?;
+                socket
+                    .connect(&data_addr.into())
+                    .map_err(|e| TransferError::NetworkError(format!("Connect: {}", e)))?;
+                socket
+                    .set_nonblocking(true)
+                    .map_err(|e| TransferError::NetworkError(format!("Nonblocking: {}", e)))?;
+                let std_stream = std::net::TcpStream::from(socket);
+                let stream = TokioTcpStream::from_std(std_stream)
+                    .map_err(|e| TransferError::NetworkError(format!("Tokio stream: {}", e)))?;
+                out.push(stream);
+            }
+            Ok::<_, TransferError>(out)
+        })
+        .await
+        .map_err(|e| TransferError::NetworkError(format!("TCP connect task panicked: {:?}", e)))??;
+        let data_streams = streams
+            .into_iter()
+            .map(|s| Box::new(TcpStreamImpl::new(s)) as Box<dyn Stream>)
+            .collect();
         Ok(data_streams)
     }
 }
