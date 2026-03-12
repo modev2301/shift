@@ -299,12 +299,20 @@ impl Transport for QuicTransport {
             writer: Box::new(writer),
         };
 
+        // Open all data streams in parallel (one RTT instead of N) so transfer starts faster
         let mut data_streams: Vec<Box<dyn Stream>> = Vec::with_capacity(num_data_streams);
+        let mut join_handles = Vec::with_capacity(num_data_streams);
         for _ in 0..num_data_streams {
-            let (send, recv) = conn
-                .open_bi()
-                .await
-                .map_err(|e| TransferError::NetworkError(format!("QUIC open_bi (data): {}", e)))?;
+            let c = conn.clone();
+            join_handles.push(tokio::spawn(async move { c.open_bi().await }));
+        }
+        for h in join_handles {
+            let open_res = h.await.map_err(|e| {
+                TransferError::NetworkError(format!("QUIC open_bi task panicked: {:?}", e))
+            })?;
+            let (send, recv) = open_res.map_err(|e| {
+                TransferError::NetworkError(format!("QUIC open_bi (data): {}", e))
+            })?;
             data_streams.push(Box::new(QuinnStream::new(send, recv)));
         }
 

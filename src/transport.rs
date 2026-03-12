@@ -293,14 +293,13 @@ impl Transport for TcpTransport {
         addr: SocketAddr,
         num_data_streams: usize,
     ) -> Result<(TransferMetaChannels, Vec<Box<dyn Stream>>), TransferError> {
-        let connect_one = |target: SocketAddr| -> Result<TokioTcpStream, TransferError> {
+        let connect_one = |target: SocketAddr,
+                          send_buf: Option<usize>,
+                          recv_buf: Option<usize>|
+         -> Result<TokioTcpStream, TransferError> {
             let socket = Socket::new(Domain::IPV4, Type::STREAM, None)
                 .map_err(|e| TransferError::NetworkError(format!("Socket: {}", e)))?;
-            configure_tcp_socket(
-                &socket,
-                self.config.socket_send_buffer_size,
-                self.config.socket_recv_buffer_size,
-            )?;
+            configure_tcp_socket(&socket, send_buf, recv_buf)?;
             socket
                 .connect(&target.into())
                 .map_err(|e| TransferError::NetworkError(format!("Connect: {}", e)))?;
@@ -312,19 +311,28 @@ impl Transport for TcpTransport {
                 .map_err(|e| TransferError::NetworkError(format!("Tokio stream: {}", e)))
         };
 
-        let meta_stream = connect_one(addr)?;
+        let meta_stream = connect_one(addr, self.config.socket_send_buffer_size, self.config.socket_recv_buffer_size)?;
         let (reader, writer) = tokio::io::split(meta_stream);
         let meta = TransferMetaChannels {
             reader: Box::new(reader),
             writer: Box::new(writer),
         };
 
-        let mut data_streams: Vec<Box<dyn Stream>> = Vec::with_capacity(num_data_streams);
         let base_port = addr.port();
         let ip = addr.ip();
+        let send_buf = self.config.socket_send_buffer_size;
+        let recv_buf = self.config.socket_recv_buffer_size;
+        let mut join_handles = Vec::with_capacity(num_data_streams);
         for i in 0..num_data_streams {
             let data_addr = SocketAddr::new(ip, base_port + 1 + i as u16);
-            let stream = connect_one(data_addr)?;
+            let (sb, rb) = (send_buf, recv_buf);
+            join_handles.push(tokio::task::spawn_blocking(move || connect_one(data_addr, sb, rb)));
+        }
+        let mut data_streams: Vec<Box<dyn Stream>> = Vec::with_capacity(num_data_streams);
+        for h in join_handles {
+            let stream = h.await.map_err(|e| {
+                TransferError::NetworkError(format!("TCP connect task panicked: {:?}", e))
+            })??;
             data_streams.push(Box::new(TcpStreamImpl::new(stream)));
         }
 
