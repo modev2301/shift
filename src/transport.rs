@@ -20,9 +20,9 @@ impl Default for Platform {
     }
 }
 
-/// A bidirectional stream with shutdown. Implementors must also implement AsyncRead + AsyncWrite.
+/// A bidirectional stream with shutdown. Implementors must also implement AsyncRead + AsyncWrite + Unpin.
 #[async_trait]
-pub trait Stream: Send + Sync + AsyncRead + AsyncWrite {
+pub trait Stream: Send + Sync + AsyncRead + AsyncWrite + Unpin {
     async fn shutdown(&self) -> Result<(), TransferError>;
 }
 
@@ -42,11 +42,24 @@ pub trait Listener: Send + Sync {
     async fn accept(&self) -> Result<Box<dyn Connection>, TransferError>;
 }
 
+/// Metadata channel halves for the transfer protocol (capability handshake, metadata, 0x06/0x07, hash).
+pub struct TransferMetaChannels {
+    pub reader: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+    pub writer: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+}
+
 /// Transport: connect (client) or listen (server). TCP and QUIC implement this.
 #[async_trait]
 pub trait Transport: Send + Sync {
     async fn connect(&self, addr: SocketAddr) -> Result<Box<dyn Connection>, TransferError>;
     async fn listen(&self, addr: SocketAddr) -> Result<Box<dyn Listener>, TransferError>;
+
+    /// Establish channels for file transfer: one metadata (split into reader/writer) and N data streams.
+    async fn connect_for_transfer(
+        &self,
+        addr: SocketAddr,
+        num_data_streams: usize,
+    ) -> Result<(TransferMetaChannels, Vec<Box<dyn Stream>>), TransferError>;
 }
 
 // -----------------------------------------------------------------------------
@@ -274,22 +287,60 @@ impl Transport for TcpTransport {
             platform: Self::platform(),
         }))
     }
+
+    async fn connect_for_transfer(
+        &self,
+        addr: SocketAddr,
+        num_data_streams: usize,
+    ) -> Result<(TransferMetaChannels, Vec<Box<dyn Stream>>), TransferError> {
+        let connect_one = |target: SocketAddr| -> Result<TokioTcpStream, TransferError> {
+            let socket = Socket::new(Domain::IPV4, Type::STREAM, None)
+                .map_err(|e| TransferError::NetworkError(format!("Socket: {}", e)))?;
+            configure_tcp_socket(
+                &socket,
+                self.config.socket_send_buffer_size,
+                self.config.socket_recv_buffer_size,
+            )?;
+            socket
+                .connect(&target.into())
+                .map_err(|e| TransferError::NetworkError(format!("Connect: {}", e)))?;
+            socket
+                .set_nonblocking(true)
+                .map_err(|e| TransferError::NetworkError(format!("Nonblocking: {}", e)))?;
+            let std_stream = std::net::TcpStream::from(socket);
+            TokioTcpStream::from_std(std_stream)
+                .map_err(|e| TransferError::NetworkError(format!("Tokio stream: {}", e)))
+        };
+
+        let meta_stream = connect_one(addr)?;
+        let (reader, writer) = tokio::io::split(meta_stream);
+        let meta = TransferMetaChannels {
+            reader: Box::new(reader),
+            writer: Box::new(writer),
+        };
+
+        let mut data_streams: Vec<Box<dyn Stream>> = Vec::with_capacity(num_data_streams);
+        let base_port = addr.port();
+        let ip = addr.ip();
+        for i in 0..num_data_streams {
+            let data_addr = SocketAddr::new(ip, base_port + 1 + i as u16);
+            let stream = connect_one(data_addr)?;
+            data_streams.push(Box::new(TcpStreamImpl::new(stream)));
+        }
+
+        Ok((meta, data_streams))
+    }
 }
 
 /// Create a transport: QUIC (if available and not force_tcp) or TCP.
-/// When the `quic` feature is enabled, tries `QuicTransport::probe()` first; on failure or if
-/// `force_tcp` is true, returns `TcpTransport`. Without the `quic` feature, always returns TCP.
-#[allow(unused_variables)]
+/// Tries QuicTransport::probe() first when force_tcp is false; on failure or if force_tcp is true, returns TcpTransport.
 pub async fn create_transport(
     config: &TransferConfig,
     force_tcp: bool,
 ) -> Box<dyn Transport> {
-    #[cfg(feature = "quic")]
-    {
-        if !force_tcp {
-            if let Ok(quic) = crate::quinn_transport::QuicTransport::probe().await {
-                return Box::new(quic);
-            }
+    if !force_tcp {
+        if let Ok(quic) = crate::quinn_transport::QuicTransport::probe().await {
+            return Box::new(quic);
         }
     }
     Box::new(TcpTransport::new(config.clone()))

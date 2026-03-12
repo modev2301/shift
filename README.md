@@ -26,21 +26,23 @@ Shift is a high-performance file transfer system designed for reliable, efficien
 cargo build --release
 ```
 
-Binary: `target/release/shift`.
+Binary: `target/release/shift`. TCP and QUIC are both built-in; choose at runtime with flags.
 
-Optional QUIC support (crates.io quinn):
+**Server — TCP or QUIC:** Use the same port in `config.toml`. Default is TCP; use `--quic` for QUIC (UDP).
 
 ```bash
-cargo build --release --features quic
+./target/release/shift server              # TCP (base port + data ports)
+./target/release/shift server --quic      # QUIC (single UDP port)
+```
+
+**Client:** By default the client tries QUIC first, then falls back to TCP. Use `--tcp` to force TCP.
+
+```bash
+./target/release/shift ./file user@host:8080:/    # QUIC if server supports it, else TCP
+./target/release/shift --tcp ./file user@host:8080:/   # TCP only
 ```
 
 ### Usage
-
-**Server** (listens on address/port from `config.toml`, default `0.0.0.0:8080`):
-
-```bash
-./target/release/shift server
-```
 
 **Transfer files** (SCP-like):
 

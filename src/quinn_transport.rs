@@ -1,9 +1,7 @@
-//! QUIC transport using the local quinn crate. Implements Transport/Connection/Stream.
-
-#![cfg(feature = "quic")]
+//! QUIC transport using quinn. Implements Transport/Connection/Stream.
 
 use crate::error::TransferError;
-use crate::transport::{Connection, Platform, Stream, Transport};
+use crate::transport::{Connection, Platform, Stream, TransferMetaChannels, Transport};
 use async_trait::async_trait;
 use quinn::{ClientConfig, Connection as QuinnConnection, Endpoint, RecvStream, SendStream};
 use std::net::SocketAddr;
@@ -26,6 +24,8 @@ impl QuinnStream {
         }
     }
 }
+
+impl Unpin for QuinnStream {}
 
 impl AsyncRead for QuinnStream {
     fn poll_read(
@@ -265,5 +265,50 @@ impl Transport for QuicTransport {
             endpoint,
             platform: self.platform,
         }))
+    }
+
+    async fn connect_for_transfer(
+        &self,
+        addr: SocketAddr,
+        num_data_streams: usize,
+    ) -> Result<(TransferMetaChannels, Vec<Box<dyn Stream>>), TransferError> {
+        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
+            .map_err(|e| TransferError::NetworkError(format!("QUIC client endpoint: {}", e)))?;
+        endpoint.set_default_client_config(Self::make_client_config()?);
+        let server_name = addr.ip().to_string();
+        let connecting = endpoint
+            .connect(addr, &server_name)
+            .map_err(|e| TransferError::NetworkError(format!("QUIC connect: {}", e)))?;
+        let conn = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            connecting,
+        )
+        .await
+        .map_err(|_| TransferError::NetworkError("QUIC handshake timeout".to_string()))?
+        .map_err(|e| TransferError::NetworkError(format!("QUIC handshake: {}", e)))?;
+        std::mem::forget(endpoint);
+
+        let (meta_send, meta_recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| TransferError::NetworkError(format!("QUIC open_bi (meta): {}", e)))?;
+        let meta_stream = QuinnStream::new(meta_send, meta_recv);
+        let (reader, writer) = tokio::io::split(meta_stream);
+        let meta = TransferMetaChannels {
+            reader: Box::new(reader),
+            writer: Box::new(writer),
+        };
+
+        let mut data_streams: Vec<Box<dyn Stream>> = Vec::with_capacity(num_data_streams);
+        for _ in 0..num_data_streams {
+            let (send, recv) = conn
+                .open_bi()
+                .await
+                .map_err(|e| TransferError::NetworkError(format!("QUIC open_bi (data): {}", e)))?;
+            data_streams.push(Box::new(QuinnStream::new(send, recv)));
+        }
+
+        std::mem::forget(conn);
+        Ok((meta, data_streams))
     }
 }

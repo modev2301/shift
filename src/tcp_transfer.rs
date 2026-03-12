@@ -7,6 +7,7 @@
 use crate::base::msg;
 use crate::error::TransferError;
 use crate::base::{split_file_ranges, FileRange, TransferConfig};
+use crate::transport::{Stream as TransportStreamTrait, Transport};
 use crate::compression::{compress, decompress, should_compress};
 use crate::encryption::{Decryptor, Encryptor};
 use crate::file_io::{open_file_optimized, read_at};
@@ -359,6 +360,133 @@ async fn transfer_range_tcp(
     Ok(total_sent)
 }
 
+/// Transfer a file range over a transport stream (TCP or QUIC). Same protocol as transfer_range_tcp.
+async fn transfer_range_stream(
+    thread_id: usize,
+    range: FileRange,
+    file: Arc<File>,
+    mut stream: Box<dyn TransportStreamTrait>,
+    config: TransferConfig,
+    progress: Option<ProgressHandle>,
+    hasher_tx: Option<mpsc::Sender<(u64, Vec<u8>)>>,
+) -> Result<u64, TransferError> {
+    tracing::debug!(
+        thread_id,
+        start = range.start,
+        end = range.end,
+        size = range.end - range.start,
+        "Transferring file range over transport stream"
+    );
+
+    let mut header = Vec::with_capacity(17);
+    header.extend_from_slice(&range.start.to_le_bytes());
+    header.extend_from_slice(&range.end.to_le_bytes());
+    let mut flags = 0u8;
+    if config.enable_compression {
+        flags |= 0x01;
+    }
+    if config.enable_encryption {
+        flags |= 0x02;
+    }
+    header.push(flags);
+    stream.write_all(&header).await
+        .map_err(|e| TransferError::NetworkError(format!("Failed to send range header: {}", e)))?;
+
+    let mut encryptor = if config.enable_encryption {
+        config.encryption_key
+            .map(|key| Encryptor::new(&key, thread_id as u32))
+            .transpose()?
+    } else {
+        None
+    };
+
+    let mut offset = range.start;
+    let buffer_size = config.buffer_size.min(16 * 1024 * 1024);
+    let mut buffer = vec![0u8; buffer_size];
+    let mut total_sent = 0u64;
+
+    const SEND_RETRY_DELAY_MS: u64 = 50;
+    const SEND_RETRY_MAX: u32 = 120;
+
+    while offset < range.end {
+        let remaining = (range.end - offset) as usize;
+        let read_size = buffer.len().min(remaining);
+
+        let bytes_read = read_at(&file, &mut buffer[..read_size], offset)?;
+
+        if bytes_read == 0 {
+            break;
+        }
+
+        if let Some(ref tx) = hasher_tx {
+            let plaintext = buffer[..bytes_read].to_vec();
+            let _ = tx.send((offset, plaintext)).await;
+        }
+
+        let mut data_to_send = buffer[..bytes_read].to_vec();
+
+        if config.enable_compression && should_compress(&data_to_send) {
+            if let Ok(compressed) = compress(&data_to_send) {
+                data_to_send = compressed;
+            }
+        }
+
+        if let Some(ref mut enc) = encryptor {
+            enc.encrypt_in_place(&mut data_to_send)?;
+        }
+
+        let mut packet = Vec::with_capacity(9 + data_to_send.len());
+        let compression_flag = if config.enable_compression && data_to_send.len() < bytes_read {
+            0x01
+        } else {
+            0x00
+        };
+        packet.push(compression_flag);
+        packet.extend_from_slice(&(data_to_send.len() as u64).to_le_bytes());
+        packet.extend_from_slice(&data_to_send);
+
+        let mut written = 0usize;
+        let mut retries = 0u32;
+        while written < packet.len() {
+            match stream.write(&packet[written..]).await {
+                Ok(0) => return Err(TransferError::NetworkError("Connection closed during send".to_string())),
+                Ok(n) => {
+                    written += n;
+                    retries = 0;
+                }
+                Err(e) => {
+                    let retryable = e.raw_os_error() == Some(55)
+                        || e.kind() == std::io::ErrorKind::WouldBlock;
+                    if retryable && retries < SEND_RETRY_MAX {
+                        retries += 1;
+                        tokio::time::sleep(Duration::from_millis(SEND_RETRY_DELAY_MS)).await;
+                    } else {
+                        return Err(TransferError::NetworkError(format!("Failed to send data: {}", e)));
+                    }
+                }
+            }
+        }
+
+        offset += bytes_read as u64;
+        total_sent += bytes_read as u64;
+
+        if let Some(ref progress) = progress {
+            progress.update(bytes_read as u64);
+        }
+    }
+
+    stream.shutdown().await
+        .map_err(|e| TransferError::NetworkError(format!("Failed to shutdown stream: {}", e)))?;
+
+    debug!(
+        thread_id,
+        bytes = total_sent,
+        "Transport stream range transfer completed"
+    );
+
+    Ok(total_sent)
+}
+
 /// Receive a file range over a single TCP connection.
 /// If `hasher_tx` is Some, plaintext bytes written are fed to the receive-side hasher (bytes actually written).
 pub async fn receive_range_tcp(
@@ -540,6 +668,170 @@ pub async fn receive_range_tcp(
         bytes = total_received,
         expected = expected_size,
         "File range reception completed"
+    );
+
+    Ok(total_received)
+}
+
+/// Receive a file range over a transport stream (QUIC or TCP). Same protocol as receive_range_tcp; only reads from stream.
+pub(crate) async fn receive_range_stream(
+    thread_id: usize,
+    file: Arc<File>,
+    mut stream: Box<dyn TransportStreamTrait>,
+    config: TransferConfig,
+    progress: Option<ProgressHandle>,
+    hasher_tx: Option<mpsc::Sender<(u64, Vec<u8>)>>,
+) -> Result<u64, TransferError> {
+    let mut start_buf = [0u8; 8];
+    stream.read_exact(&mut start_buf).await
+        .map_err(|e| TransferError::NetworkError(format!("Failed to read start offset: {}", e)))?;
+    let start_offset = u64::from_le_bytes(start_buf);
+
+    let mut end_buf = [0u8; 8];
+    stream.read_exact(&mut end_buf).await
+        .map_err(|e| TransferError::NetworkError(format!("Failed to read end offset: {}", e)))?;
+    let end_offset = u64::from_le_bytes(end_buf);
+
+    let mut flags_buf = [0u8; 1];
+    stream.read_exact(&mut flags_buf).await
+        .map_err(|e| TransferError::NetworkError(format!("Failed to read flags: {}", e)))?;
+    let flags = flags_buf[0];
+    let _compression_enabled = (flags & 0x01) != 0;
+    let encryption_enabled = (flags & 0x02) != 0;
+
+    let mut decryptor: Option<Decryptor> = if encryption_enabled {
+        config.encryption_key
+            .map(|key| Decryptor::new(&key, thread_id as u32))
+            .transpose()?
+    } else {
+        None
+    };
+
+    tracing::debug!(
+        thread_id,
+        start = start_offset,
+        end = end_offset,
+        size = end_offset - start_offset,
+        "Receiving file range over transport stream"
+    );
+
+    let mut offset = start_offset;
+    let mut buffer = vec![0u8; config.buffer_size.min(16 * 1024 * 1024)];
+    let mut decompress_buffer = Vec::new();
+    let mut total_received = 0u64;
+
+    while offset < end_offset {
+        let remaining = (end_offset - offset) as usize;
+        let read_size = buffer.len().min(remaining);
+
+        let mut flag_buf = [0u8; 1];
+        stream.read_exact(&mut flag_buf).await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to read compression flag: {}", e)))?;
+
+        let mut size_buf = [0u8; 8];
+        stream.read_exact(&mut size_buf).await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to read data size: {}", e)))?;
+        let data_size = u64::from_le_bytes(size_buf) as usize;
+
+        if data_size == 0 {
+            break;
+        }
+
+        let mut data_buf = vec![0u8; data_size];
+        stream.read_exact(&mut data_buf).await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to read data: {}", e)))?;
+
+        if let Some(ref mut dec) = decryptor {
+            let plaintext_len = dec.decrypt_in_place(&mut data_buf)?;
+            data_buf.truncate(plaintext_len);
+        }
+
+        let bytes_read = if flag_buf[0] == 0x01 {
+            decompress_buffer = decompress(&data_buf, read_size)?;
+            decompress_buffer.len()
+        } else {
+            let copy_len = data_buf.len().min(buffer.len());
+            buffer[..copy_len].copy_from_slice(&data_buf[..copy_len]);
+            copy_len
+        };
+
+        if bytes_read == 0 {
+            break;
+        }
+
+        let data = if flag_buf[0] == 0x01 && !decompress_buffer.is_empty() {
+            &decompress_buffer[..bytes_read]
+        } else {
+            &buffer[..bytes_read]
+        };
+
+        if let Some(ref tx) = hasher_tx {
+            let _ = tx.send((offset, data.to_vec())).await;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = file.as_raw_fd();
+            let written = unsafe {
+                libc::pwrite(
+                    fd,
+                    data.as_ptr() as *const libc::c_void,
+                    bytes_read,
+                    offset as libc::off_t,
+                )
+            };
+            if written < 0 {
+                return Err(TransferError::Io(std::io::Error::last_os_error()));
+            }
+            if written as usize != bytes_read {
+                return Err(TransferError::ProtocolError(
+                    format!("Partial write: {} != {}", written, bytes_read)
+                ));
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let mut file_mut = File::try_clone(&*file)?;
+            use std::io::SeekFrom;
+            file_mut.seek(SeekFrom::Start(offset))?;
+            file_mut.write_all(data)?;
+        }
+
+        offset += bytes_read as u64;
+        total_received += bytes_read as u64;
+
+        if let Some(ref progress) = progress {
+            progress.update(bytes_read as u64);
+        }
+    }
+
+    let expected_size = end_offset - start_offset;
+    if total_received != expected_size {
+        return Err(TransferError::ProtocolError(
+            format!("Range size mismatch: received {} bytes, expected {} bytes (range {} to {})",
+                total_received, expected_size, start_offset, end_offset)
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = file.as_raw_fd();
+        unsafe { libc::fsync(fd); }
+    }
+    #[cfg(not(unix))]
+    {
+        let file_mut = File::try_clone(&*file)?;
+        file_mut.sync_all()?;
+    }
+
+    tracing::debug!(
+        thread_id,
+        bytes = total_received,
+        expected = expected_size,
+        "Transport stream range reception completed"
     );
 
     Ok(total_received)
@@ -909,8 +1201,6 @@ pub async fn send_file_tcp(
         }
     }
 
-    drop(metadata_stream);
-
     // Delete checkpoint only on hash OK
     delete_checkpoint(file_path)?;
 
@@ -932,6 +1222,329 @@ pub async fn send_file_tcp(
         duration_secs = duration.as_secs_f64(),
         throughput_mbps = throughput_mbps,
         "Transfer completed"
+    );
+
+    Ok(total_sent)
+}
+
+/// Send a file over a transport (TCP or QUIC). Uses same protocol as send_file_tcp.
+pub async fn send_file_over_transport(
+    transport: &dyn Transport,
+    file_path: &std::path::Path,
+    server_addr: SocketAddr,
+    config: TransferConfig,
+) -> Result<u64, TransferError> {
+    let metadata = std::fs::metadata(file_path)?;
+    let file_size = metadata.len();
+
+    if file_size == 0 {
+        return Err(TransferError::ProtocolError("Cannot transfer empty file".to_string()));
+    }
+
+    let filename = file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let mut config = config;
+    if !is_file_compressible(file_path) {
+        config.enable_compression = false;
+    }
+
+    tracing::debug!(
+        file = %filename,
+        size = file_size,
+        streams = config.num_streams,
+        "Starting transfer over transport"
+    );
+
+    let progress = TransferProgress::new(file_size, true);
+    if let Some(ref pb) = progress.progress_bar {
+        pb.set_message(format!("{}", filename));
+    }
+    let progress_handle = progress.handle();
+
+    let progress_for_logger = progress.handle();
+    let filename_for_logger = filename.clone();
+    let total_bytes = file_size;
+    let start_time = std::time::Instant::now();
+    let logger_handle = tokio::spawn(async move {
+        let mut interval = interval(Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            let transferred = progress_for_logger.transferred.load(std::sync::atomic::Ordering::Relaxed);
+            if transferred >= total_bytes {
+                break;
+            }
+            if transferred > 0 {
+                let elapsed = start_time.elapsed().as_secs_f64();
+                if elapsed > 0.0 {
+                    let mbps = (transferred as f64 / (1024.0 * 1024.0)) / elapsed;
+                    tracing::debug!(file = %filename_for_logger, throughput_mbps = mbps, transferred = transferred, total = total_bytes, "Transfer progress");
+                }
+            }
+        }
+    });
+
+    let (meta, data_streams) = transport
+        .connect_for_transfer(server_addr, config.num_streams)
+        .await?;
+
+    let mut reader = meta.reader;
+    let mut writer = meta.writer;
+
+    let client_caps = crate::base::capabilities_from_config(&config);
+    writer.write_all(&client_caps.to_bytes()).await
+        .map_err(|e| TransferError::NetworkError(format!("Failed to send capabilities: {}", e)))?;
+    let mut cap_buf = [0u8; crate::base::CAPABILITIES_WIRE_LEN];
+    reader.read_exact(&mut cap_buf).await
+        .map_err(|e| TransferError::NetworkError(format!("Failed to read negotiated capabilities: {}", e)))?;
+    let negotiated = crate::base::Capabilities::from_bytes(&cap_buf)
+        .ok_or_else(|| TransferError::ProtocolError("Invalid capabilities from server".to_string()))?;
+    let config = crate::base::apply_capabilities_to_config(&config, negotiated);
+
+    let metadata_bytes = {
+        let filename_bytes = filename.as_bytes();
+        let mut m = Vec::new();
+        m.extend_from_slice(&(filename_bytes.len() as u64).to_le_bytes());
+        m.extend_from_slice(filename_bytes);
+        m.extend_from_slice(&file_size.to_le_bytes());
+        m.extend_from_slice(&(config.num_streams as u64).to_le_bytes());
+        m
+    };
+    writer.write_all(&metadata_bytes).await
+        .map_err(|e| TransferError::NetworkError(format!("Failed to send metadata: {}", e)))?;
+
+    let mut ack_buf = [0u8; 1];
+    reader.read_exact(&mut ack_buf).await
+        .map_err(|e| TransferError::NetworkError(format!("Failed to receive initial ack: {}", e)))?;
+
+    if ack_buf[0] != msg::READY {
+        return Err(TransferError::ProtocolError("Invalid initial ACK from server".to_string()));
+    }
+
+    let checkpoint_path = get_checkpoint_path(file_path);
+    let mut checkpoint = if checkpoint_path.exists() {
+        tracing::debug!("Found checkpoint file, attempting to resume transfer");
+        match TransferCheckpoint::load(&checkpoint_path) {
+            Ok(cp) if cp.file_size == file_size => cp,
+            Ok(_) => {
+                tracing::debug!("Checkpoint file size mismatch, starting fresh transfer");
+                delete_checkpoint(file_path)?;
+                TransferCheckpoint::new(file_size)
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "Failed to load checkpoint, starting fresh transfer");
+                delete_checkpoint(file_path)?;
+                TransferCheckpoint::new(file_size)
+            }
+        }
+    } else {
+        TransferCheckpoint::new(file_size)
+    };
+
+    let all_ranges = split_file_ranges(file_size, config.num_streams);
+    let completed_ordered = checkpoint.completed_ranges_ordered(&all_ranges);
+
+    if !completed_ordered.is_empty() {
+        writer.write_all(&[msg::RANGE_HASHES]).await.map_err(|e| {
+            TransferError::NetworkError(format!("Failed to send range hashes type: {}", e))
+        })?;
+        writer
+            .write_all(&(completed_ordered.len() as u64).to_le_bytes())
+            .await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to send num_ranges: {}", e)))?;
+        for (range, hash) in &completed_ordered {
+            writer.write_all(&range.start.to_le_bytes()).await.map_err(|e| {
+                TransferError::NetworkError(format!("Failed to send range start: {}", e))
+            })?;
+            writer.write_all(&range.end.to_le_bytes()).await.map_err(|e| {
+                TransferError::NetworkError(format!("Failed to send range end: {}", e))
+            })?;
+            writer.write_all(hash).await.map_err(|e| {
+                TransferError::NetworkError(format!("Failed to send range hash: {}", e))
+            })?;
+        }
+        let mut resp = [0u8; 1];
+        reader.read_exact(&mut resp).await.map_err(|e| {
+            TransferError::NetworkError(format!("Failed to read range verify result type: {}", e))
+        })?;
+        if resp[0] != msg::RANGE_VERIFY_RESULT {
+            return Err(TransferError::ProtocolError(format!(
+                "Expected range verify result (0x07), got 0x{:02x}",
+                resp[0]
+            )));
+        }
+        let mut num_failed_buf = [0u8; 8];
+        reader.read_exact(&mut num_failed_buf).await.map_err(|e| {
+            TransferError::NetworkError(format!("Failed to read num_failed: {}", e))
+        })?;
+        let num_failed = u64::from_le_bytes(num_failed_buf) as usize;
+        for _ in 0..num_failed {
+            let mut start_buf = [0u8; 8];
+            let mut end_buf = [0u8; 8];
+            reader.read_exact(&mut start_buf).await.map_err(|e| {
+                TransferError::NetworkError(format!("Failed to read failed range start: {}", e))
+            })?;
+            reader.read_exact(&mut end_buf).await.map_err(|e| {
+                TransferError::NetworkError(format!("Failed to read failed range end: {}", e))
+            })?;
+            let start = u64::from_le_bytes(start_buf);
+            let end = u64::from_le_bytes(end_buf);
+            checkpoint.remove_completed(&FileRange { start, end });
+        }
+        checkpoint.save(&checkpoint_path)?;
+    } else {
+        writer.write_all(&[msg::NO_RANGE_VERIFY]).await.map_err(|e| {
+            TransferError::NetworkError(format!("Failed to send no range verify: {}", e))
+        })?;
+    }
+
+    let missing_ranges = checkpoint.get_missing_ranges(&all_ranges);
+    if missing_ranges.is_empty() {
+        delete_checkpoint(file_path)?;
+        return Ok(file_size);
+    }
+
+    let is_resume = checkpoint.completed_ranges.len() > 0;
+    if is_resume {
+        tracing::debug!(
+            completed = checkpoint.completed_ranges.len(),
+            remaining = missing_ranges.len(),
+            "Resuming transfer"
+        );
+    }
+
+    let file = Arc::new(open_file_optimized(file_path, file_size)?);
+
+    let resume_hash = if is_resume {
+        Some(hash_file(file_path, file_size)?)
+    } else {
+        None
+    };
+    let (hasher_tx, hasher_handle) = if resume_hash.is_none() {
+        let (tx, rx) = mpsc::channel(64);
+        let handle = tokio::spawn(async move { run_ordered_hasher(rx, file_size).await });
+        (Some(tx), Some(handle))
+    } else {
+        (None, None)
+    };
+
+    let mut streams: Vec<Option<Box<dyn TransportStreamTrait>>> =
+        data_streams.into_iter().map(Some).collect();
+
+    let mut handles = Vec::new();
+    for (idx, range) in missing_ranges.iter().enumerate() {
+        let thread_id = idx;
+        let range = *range;
+        let file = Arc::clone(&file);
+        let config = config.clone();
+        let stream = streams[thread_id].take().ok_or_else(|| {
+            TransferError::ProtocolError("Missing data stream for range".to_string())
+        })?;
+        let progress_clone = progress_handle.clone();
+        let range_hasher_tx = hasher_tx.clone();
+
+        let handle = tokio::spawn(async move {
+            transfer_range_stream(
+                thread_id,
+                range,
+                file,
+                stream,
+                config,
+                Some(progress_clone),
+                range_hasher_tx,
+            )
+            .await
+        });
+        handles.push(handle);
+    }
+
+    let mut total_sent = 0u64;
+    for (idx, handle) in handles.into_iter().enumerate() {
+        match handle.await {
+            Ok(Ok(bytes)) => {
+                total_sent += bytes;
+                if idx < missing_ranges.len() {
+                    let range = missing_ranges[idx];
+                    let range_hash = hash_file_range_path(file_path, range.start, range.end)?;
+                    checkpoint.mark_completed(range, range_hash);
+                    checkpoint.save(&checkpoint_path)?;
+                }
+                tracing::debug!(thread_id = idx, bytes, "Connection completed");
+            }
+            Ok(Err(e)) => {
+                drop(hasher_tx);
+                let _ = checkpoint.save(&checkpoint_path);
+                return Err(e);
+            }
+            Err(e) => {
+                drop(hasher_tx);
+                let _ = checkpoint.save(&checkpoint_path);
+                return Err(TransferError::NetworkError(format!("Connection panicked: {:?}", e)));
+            }
+        }
+    }
+
+    let file_hash = match (resume_hash, hasher_handle) {
+        (Some(h), _) => h,
+        (None, Some(handle)) => {
+            drop(hasher_tx);
+            handle
+                .await
+                .map_err(|e| TransferError::NetworkError(format!("Hasher task panicked: {:?}", e)))?
+                .map_err(|e| TransferError::ProtocolError(format!("Hasher: {}", e)))?
+        }
+        (None, None) => unreachable!("full transfer always spawns hasher"),
+    };
+
+    writer.write_all(&[msg::HASH]).await.map_err(|e| {
+        TransferError::NetworkError(format!("Failed to send hash message type: {}", e))
+    })?;
+    writer
+        .write_all(&file_hash)
+        .await
+        .map_err(|e| TransferError::NetworkError(format!("Failed to send file hash: {}", e)))?;
+
+    let mut response_buf = [0u8; 1];
+    reader.read_exact(&mut response_buf).await.map_err(|e| {
+        TransferError::NetworkError(format!("Failed to receive hash response: {}", e))
+    })?;
+
+    match response_buf[0] {
+        msg::HASH_OK => {}
+        msg::HASH_MISMATCH => {
+            return Err(TransferError::IntegrityCheckFailed(
+                "Server reported BLAKE3 mismatch; checkpoint kept for retry".to_string(),
+            ));
+        }
+        _ => {
+            return Err(TransferError::ProtocolError(format!(
+                "Invalid hash response from server: 0x{:02x}",
+                response_buf[0]
+            )));
+        }
+    }
+
+    delete_checkpoint(file_path)?;
+
+    let _ = logger_handle.await;
+    progress.finish();
+
+    let duration = progress.start_time.elapsed();
+    let throughput_mbps = if duration.as_secs_f64() > 0.0 {
+        (total_sent as f64 / (1024.0 * 1024.0)) / duration.as_secs_f64()
+    } else {
+        0.0
+    };
+
+    tracing::debug!(
+        file = %filename,
+        bytes = total_sent,
+        duration_secs = duration.as_secs_f64(),
+        throughput_mbps = throughput_mbps,
+        "Transfer over transport completed"
     );
 
     Ok(total_sent)

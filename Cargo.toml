@@ -25,14 +25,12 @@ ring = "0.17"
 async-trait = "0.1"
 blake3 = "1.5"
 rusqlite = { version = "0.31", features = ["bundled"] }
-quinn = { version = "0.11", optional = true, default-features = false, features = ["rustls-ring", "runtime-tokio"] }
-rcgen = { version = "0.12", optional = true }
-rustls = { version = "0.23", optional = true, default-features = false, features = ["std"] }
+quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
+rcgen = "0.12"
+rustls = { version = "0.23", default-features = false, features = ["std"] }
 
 [features]
 default = []
-# Enable QUIC via quinn (crates.io). Quinn/msquic dirs in repo are for reference only.
-quic = ["dep:quinn", "dep:rcgen", "dep:rustls"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

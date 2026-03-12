@@ -44,7 +44,7 @@
 pub mod base;
 pub mod compression;
 pub mod config;
-#[cfg(feature = "quic")]
+pub mod quic_server;
 pub mod quinn_transport;
 pub mod transport;
 pub mod encryption;
@@ -61,7 +61,6 @@ pub use base::{FileRange, TransferConfig, TransferStats};
 pub use config::Config;
 pub use error::TransferError;
 pub use transport::{create_transport, Connection, Listener, Platform, Stream, Transport, TcpTransport};
-#[cfg(feature = "quic")]
 pub use quinn_transport::QuicTransport;
 
 // Re-export commonly used types for convenience

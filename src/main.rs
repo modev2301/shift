@@ -19,6 +19,10 @@ struct Cli {
     #[arg(short = 'd', long = "dedup")]
     deduplicate: bool,
     
+    /// Force TCP transport (use when comparing with QUIC or if QUIC is unavailable)
+    #[arg(long = "tcp")]
+    force_tcp: bool,
+    
     /// Configuration file path
     #[arg(short, long, default_value = "config.toml")]
     config: PathBuf,
@@ -37,8 +41,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the transfer server
-    Server,
+    /// Start the transfer server (TCP or QUIC; use --quic for QUIC)
+    Server {
+        /// Listen with QUIC (UDP) instead of TCP
+        #[arg(long)]
+        quic: bool,
+    },
 }
 
 /// Parses SCP-like remote path: user@host:/path or host:/path
@@ -108,23 +116,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Handle explicit commands first
     if let Some(command) = cli.command {
         match command {
-            Commands::Server => {
+            Commands::Server { quic } => {
                 let config = Config::load_or_create(&cli.config)?;
-                
-                use shift::{tcp_server::TcpServer, TransferConfig};
-                
+                use shift::TransferConfig;
                 let num_streams = config.server.parallel_streams.unwrap_or(DEFAULT_PARALLEL_STREAMS);
-                
-                // Auto-calculate buffer sizes if not specified
                 use shift::utils::calculate_optimal_buffer_size;
                 let buffer_size = config.server.buffer_size.unwrap_or_else(|| {
-                    // Use a default file size estimate for server (1GB)
                     calculate_optimal_buffer_size(1024 * 1024 * 1024, num_streams)
                 });
                 let socket_buffer = config.server.socket_send_buffer_size
                     .or(config.server.socket_recv_buffer_size)
                     .unwrap_or_else(|| calculate_optimal_buffer_size(1024 * 1024 * 1024, num_streams));
-                
                 let transfer_config = TransferConfig {
                     start_port: config.server.port,
                     num_streams,
@@ -136,20 +138,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     encryption_key: None,
                     timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
                 };
-                
                 eprintln!("Shift Transfer Server");
                 eprintln!("Port: {}", transfer_config.start_port);
                 eprintln!("Output directory: {}", config.server.output_directory);
-                
-                let server = TcpServer::new(
-                    transfer_config.start_port,
-                    transfer_config.num_streams,
-                    PathBuf::from(&config.server.output_directory),
-                    transfer_config,
-                );
-                
                 let rt = tokio::runtime::Runtime::new()?;
-                rt.block_on(server.run_forever())?;
+                if quic {
+                    use shift::quic_server::QuicServer;
+                    eprintln!("Transport: QUIC (UDP)");
+                    let server = QuicServer::new(
+                        transfer_config.start_port,
+                        PathBuf::from(&config.server.output_directory),
+                        transfer_config,
+                    );
+                    rt.block_on(server.run_forever())?;
+                } else {
+                    use shift::tcp_server::TcpServer;
+                    eprintln!("Transport: TCP");
+                    let server = TcpServer::new(
+                        transfer_config.start_port,
+                        transfer_config.num_streams,
+                        PathBuf::from(&config.server.output_directory),
+                        transfer_config,
+                    );
+                    rt.block_on(server.run_forever())?;
+                }
                 return Ok(());
             }
         }
@@ -249,8 +261,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         }
         
-        // Use TCP-based transfer for maximum throughput
-        use shift::{tcp_transfer::send_file_tcp, TransferConfig};
+        use shift::tcp_transfer::send_file_over_transport;
+        use shift::transport::create_transport;
+        use shift::TransferConfig;
         use shift::utils::calculate_optimal_parallel_streams;
         use std::net::ToSocketAddrs;
         
@@ -314,6 +327,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
         
         let rt = tokio::runtime::Runtime::new()?;
+        let transport = rt.block_on(create_transport(&transfer_config, cli.force_tcp));
         
         for (idx, local_file) in files_to_transfer.iter().enumerate() {
             let file_idx = idx + 1;
@@ -329,8 +343,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .next()
                 .ok_or_else(|| "Failed to resolve server address")?;
             
-            // Transfer file using TCP
-            match rt.block_on(send_file_tcp(local_file, server_addr, transfer_config.clone())) {
+            match rt.block_on(send_file_over_transport(
+                transport.as_ref(),
+                local_file,
+                server_addr,
+                transfer_config.clone(),
+            )) {
                 Ok(_) => {
                     // Progress bar already shows completion, no need for extra message
                 }
