@@ -20,7 +20,7 @@ impl TransferProgress {
             let pb = ProgressBar::new(total_bytes);
             pb.set_style(
                 ProgressStyle::default_bar()
-                    .template("{msg:25.25} {bytes:>10}/{total_bytes:>10} {percent:>5}% {bytes_per_sec:>12} {eta:>8}")
+                    .template("{msg:32.32} {bytes:>10}/{total_bytes:>10} {percent:>5}% {bytes_per_sec:>12} {eta:>8}")
                     .unwrap()
                     .progress_chars("█▉▊▋▌▍▎▏ "),
             );
@@ -97,6 +97,13 @@ impl ProgressHandle {
         let prev = self.transferred.fetch_add(bytes, Ordering::Relaxed);
         if let Some(ref pb) = self.progress_bar {
             pb.set_position(prev + bytes);
+        }
+    }
+
+    /// Set the progress bar status line (e.g. "⚡ QUIC  6→8" or "🔌 TCP  4→6").
+    pub fn set_message(&self, msg: impl AsRef<str>) {
+        if let Some(ref pb) = self.progress_bar {
+            pb.set_message(msg.as_ref().to_string());
         }
     }
 }

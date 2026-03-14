@@ -1,11 +1,14 @@
 use clap::{Parser, Subcommand};
-use shift::{config::{DEFAULT_PARALLEL_STREAMS, DEFAULT_TIMEOUT_SECONDS}, Config};
+use shift::config::{DEFAULT_PARALLEL_STREAMS, DEFAULT_TIMEOUT_SECONDS};
+use shift::TransferReport;
+use shift::Config;
 use std::path::PathBuf;
 use tracing::info;
 
 #[derive(Parser)]
 #[command(name = "shift")]
 #[command(about = "High-performance file transfer tool")]
+#[command(subcommand_negates_reqs = true)]
 struct Cli {
     /// Recursive directory transfer
     #[arg(short = 'r', long)]
@@ -22,7 +25,15 @@ struct Cli {
     /// Force TCP transport (use when comparing with QUIC or if QUIC is unavailable)
     #[arg(long = "tcp")]
     force_tcp: bool,
-    
+
+    /// Print transfer stats after each file (human-readable)
+    #[arg(long = "stats")]
+    stats: bool,
+
+    /// Print transfer stats as JSON (for scripting/benchmarks)
+    #[arg(long = "json")]
+    json: bool,
+
     /// Configuration file path
     #[arg(short, long, default_value = "config.toml")]
     config: PathBuf,
@@ -30,13 +41,9 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
     
-    /// Source paths (files, directories, or remote paths). Can specify multiple files.
-    #[arg(value_name = "SOURCE", num_args = 1..)]
-    sources: Vec<String>,
-    
-    /// Destination path (file, directory, or remote path)
-    #[arg(value_name = "DEST")]
-    dest: Option<String>,
+    /// Source and destination: SOURCE... DEST (last arg is destination, e.g. user@host:/path)
+    #[arg(value_name = "PATH", num_args = 2..)]
+    paths: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -130,6 +137,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let transfer_config = TransferConfig {
                     start_port: config.server.port,
                     num_streams,
+                    max_streams: num_streams,
                     buffer_size,
                     socket_send_buffer_size: Some(socket_buffer),
                     socket_recv_buffer_size: Some(socket_buffer),
@@ -156,7 +164,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("Transport: TCP");
                     let server = TcpServer::new(
                         transfer_config.start_port,
-                        transfer_config.num_streams,
                         PathBuf::from(&config.server.output_directory),
                         transfer_config,
                     );
@@ -167,18 +174,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     
-    // Handle SCP-like syntax: shift source... dest
-    if cli.sources.is_empty() || cli.dest.is_none() {
-        eprintln!("Error: Source and destination required");
+    // Handle SCP-like syntax: shift source... dest (last arg is destination)
+    if cli.paths.len() < 2 {
+        eprintln!("Error: At least one source and one destination required");
         eprintln!("Usage: shift [OPTIONS] SOURCE... DEST");
         eprintln!("       shift [OPTIONS] file1.txt file2.txt user@host:/path/");
         eprintln!("       shift [OPTIONS] *.log host:/backup/");
         eprintln!("       shift [OPTIONS] user@host:/file.txt ./");
         std::process::exit(1);
     }
-    
-    let dest = cli.dest.unwrap();
-    let sources = cli.sources;
+    let (sources, dest) = {
+        let (last, rest) = cli.paths.split_last().unwrap();
+        (rest.to_vec(), last.clone())
+    };
     
     // Check if any source is remote
     let source_is_remote = sources.iter().any(|s| is_remote_path(s));
@@ -307,9 +315,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             });
         
+        let max_streams = (num_streams * 2).max(32).min(256);
         let transfer_config = TransferConfig {
             start_port: remote.port.unwrap_or(8080),
             num_streams,
+            max_streams,
             buffer_size,
             socket_send_buffer_size: Some(socket_buffer),
             socket_recv_buffer_size: Some(socket_buffer),
@@ -328,29 +338,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         let rt = tokio::runtime::Runtime::new()?;
         let transport = rt.block_on(create_transport(&transfer_config, cli.force_tcp));
-        
+        let output_stats = cli.stats || cli.json;
+        let mut report = TransferReport::default();
+
         for (idx, local_file) in files_to_transfer.iter().enumerate() {
             let file_idx = idx + 1;
             let total_files = files_to_transfer.len();
-            
+
             if total_files > 1 {
                 eprintln!("[{}/{}] {}", file_idx, total_files, local_file.display());
             }
-            
+
             let server_addr_str = format!("{}:{}", remote.host, remote.port.unwrap_or(8080));
             let server_addr = server_addr_str
                 .to_socket_addrs()?
                 .next()
                 .ok_or_else(|| "Failed to resolve server address")?;
-            
+
+            let stats_out = if output_stats { Some(&mut report) } else { None };
             match rt.block_on(send_file_over_transport(
                 transport.as_ref(),
                 local_file,
                 server_addr,
                 transfer_config.clone(),
+                stats_out,
+                cli.skip_unchanged,
             )) {
                 Ok(_) => {
-                    // Progress bar already shows completion, no need for extra message
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()));
+                    } else if cli.stats {
+                        eprintln!(
+                            "transport: {}  bytes: {}  duration_ms: {}  throughput_mbps: {:.2}  streams: {}→{}  stalled: {}  rtt_ms: {}  ranges: {} total, {} resumed",
+                            report.transport,
+                            report.bytes,
+                            report.duration_ms,
+                            report.throughput_mbps,
+                            report.streams_initial,
+                            report.streams_peak,
+                            report.streams_stalled,
+                            report.rtt_ms,
+                            report.ranges_total,
+                            report.ranges_resumed,
+                        );
+                    }
                 }
                 Err(e) => {
                     eprintln!("[{}/{}] Transfer failed: {} - {}", file_idx, total_files, local_file.display(), e);

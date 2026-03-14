@@ -22,6 +22,7 @@
 //!     let transfer_config = TransferConfig {
 //!         start_port: config.server.port,
 //!         num_streams: 16,
+//!         max_streams: 16,
 //!         buffer_size: 16 * 1024 * 1024,
 //!         socket_send_buffer_size: Some(16 * 1024 * 1024),
 //!         socket_recv_buffer_size: Some(16 * 1024 * 1024),
@@ -32,7 +33,6 @@
 //!     };
 //!     let server = TcpServer::new(
 //!         config.server.port,
-//!         16,
 //!         config.server.output_directory.into(),
 //!         transfer_config,
 //!     );
@@ -51,13 +51,15 @@ pub mod encryption;
 pub mod error;
 pub mod file_io;
 pub mod integrity;
+pub mod metrics;
 pub mod progress;
+pub mod range_queue;
 pub mod resume;
 pub mod tcp_server;
 pub mod tcp_transfer;
 pub mod utils;
 
-pub use base::{FileRange, TransferConfig, TransferStats};
+pub use base::{FileRange, TransferConfig, TransferReport, TransferStats};
 pub use config::Config;
 pub use error::TransferError;
 pub use transport::{create_transport, Connection, Listener, Platform, Stream, Transport, TcpTransport};

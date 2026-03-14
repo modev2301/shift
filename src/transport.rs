@@ -1,9 +1,12 @@
 //! Transport abstraction: TCP implements today, QUIC implements same traits later.
 //! Nothing above this layer changes when swapping transport.
 
+use crate::base::TransferConfig;
 use crate::error::TransferError;
 use async_trait::async_trait;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 /// Platform for capability reporting (0=unknown, 1=linux, 2=windows).
@@ -48,29 +51,42 @@ pub struct TransferMetaChannels {
     pub writer: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
 }
 
+/// Opens data streams on demand (TCP: connect to next port, QUIC: open_bi). Coordinator holds this for transfer duration.
+#[async_trait]
+pub trait StreamOpener: Send + Sync {
+    /// Open one new stream. TCP: connect to next data port; QUIC: open_bi on the connection.
+    async fn open_stream(&self) -> Result<Box<dyn Stream>, TransferError>;
+    fn max_streams(&self) -> usize;
+}
+
 /// Transport: connect (client) or listen (server). TCP and QUIC implement this.
 #[async_trait]
 pub trait Transport: Send + Sync {
+    /// Display name for UI (e.g. "tcp", "quic").
+    fn name(&self) -> &'static str {
+        "tcp"
+    }
+
     async fn connect(&self, addr: SocketAddr) -> Result<Box<dyn Connection>, TransferError>;
     async fn listen(&self, addr: SocketAddr) -> Result<Box<dyn Listener>, TransferError>;
 
-    /// Establish channels for file transfer: one metadata (split into reader/writer) and optionally data streams.
-    /// TCP: returns only metadata; data streams must be opened after READY via open_data_connections (server opens data ports only after sending READY).
-    /// QUIC: returns metadata and all data streams (opened in parallel on the same connection).
+    /// Establish metadata channel and a stream opener. Caller uses opener.open_stream() for data (initial + scale-up).
+    /// num_streams: hint for initial count; max_streams: ceiling for opener. Opener is Arc so workers can share it.
     async fn connect_for_transfer(
         &self,
         addr: SocketAddr,
-        num_data_streams: usize,
-    ) -> Result<(TransferMetaChannels, Vec<Box<dyn Stream>>), TransferError>;
+        num_streams: usize,
+        max_streams: usize,
+    ) -> Result<(TransferMetaChannels, Arc<dyn StreamOpener>), TransferError>;
 
-    /// Open data connections (TCP only). Call after metadata handshake and READY. Default: error (QUIC uses streams from connect_for_transfer).
+    /// Deprecated: use StreamOpener from connect_for_transfer instead. Kept for compatibility.
     async fn open_data_connections(
         &self,
         _addr: SocketAddr,
         _num: usize,
     ) -> Result<Vec<Box<dyn Stream>>, TransferError> {
         Err(TransferError::ProtocolError(
-            "open_data_connections not supported for this transport".to_string(),
+            "open_data_connections not supported; use StreamOpener from connect_for_transfer".to_string(),
         ))
     }
 }
@@ -81,8 +97,6 @@ pub trait Transport: Send + Sync {
 
 use socket2::{Domain, Socket, Type};
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream};
-
-use crate::base::TransferConfig;
 
 /// Wraps tokio TcpStream to implement the transport Stream trait (AsyncRead + AsyncWrite + shutdown).
 pub struct TcpStreamImpl {
@@ -250,6 +264,43 @@ fn configure_tcp_socket(
     Ok(())
 }
 
+/// Opens TCP data streams by connecting to base_port+1, base_port+2, ... Coordinator calls open_stream() on demand.
+pub struct TcpStreamOpener {
+    addr: SocketAddr,
+    next_port: AtomicU16,
+    max: usize,
+    config: TransferConfig,
+}
+
+#[async_trait]
+impl StreamOpener for TcpStreamOpener {
+    async fn open_stream(&self) -> Result<Box<dyn Stream>, TransferError> {
+        let port = self.next_port.fetch_add(1, Ordering::SeqCst);
+        let data_addr = SocketAddr::new(self.addr.ip(), port);
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, None)
+            .map_err(|e| TransferError::NetworkError(format!("Socket: {}", e)))?;
+        configure_tcp_socket(
+            &socket,
+            self.config.socket_send_buffer_size,
+            self.config.socket_recv_buffer_size,
+        )?;
+        socket
+            .connect(&data_addr.into())
+            .map_err(|e| TransferError::NetworkError(format!("Connect: {}", e)))?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|e| TransferError::NetworkError(format!("Nonblocking: {}", e)))?;
+        let std_stream = std::net::TcpStream::from(socket);
+        let stream = TokioTcpStream::from_std(std_stream)
+            .map_err(|e| TransferError::NetworkError(format!("Tokio stream: {}", e)))?;
+        Ok(Box::new(TcpStreamImpl::new(stream)))
+    }
+
+    fn max_streams(&self) -> usize {
+        self.max
+    }
+}
+
 #[async_trait]
 impl Transport for TcpTransport {
     async fn connect(&self, addr: SocketAddr) -> Result<Box<dyn Connection>, TransferError> {
@@ -304,35 +355,37 @@ impl Transport for TcpTransport {
     async fn connect_for_transfer(
         &self,
         addr: SocketAddr,
-        _num_data_streams: usize,
-    ) -> Result<(TransferMetaChannels, Vec<Box<dyn Stream>>), TransferError> {
-        let connect_one = |target: SocketAddr,
-                          send_buf: Option<usize>,
-                          recv_buf: Option<usize>|
-         -> Result<TokioTcpStream, TransferError> {
-            let socket = Socket::new(Domain::IPV4, Type::STREAM, None)
-                .map_err(|e| TransferError::NetworkError(format!("Socket: {}", e)))?;
-            configure_tcp_socket(&socket, send_buf, recv_buf)?;
-            socket
-                .connect(&target.into())
-                .map_err(|e| TransferError::NetworkError(format!("Connect: {}", e)))?;
-            socket
-                .set_nonblocking(true)
-                .map_err(|e| TransferError::NetworkError(format!("Nonblocking: {}", e)))?;
-            let std_stream = std::net::TcpStream::from(socket);
-            TokioTcpStream::from_std(std_stream)
-                .map_err(|e| TransferError::NetworkError(format!("Tokio stream: {}", e)))
-        };
-
-        let meta_stream = connect_one(addr, self.config.socket_send_buffer_size, self.config.socket_recv_buffer_size)?;
+        _num_streams: usize,
+        max_streams: usize,
+    ) -> Result<(TransferMetaChannels, Arc<dyn StreamOpener>), TransferError> {
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, None)
+            .map_err(|e| TransferError::NetworkError(format!("Socket: {}", e)))?;
+        configure_tcp_socket(
+            &socket,
+            self.config.socket_send_buffer_size,
+            self.config.socket_recv_buffer_size,
+        )?;
+        socket
+            .connect(&addr.into())
+            .map_err(|e| TransferError::NetworkError(format!("Connect: {}", e)))?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|e| TransferError::NetworkError(format!("Nonblocking: {}", e)))?;
+        let std_stream = std::net::TcpStream::from(socket);
+        let meta_stream = TokioTcpStream::from_std(std_stream)
+            .map_err(|e| TransferError::NetworkError(format!("Tokio stream: {}", e)))?;
         let (reader, writer) = tokio::io::split(meta_stream);
         let meta = TransferMetaChannels {
             reader: Box::new(reader),
             writer: Box::new(writer),
         };
-
-        // TCP server only opens data ports after sending READY; open data connections later via open_data_connections
-        Ok((meta, vec![]))
+        let opener = TcpStreamOpener {
+            addr,
+            next_port: AtomicU16::new(addr.port() + 1),
+            max: max_streams,
+            config: self.config.clone(),
+        };
+        Ok((meta, Arc::new(opener)))
     }
 
     async fn open_data_connections(

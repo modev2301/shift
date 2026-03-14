@@ -6,8 +6,10 @@
 
 use crate::base::msg;
 use crate::error::TransferError;
-use crate::base::{split_file_ranges, FileRange, TransferConfig};
-use crate::transport::{Stream as TransportStreamTrait, Transport};
+use crate::base::{split_file_ranges, transfer_num_ranges, FileRange, TransferConfig, TransferReport};
+use crate::metrics::BandwidthEstimator;
+use crate::range_queue::{RangeQueue, StreamReport, WorkerId};
+use crate::transport::{Stream as TransportStreamTrait, StreamOpener, Transport};
 use crate::compression::{compress, decompress, should_compress};
 use crate::encryption::{Decryptor, Encryptor};
 use crate::file_io::{open_file_optimized, read_at};
@@ -18,8 +20,10 @@ use crate::utils::is_file_compressible;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 use socket2::{Domain, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -224,6 +228,7 @@ async fn transfer_range_tcp(
     config: TransferConfig,
     progress: Option<ProgressHandle>,
     hasher_tx: Option<mpsc::Sender<(u64, Vec<u8>)>>,
+    metrics_tx: Option<mpsc::Sender<StreamReport>>,
 ) -> Result<u64, TransferError> {
     tracing::debug!(
         thread_id,
@@ -266,6 +271,7 @@ async fn transfer_range_tcp(
     let mut total_sent = 0u64;
 
     while offset < range.end {
+        let chunk_start = Instant::now();
         let remaining = (range.end - offset) as usize;
         let read_size = buffer.len().min(remaining);
 
@@ -339,10 +345,17 @@ async fn transfer_range_tcp(
 
         offset += bytes_read as u64;
         total_sent += bytes_read as u64;
-        
-        // Update progress if provided
+
         if let Some(ref progress) = progress {
             progress.update(bytes_read as u64);
+        }
+        if let Some(ref tx) = metrics_tx {
+            let _ = tx
+                .try_send(StreamReport {
+                    worker_id: thread_id,
+                    bytes_this_interval: bytes_read as u64,
+                    elapsed_ms: chunk_start.elapsed().as_millis() as u64,
+                });
         }
     }
 
@@ -369,6 +382,7 @@ async fn transfer_range_stream(
     config: TransferConfig,
     progress: Option<ProgressHandle>,
     hasher_tx: Option<mpsc::Sender<(u64, Vec<u8>)>>,
+    metrics_tx: Option<mpsc::Sender<StreamReport>>,
 ) -> Result<u64, TransferError> {
     tracing::debug!(
         thread_id,
@@ -409,6 +423,7 @@ async fn transfer_range_stream(
     const SEND_RETRY_MAX: u32 = 120;
 
     while offset < range.end {
+        let chunk_start = Instant::now();
         let remaining = (range.end - offset) as usize;
         let read_size = buffer.len().min(remaining);
 
@@ -473,6 +488,13 @@ async fn transfer_range_stream(
         if let Some(ref progress) = progress {
             progress.update(bytes_read as u64);
         }
+        if let Some(ref tx) = metrics_tx {
+            let _ = tx.try_send(StreamReport {
+                worker_id: thread_id,
+                bytes_this_interval: bytes_read as u64,
+                elapsed_ms: chunk_start.elapsed().as_millis() as u64,
+            });
+        }
     }
 
     stream.shutdown().await
@@ -485,6 +507,139 @@ async fn transfer_range_stream(
     );
 
     Ok(total_sent)
+}
+
+/// Coordinator state for one active worker: last activity time (for stall detection) and join handle.
+struct WorkerState {
+    last_active: Instant,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+/// One TCP stream worker: pulls ranges from queue, connects to pre-assigned port, sends range, reports completion or requeues on error.
+async fn tcp_stream_worker(
+    id: WorkerId,
+    queue: Arc<RangeQueue>,
+    file: Arc<File>,
+    file_path: PathBuf,
+    config: TransferConfig,
+    server_ip: std::net::IpAddr,
+    base_port: u16,
+    progress: Option<ProgressHandle>,
+    hasher_tx: Option<mpsc::Sender<(u64, Vec<u8>)>>,
+    metrics_tx: Option<mpsc::Sender<StreamReport>>,
+    completed_tx: mpsc::Sender<(FileRange, [u8; BLAKE3_LEN])>,
+    done_tx: mpsc::Sender<(WorkerId, Result<(), TransferError>)>,
+) {
+    let target_port = base_port + 1 + id as u16;
+    loop {
+        let range = match queue.pop() {
+            Some(r) => r,
+            None => break,
+        };
+        queue.mark_in_flight(id, range);
+        let result = async {
+            let socket = Socket::new(Domain::IPV4, Type::STREAM, None)
+                .map_err(|e| TransferError::NetworkError(format!("Failed to create socket: {}", e)))?;
+            configure_tcp_socket(
+                &socket,
+                config.socket_send_buffer_size,
+                config.socket_recv_buffer_size,
+            )?;
+            let server_addr = SocketAddr::new(server_ip, target_port);
+            socket.connect(&server_addr.into())
+                .map_err(|e| TransferError::NetworkError(format!("Connection failed: {}", e)))?;
+            socket.set_nonblocking(true)
+                .map_err(|e| TransferError::NetworkError(format!("Failed to set nonblocking: {}", e)))?;
+            let std_stream = std::net::TcpStream::from(socket);
+            let stream = TcpStream::from_std(std_stream)
+                .map_err(|e| TransferError::NetworkError(format!("Failed to convert to tokio stream: {}", e)))?;
+            transfer_range_tcp(id, range, file.clone(), stream, config.clone(), progress.clone(), hasher_tx.clone(), metrics_tx.clone()).await
+        }
+        .await;
+        match result {
+            Ok(_) => {
+                let range_hash = match hash_file_range_path(&file_path, range.start, range.end) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        queue.requeue(id);
+                        let _ = done_tx.send((id, Err(e))).await;
+                        return;
+                    }
+                };
+                let _ = completed_tx.send((range, range_hash)).await;
+                queue.complete(id);
+            }
+            Err(e) => {
+                queue.requeue(id);
+                let _ = done_tx.send((id, Err(e))).await;
+                return;
+            }
+        }
+    }
+    let _ = done_tx.send((id, Ok(()))).await;
+}
+
+/// One transport stream worker (TCP or QUIC via opener): pulls ranges from queue, opens stream per range, sends, reports completion or requeues.
+async fn transport_stream_worker(
+    id: WorkerId,
+    opener: Arc<dyn StreamOpener>,
+    queue: Arc<RangeQueue>,
+    file: Arc<File>,
+    file_path: PathBuf,
+    config: TransferConfig,
+    progress: Option<ProgressHandle>,
+    hasher_tx: Option<mpsc::Sender<(u64, Vec<u8>)>>,
+    metrics_tx: mpsc::Sender<StreamReport>,
+    completed_tx: mpsc::Sender<(FileRange, [u8; BLAKE3_LEN])>,
+    done_tx: mpsc::Sender<(WorkerId, Result<(), TransferError>)>,
+) {
+    loop {
+        let range = match queue.pop() {
+            Some(r) => r,
+            None => break,
+        };
+        queue.mark_in_flight(id, range);
+        let stream = match opener.open_stream().await {
+            Ok(s) => s,
+            Err(e) => {
+                queue.requeue(id);
+                let _ = done_tx.send((id, Err(e))).await;
+                return;
+            }
+        };
+        let stream = stream as Box<dyn TransportStreamTrait>;
+        let result = transfer_range_stream(
+            id,
+            range,
+            file.clone(),
+            stream,
+            config.clone(),
+            progress.clone(),
+            hasher_tx.clone(),
+            Some(metrics_tx.clone()),
+        )
+        .await;
+        match result {
+            Ok(_) => {
+                let range_hash = match hash_file_range_path(&file_path, range.start, range.end) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        queue.requeue(id);
+                        let _ = done_tx.send((id, Err(e))).await;
+                        return;
+                    }
+                };
+                let _ = completed_tx.send((range, range_hash)).await;
+                queue.complete(id);
+            }
+            Err(e) => {
+                queue.requeue(id);
+                let _ = done_tx.send((id, Err(e))).await;
+                return;
+            }
+        }
+    }
+    let _ = done_tx.send((id, Ok(()))).await;
 }
 
 /// Receive a file range over a single TCP connection.
@@ -939,14 +1094,44 @@ pub async fn send_file_tcp(
         .ok_or_else(|| TransferError::ProtocolError("Invalid capabilities from server".to_string()))?;
     let config = crate::base::apply_capabilities_to_config(&config, negotiated);
 
-    // Send metadata: filename_len (8) + filename + file_size (8) + num_streams (8)
+    // RTT probe when both sides set RTT_PROBE. Used for stall threshold and scale-up cooldown.
+    let rtt_ms = if (negotiated.flags & crate::base::cap_flags::RTT_PROBE) != 0 {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64;
+        let mut ping = [0u8; crate::base::PING_PONG_WIRE_LEN];
+        ping[0] = crate::base::msg::PING;
+        ping[1..9].copy_from_slice(&ts.to_le_bytes());
+        writer.write_all(&ping).await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to send PING: {}", e)))?;
+        let mut pong_buf = [0u8; crate::base::PING_PONG_WIRE_LEN];
+        reader.read_exact(&mut pong_buf).await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to read PONG: {}", e)))?;
+        if pong_buf[0] != crate::base::msg::PONG {
+            return Err(TransferError::ProtocolError("Expected PONG after PING".to_string()));
+        }
+        let ts_back = u64::from_le_bytes(pong_buf[1..9].try_into().unwrap());
+        let now_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64;
+        let ms = (now_us.saturating_sub(ts_back)) / 1000;
+        tracing::debug!(rtt_ms = ms, "RTT probe");
+        ms
+    } else {
+        100u64
+    };
+
+    // Send metadata: filename_len (8) + filename + file_size (8) + 8-byte slot (max_streams ceiling).
+    // Receiver uses this value to split ranges and pre-spawn listeners; it is NOT the count we open now (that is config.num_streams).
     let metadata = {
         let filename_bytes = filename.as_bytes();
         let mut m = Vec::new();
         m.extend_from_slice(&(filename_bytes.len() as u64).to_le_bytes());
         m.extend_from_slice(filename_bytes);
         m.extend_from_slice(&file_size.to_le_bytes());
-        m.extend_from_slice(&(config.num_streams as u64).to_le_bytes());
+        m.extend_from_slice(&(config.max_streams as u64).to_le_bytes());
         m
     };
     writer.write_all(&metadata).await
@@ -982,7 +1167,7 @@ pub async fn send_file_tcp(
         TransferCheckpoint::new(file_size)
     };
 
-    let all_ranges = split_file_ranges(file_size, config.num_streams);
+    let all_ranges = split_file_ranges(file_size, transfer_num_ranges(config.max_streams));
 
     // Per-range verification (before opening data streams): send 0x06 if we have completed ranges with hashes.
     let completed_ordered = checkpoint.completed_ranges_ordered(&all_ranges);
@@ -1075,89 +1260,163 @@ pub async fn send_file_tcp(
         (None, None)
     };
 
-    // Establish parallel TCP connections for data (ports base+1, base+2, ...)
-    let mut handles = Vec::new();
+    // Range queue: workers pull from pending, report completion or requeue on error. Coordinator updates checkpoint, stall detection, and smart scale-up.
+    let num_pending = missing_ranges.len();
+    let queue = Arc::new(RangeQueue::new(missing_ranges));
+    let (completed_tx, mut completed_rx) = mpsc::channel::<(FileRange, [u8; BLAKE3_LEN])>(64);
+    let (done_tx, mut done_rx) = mpsc::channel::<(WorkerId, Result<(), TransferError>)>(32);
+    let (metrics_tx, mut metrics_rx) = mpsc::channel::<StreamReport>(256);
     let base_port = server_addr.port();
     let server_ip = server_addr.ip();
+    let file_path_buf = file_path.to_path_buf();
+    let num_workers_initial = config.num_streams.min(num_pending).max(1);
+    let mut next_worker_id = num_workers_initial;
+    let mut active_workers: std::collections::HashMap<WorkerId, WorkerState> = std::collections::HashMap::new();
+    let mut estimator = BandwidthEstimator::new(10);
+    let mut last_change = Instant::now();
 
-    // Only transfer missing ranges
-    for (idx, range) in missing_ranges.iter().enumerate() {
-        let thread_id = idx;
-        let range = *range; // Copy the range
-        let file = Arc::clone(&file);
+    let spawn_worker = |id: WorkerId,
+                        queue: &Arc<RangeQueue>,
+                        file: &Arc<File>,
+                        file_path_buf: &PathBuf,
+                        config: &TransferConfig,
+                        progress_handle: &ProgressHandle,
+                        hasher_tx: &Option<mpsc::Sender<(u64, Vec<u8>)>>,
+                        metrics_tx: &mpsc::Sender<StreamReport>,
+                        completed_tx: &mpsc::Sender<(FileRange, [u8; BLAKE3_LEN])>,
+                        done_tx: &mpsc::Sender<(WorkerId, Result<(), TransferError>)>|
+     -> tokio::task::JoinHandle<()> {
+        let queue = Arc::clone(queue);
+        let file = Arc::clone(file);
+        let file_path = file_path_buf.clone();
         let config = config.clone();
-        let target_port = base_port + 1 + thread_id as u16;
-        let progress_clone = progress_handle.clone();
-        let range_hasher_tx = hasher_tx.clone();
-
-        let handle = tokio::spawn(async move {
-            // Create and configure socket using socket2
-            let socket = Socket::new(Domain::IPV4, Type::STREAM, None)
-                .map_err(|e| TransferError::NetworkError(format!("Failed to create socket: {}", e)))?;
-            configure_tcp_socket(
-                &socket,
-                config.socket_send_buffer_size,
-                config.socket_recv_buffer_size,
-            )?;
-
-            // Connect to server
-            let server_addr = SocketAddr::new(server_ip, target_port);
-            socket.connect(&server_addr.into())
-                .map_err(|e| TransferError::NetworkError(format!("Connection failed: {}", e)))?;
-
-            // Convert to tokio TcpStream
-            socket.set_nonblocking(true)
-                .map_err(|e| TransferError::NetworkError(format!("Failed to set nonblocking: {}", e)))?;
-            
-            let std_stream = std::net::TcpStream::from(socket);
-            let stream = TcpStream::from_std(std_stream)
-                .map_err(|e| TransferError::NetworkError(format!("Failed to convert to tokio stream: {}", e)))?;
-
-            transfer_range_tcp(
-                thread_id,
-                range,
+        let progress = progress_handle.clone();
+        let hasher_tx = hasher_tx.clone();
+        let metrics_tx = metrics_tx.clone();
+        let completed_tx = completed_tx.clone();
+        let done_tx = done_tx.clone();
+        tokio::spawn(async move {
+            tcp_stream_worker(
+                id,
+                queue,
                 file,
-                stream,
+                file_path,
                 config,
-                Some(progress_clone),
-                range_hasher_tx,
+                server_ip,
+                base_port,
+                Some(progress),
+                hasher_tx,
+                Some(metrics_tx),
+                completed_tx,
+                done_tx,
             )
             .await
-        });
+        })
+    };
 
-        handles.push(handle);
+    for id in 0..num_workers_initial {
+        let handle = spawn_worker(
+            id,
+            &queue,
+            &file,
+            &file_path_buf,
+            &config,
+            &progress_handle,
+            &hasher_tx,
+            &metrics_tx,
+            &completed_tx,
+            &done_tx,
+        );
+        active_workers.insert(id, WorkerState { last_active: Instant::now(), handle });
     }
 
-    // Wait for all connections to complete
-    let mut total_sent = 0u64;
-    for (idx, handle) in handles.into_iter().enumerate() {
-        match handle.await {
-            Ok(Ok(bytes)) => {
-                total_sent += bytes;
-                if idx < missing_ranges.len() {
-                    let range = missing_ranges[idx];
-                    let range_hash = hash_file_range_path(file_path, range.start, range.end)?;
-                    checkpoint.mark_completed(range, range_hash);
-                    checkpoint.save(&checkpoint_path)?;
+    let mut interval = interval(Duration::from_secs(2));
+    loop {
+        tokio::select! {
+            completed = completed_rx.recv() => {
+                match completed {
+                    Some((range, range_hash)) => {
+                        checkpoint.mark_completed(range, range_hash);
+                        checkpoint.save(&checkpoint_path)?;
+                    }
+                    None => break,
                 }
-                tracing::debug!(
-                    thread_id = idx,
-                    bytes,
-                    "Connection completed"
-                );
             }
-            Ok(Err(e)) => {
-                drop(hasher_tx); // close channel so hasher task exits instead of hanging
-                let _ = checkpoint.save(&checkpoint_path);
-                return Err(e);
+            report = metrics_rx.recv() => {
+                if let Some(r) = report {
+                    estimator.record(r.bytes_this_interval);
+                    if let Some(state) = active_workers.get_mut(&r.worker_id) {
+                        state.last_active = Instant::now();
+                    }
+                }
             }
-            Err(e) => {
-                drop(hasher_tx);
-                let _ = checkpoint.save(&checkpoint_path);
-                return Err(TransferError::NetworkError(format!("Connection panicked: {:?}", e)));
+            done = done_rx.recv() => {
+                match done {
+                    Some((id, result)) => {
+                        active_workers.remove(&id);
+                        if result.is_err() {
+                            queue.requeue(id);
+                            if !queue.is_done() {
+                                let handle = spawn_worker(id, &queue, &file, &file_path_buf, &config, &progress_handle, &hasher_tx, &metrics_tx, &completed_tx, &done_tx);
+                                active_workers.insert(id, WorkerState { last_active: Instant::now(), handle });
+                            }
+                        }
+                    }
+                    None => break,
+                }
+            }
+            _ = interval.tick() => {
+                let stall_threshold = Duration::from_millis((rtt_ms * 2).max(4000));
+                let stalled: Vec<WorkerId> = active_workers
+                    .iter()
+                    .filter(|(_, s)| s.last_active.elapsed() > stall_threshold)
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in stalled {
+                    if let Some(state) = active_workers.remove(&id) {
+                        state.handle.abort();
+                    }
+                    queue.requeue(id);
+                    if !queue.is_done() {
+                        let handle = spawn_worker(id, &queue, &file, &file_path_buf, &config, &progress_handle, &hasher_tx, &metrics_tx, &completed_tx, &done_tx);
+                        active_workers.insert(id, WorkerState { last_active: Instant::now(), handle });
+                    }
+                    tracing::warn!(worker_id = id, "worker stalled, requeuing range");
+                }
+
+                let can_scale = active_workers.len() < config.max_streams
+                    && next_worker_id < config.max_streams
+                    && !queue.is_done();
+                let should_scale = estimator.is_underperforming() || estimator.peak_mbps == 0.0;
+                let cooldown_ok = last_change.elapsed() > Duration::from_millis(rtt_ms * 2);
+                if can_scale && should_scale && cooldown_ok {
+                    let id_new = next_worker_id;
+                    next_worker_id += 1;
+                    let handle = spawn_worker(id_new, &queue, &file, &file_path_buf, &config, &progress_handle, &hasher_tx, &metrics_tx, &completed_tx, &done_tx);
+                    active_workers.insert(id_new, WorkerState { last_active: Instant::now(), handle });
+                    last_change = Instant::now();
+                }
+
+                if queue.is_done() && active_workers.is_empty() {
+                    break;
+                }
             }
         }
     }
+
+    drop(completed_tx);
+    drop(done_tx);
+    drop(metrics_tx);
+    let worker_ids: Vec<WorkerId> = active_workers.keys().cloned().collect();
+    for id in worker_ids {
+        if let Some(state) = active_workers.remove(&id) {
+            let _ = state.handle.await;
+        }
+    }
+    while completed_rx.recv().await.is_some() {}
+    while done_rx.recv().await.is_some() {}
+
+    let total_sent = progress_handle.transferred.load(Ordering::Relaxed);
 
     // Hash: full transfer = bytes we just sent; resume = full file at start of this run
     let file_hash = match (resume_hash, hasher_handle) {
@@ -1228,11 +1487,15 @@ pub async fn send_file_tcp(
 }
 
 /// Send a file over a transport (TCP or QUIC). Uses same protocol as send_file_tcp.
+/// If `stats_out` is `Some`, it is filled with transfer report data on success (for --stats / --json).
+/// If `skip_unchanged` is true, send CHECK_HASH first and skip transfer when server already has this hash (--update).
 pub async fn send_file_over_transport(
     transport: &dyn Transport,
     file_path: &std::path::Path,
     server_addr: SocketAddr,
     config: TransferConfig,
+    stats_out: Option<&mut TransferReport>,
+    skip_unchanged: bool,
 ) -> Result<u64, TransferError> {
     let metadata = std::fs::metadata(file_path)?;
     let file_size = metadata.len();
@@ -1287,8 +1550,8 @@ pub async fn send_file_over_transport(
         }
     });
 
-    let (meta, mut data_streams) = transport
-        .connect_for_transfer(server_addr, config.num_streams)
+    let (meta, opener) = transport
+        .connect_for_transfer(server_addr, config.num_streams, config.max_streams)
         .await?;
 
     let mut reader = meta.reader;
@@ -1304,13 +1567,66 @@ pub async fn send_file_over_transport(
         .ok_or_else(|| TransferError::ProtocolError("Invalid capabilities from server".to_string()))?;
     let config = crate::base::apply_capabilities_to_config(&config, negotiated);
 
+    let rtt_ms = if (negotiated.flags & crate::base::cap_flags::RTT_PROBE) != 0 {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64;
+        let mut ping = [0u8; crate::base::PING_PONG_WIRE_LEN];
+        ping[0] = crate::base::msg::PING;
+        ping[1..9].copy_from_slice(&ts.to_le_bytes());
+        writer.write_all(&ping).await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to send PING: {}", e)))?;
+        let mut pong_buf = [0u8; crate::base::PING_PONG_WIRE_LEN];
+        reader.read_exact(&mut pong_buf).await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to read PONG: {}", e)))?;
+        if pong_buf[0] != crate::base::msg::PONG {
+            return Err(TransferError::ProtocolError("Expected PONG after PING".to_string()));
+        }
+        let ts_back = u64::from_le_bytes(pong_buf[1..9].try_into().unwrap());
+        let now_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64;
+        let ms = (now_us.saturating_sub(ts_back)) / 1000;
+        tracing::debug!(rtt_ms = ms, "RTT probe");
+        ms
+    } else {
+        100u64
+    };
+
+    // --update: optional skip check (CHECK_HASH). If server has same hash, skip transfer.
+    if skip_unchanged {
+        let file_hash = hash_file(file_path, file_size)?;
+        writer.write_all(&[msg::CHECK_HASH]).await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to send CHECK_HASH: {}", e)))?;
+        writer.write_all(&(filename.len() as u64).to_le_bytes()).await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to send CHECK_HASH filename len: {}", e)))?;
+        writer.write_all(filename.as_bytes()).await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to send CHECK_HASH filename: {}", e)))?;
+        writer.write_all(&file_hash).await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to send CHECK_HASH hash: {}", e)))?;
+        let mut reply = [0u8; 1];
+        reader.read_exact(&mut reply).await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to read CHECK_HASH reply: {}", e)))?;
+        if reply[0] == msg::HAVE_HASH {
+            tracing::debug!(file = %filename, "Server already has file (unchanged), skipping");
+            eprintln!("Skipped (unchanged): {}", filename);
+            return Ok(0);
+        }
+        if reply[0] != msg::NEED_FILE {
+            return Err(TransferError::ProtocolError(format!("Expected NEED_FILE or HAVE_HASH, got 0x{:02x}", reply[0])));
+        }
+    }
+
+    // 8-byte slot carries max_streams (ceiling for range split and listener count), not current stream count.
     let metadata_bytes = {
         let filename_bytes = filename.as_bytes();
         let mut m = Vec::new();
         m.extend_from_slice(&(filename_bytes.len() as u64).to_le_bytes());
         m.extend_from_slice(filename_bytes);
         m.extend_from_slice(&file_size.to_le_bytes());
-        m.extend_from_slice(&(config.num_streams as u64).to_le_bytes());
+        m.extend_from_slice(&(config.max_streams as u64).to_le_bytes());
         m
     };
     writer.write_all(&metadata_bytes).await
@@ -1322,13 +1638,6 @@ pub async fn send_file_over_transport(
 
     if ack_buf[0] != msg::READY {
         return Err(TransferError::ProtocolError("Invalid initial ACK from server".to_string()));
-    }
-
-    // TCP: server only opens data ports after READY; open data connections now
-    if data_streams.is_empty() {
-        data_streams = transport
-            .open_data_connections(server_addr, config.num_streams)
-            .await?;
     }
 
     let checkpoint_path = get_checkpoint_path(file_path);
@@ -1351,7 +1660,7 @@ pub async fn send_file_over_transport(
         TransferCheckpoint::new(file_size)
     };
 
-    let all_ranges = split_file_ranges(file_size, config.num_streams);
+    let all_ranges = split_file_ranges(file_size, transfer_num_ranges(config.max_streams));
     let completed_ordered = checkpoint.completed_ranges_ordered(&all_ranges);
 
     if !completed_ordered.is_empty() {
@@ -1409,6 +1718,9 @@ pub async fn send_file_over_transport(
     }
 
     let missing_ranges = checkpoint.get_missing_ranges(&all_ranges);
+    let ranges_total = all_ranges.len();
+    let ranges_resumed = completed_ordered.len();
+
     if missing_ranges.is_empty() {
         delete_checkpoint(file_path)?;
         return Ok(file_size);
@@ -1438,61 +1750,161 @@ pub async fn send_file_over_transport(
         (None, None)
     };
 
-    let mut streams: Vec<Option<Box<dyn TransportStreamTrait>>> =
-        data_streams.into_iter().map(Some).collect();
+    // Unified queue + coordinator (same as send_file_tcp). Opener held here so connection stays alive until workers complete.
+    let num_pending = missing_ranges.len();
+    let queue = Arc::new(RangeQueue::new(missing_ranges));
+    let (completed_tx, mut completed_rx) = mpsc::channel::<(FileRange, [u8; BLAKE3_LEN])>(64);
+    let (done_tx, mut done_rx) = mpsc::channel::<(WorkerId, Result<(), TransferError>)>(32);
+    let (metrics_tx, mut metrics_rx) = mpsc::channel::<StreamReport>(256);
+    let file_path_buf = file_path.to_path_buf();
+    let num_workers_initial = config.num_streams.min(num_pending).max(1);
+    let mut next_worker_id = num_workers_initial;
+    let mut active_workers: std::collections::HashMap<WorkerId, WorkerState> = std::collections::HashMap::new();
+    let mut streams_peak = num_workers_initial;
+    let mut streams_stalled: usize = 0;
+    let mut estimator = BandwidthEstimator::new(10);
+    let mut last_change = Instant::now();
+    let transport_label = match transport.name() {
+        "quic" => "⚡ QUIC",
+        _ => "🔌 TCP",
+    };
 
-    let mut handles = Vec::new();
-    for (idx, range) in missing_ranges.iter().enumerate() {
-        let thread_id = idx;
-        let range = *range;
-        let file = Arc::clone(&file);
+    let spawn_transport_worker = |id: WorkerId,
+                                 opener: &Arc<dyn StreamOpener>,
+                                 queue: &Arc<RangeQueue>,
+                                 file: &Arc<File>,
+                                 file_path_buf: &PathBuf,
+                                 config: &TransferConfig,
+                                 progress_handle: &ProgressHandle,
+                                 hasher_tx: &Option<mpsc::Sender<(u64, Vec<u8>)>>,
+                                 metrics_tx: &mpsc::Sender<StreamReport>,
+                                 completed_tx: &mpsc::Sender<(FileRange, [u8; BLAKE3_LEN])>,
+                                 done_tx: &mpsc::Sender<(WorkerId, Result<(), TransferError>)>|
+     -> tokio::task::JoinHandle<()> {
+        let opener = Arc::clone(opener);
+        let queue = Arc::clone(queue);
+        let file = Arc::clone(file);
+        let file_path = file_path_buf.clone();
         let config = config.clone();
-        let stream = streams[thread_id].take().ok_or_else(|| {
-            TransferError::ProtocolError("Missing data stream for range".to_string())
-        })?;
-        let progress_clone = progress_handle.clone();
-        let range_hasher_tx = hasher_tx.clone();
+        let progress = progress_handle.clone();
+        let hasher_tx = hasher_tx.clone();
+        let metrics_tx = metrics_tx.clone();
+        let completed_tx = completed_tx.clone();
+        let done_tx = done_tx.clone();
+        tokio::spawn(async move {
+            transport_stream_worker(id, opener, queue, file, file_path, config, Some(progress), hasher_tx, metrics_tx, completed_tx, done_tx).await
+        })
+    };
 
-        let handle = tokio::spawn(async move {
-            transfer_range_stream(
-                thread_id,
-                range,
-                file,
-                stream,
-                config,
-                Some(progress_clone),
-                range_hasher_tx,
-            )
-            .await
-        });
-        handles.push(handle);
+    for id in 0..num_workers_initial {
+        let handle = spawn_transport_worker(
+            id,
+            &opener,
+            &queue,
+            &file,
+            &file_path_buf,
+            &config,
+            &progress_handle,
+            &hasher_tx,
+            &metrics_tx,
+            &completed_tx,
+            &done_tx,
+        );
+        active_workers.insert(id, WorkerState { last_active: Instant::now(), handle });
     }
+    progress_handle.set_message(format!("{}  {}→{}", transport_label, num_workers_initial, streams_peak));
 
-    let mut total_sent = 0u64;
-    for (idx, handle) in handles.into_iter().enumerate() {
-        match handle.await {
-            Ok(Ok(bytes)) => {
-                total_sent += bytes;
-                if idx < missing_ranges.len() {
-                    let range = missing_ranges[idx];
-                    let range_hash = hash_file_range_path(file_path, range.start, range.end)?;
-                    checkpoint.mark_completed(range, range_hash);
-                    checkpoint.save(&checkpoint_path)?;
+    let mut interval = interval(Duration::from_secs(2));
+    loop {
+        tokio::select! {
+            completed = completed_rx.recv() => {
+                match completed {
+                    Some((range, range_hash)) => {
+                        checkpoint.mark_completed(range, range_hash);
+                        checkpoint.save(&checkpoint_path)?;
+                    }
+                    None => break,
                 }
-                tracing::debug!(thread_id = idx, bytes, "Connection completed");
             }
-            Ok(Err(e)) => {
-                drop(hasher_tx);
-                let _ = checkpoint.save(&checkpoint_path);
-                return Err(e);
+            report = metrics_rx.recv() => {
+                if let Some(r) = report {
+                    estimator.record(r.bytes_this_interval);
+                    if let Some(state) = active_workers.get_mut(&r.worker_id) {
+                        state.last_active = Instant::now();
+                    }
+                }
             }
-            Err(e) => {
-                drop(hasher_tx);
-                let _ = checkpoint.save(&checkpoint_path);
-                return Err(TransferError::NetworkError(format!("Connection panicked: {:?}", e)));
+            done = done_rx.recv() => {
+                match done {
+                    Some((id, result)) => {
+                        active_workers.remove(&id);
+                        if result.is_err() {
+                            queue.requeue(id);
+                            if !queue.is_done() {
+                                let handle = spawn_transport_worker(id, &opener, &queue, &file, &file_path_buf, &config, &progress_handle, &hasher_tx, &metrics_tx, &completed_tx, &done_tx);
+                                active_workers.insert(id, WorkerState { last_active: Instant::now(), handle });
+                            }
+                        }
+                    }
+                    None => break,
+                }
+            }
+            _ = interval.tick() => {
+                let stall_threshold = Duration::from_millis((rtt_ms * 2).max(4000));
+                let stalled: Vec<WorkerId> = active_workers
+                    .iter()
+                    .filter(|(_, s)| s.last_active.elapsed() > stall_threshold)
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in stalled {
+                    streams_stalled += 1;
+                    if let Some(state) = active_workers.remove(&id) {
+                        state.handle.abort();
+                    }
+                    queue.requeue(id);
+                    if !queue.is_done() {
+                        let handle = spawn_transport_worker(id, &opener, &queue, &file, &file_path_buf, &config, &progress_handle, &hasher_tx, &metrics_tx, &completed_tx, &done_tx);
+                        active_workers.insert(id, WorkerState { last_active: Instant::now(), handle });
+                    }
+                    tracing::warn!(worker_id = id, "worker stalled, requeuing range");
+                }
+
+                let can_scale = active_workers.len() < config.max_streams
+                    && next_worker_id < config.max_streams
+                    && !queue.is_done();
+                let should_scale = estimator.is_underperforming() || estimator.peak_mbps == 0.0;
+                let cooldown_ok = last_change.elapsed() > Duration::from_millis(rtt_ms * 2);
+                if can_scale && should_scale && cooldown_ok {
+                    let id_new = next_worker_id;
+                    next_worker_id += 1;
+                    let handle = spawn_transport_worker(id_new, &opener, &queue, &file, &file_path_buf, &config, &progress_handle, &hasher_tx, &metrics_tx, &completed_tx, &done_tx);
+                    active_workers.insert(id_new, WorkerState { last_active: Instant::now(), handle });
+                    last_change = Instant::now();
+                }
+
+                streams_peak = streams_peak.max(active_workers.len());
+                progress_handle.set_message(format!("{}  {}→{}", transport_label, num_workers_initial, streams_peak));
+
+                if queue.is_done() && active_workers.is_empty() {
+                    break;
+                }
             }
         }
     }
+
+    drop(completed_tx);
+    drop(done_tx);
+    drop(metrics_tx);
+    let worker_ids: Vec<WorkerId> = active_workers.keys().cloned().collect();
+    for id in worker_ids {
+        if let Some(state) = active_workers.remove(&id) {
+            let _ = state.handle.await;
+        }
+    }
+    while completed_rx.recv().await.is_some() {}
+    while done_rx.recv().await.is_some() {}
+
+    let total_sent = progress_handle.transferred.load(Ordering::Relaxed);
 
     let file_hash = match (resume_hash, hasher_handle) {
         (Some(h), _) => h,
@@ -1540,11 +1952,25 @@ pub async fn send_file_over_transport(
     progress.finish();
 
     let duration = progress.start_time.elapsed();
+    let duration_ms = duration.as_millis() as u64;
     let throughput_mbps = if duration.as_secs_f64() > 0.0 {
         (total_sent as f64 / (1024.0 * 1024.0)) / duration.as_secs_f64()
     } else {
         0.0
     };
+
+    if let Some(out) = stats_out {
+        out.transport = transport.name().to_string();
+        out.bytes = total_sent;
+        out.duration_ms = duration_ms;
+        out.throughput_mbps = throughput_mbps;
+        out.streams_initial = num_workers_initial;
+        out.streams_peak = streams_peak;
+        out.streams_stalled = streams_stalled;
+        out.rtt_ms = rtt_ms;
+        out.ranges_total = ranges_total;
+        out.ranges_resumed = ranges_resumed;
+    }
 
     tracing::debug!(
         file = %filename,
@@ -1585,8 +2011,8 @@ pub async fn receive_file_tcp(
     file.set_len(file_size)?;
     let file = Arc::new(file);
 
-    // Split file into ranges
-    let ranges = split_file_ranges(file_size, num_connections);
+    // Split file into ranges (finer granularity for load balance)
+    let ranges = split_file_ranges(file_size, transfer_num_ranges(num_connections));
 
     // Optional receive-side hasher for integrity (symmetric with server path).
     let (hasher_tx, hasher_rx) = if expected_hash.is_some() {

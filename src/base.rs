@@ -3,6 +3,7 @@
 //! This module provides common abstractions used by both the sender and receiver
 //! components, including transfer configuration, error handling, and state management.
 
+use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -27,7 +28,19 @@ pub mod msg {
     pub const RANGE_VERIFY_RESULT: u8 = 0x07;
     /// Client → Server: no range verify (proceed to data). Sent when no completed ranges to verify.
     pub const NO_RANGE_VERIFY: u8 = 0x00;
+    /// RTT probe: client → server. Wire: 0x08 (1) + timestamp_us (8 LE).
+    pub const PING: u8 = 0x08;
+    /// RTT probe: server → client. Wire: 0x09 (1) + timestamp_us (8 LE).
+    pub const PONG: u8 = 0x09;
+    /// Client → Server: skip check (--update). Wire: 0x0A (1) + filename_len (8 LE) + filename + hash (32).
+    pub const CHECK_HASH: u8 = 0x0A;
+    /// Server → Client: file already present with this hash, skip transfer.
+    pub const HAVE_HASH: u8 = 0x0B;
+    /// Server → Client: need file (proceed with metadata).
+    pub const NEED_FILE: u8 = 0x0C;
 }
+/// Wire size of Ping/Pong: 1 byte type + 8 bytes timestamp_us LE.
+pub const PING_PONG_WIRE_LEN: usize = 9;
 
 /// Capability negotiation: client sends, server responds with negotiated (intersection).
 /// Both sides use the negotiated values; replaces the assumption that configs match.
@@ -36,7 +49,10 @@ pub struct Capabilities {
     pub version: u8,
     /// bit 0 = compression, 1 = encryption, 2 = blake3, 3 = range_hashes, 4 = quic
     pub flags: u8,
+    /// Ceiling: max streams we may use this transfer (receiver pre-spawns this many).
     pub max_streams: u16,
+    /// Starting count: streams to open initially (sender may grow up to max_streams).
+    pub initial_streams: u16,
     pub max_buffer: u32,
     /// 0 = unknown, 1 = linux, 2 = windows
     pub platform: u8,
@@ -49,10 +65,12 @@ pub mod cap_flags {
     pub const BLAKE3: u8 = 1 << 2;
     pub const RANGE_HASHES: u8 = 1 << 3;
     pub const QUIC: u8 = 1 << 4;
+    /// Both sides support RTT probe (PING/PONG) on control channel before metadata.
+    pub const RTT_PROBE: u8 = 1 << 5;
 }
 
-/// Wire size of Capabilities (LE: version, flags, max_streams, max_buffer, platform, reserved).
-pub const CAPABILITIES_WIRE_LEN: usize = 1 + 1 + 2 + 4 + 1 + 4;
+/// Wire size of Capabilities (LE: version, flags, max_streams, initial_streams, max_buffer, platform, reserved).
+pub const CAPABILITIES_WIRE_LEN: usize = 1 + 1 + 2 + 2 + 4 + 1 + 4;
 
 impl Capabilities {
     pub fn to_bytes(&self) -> [u8; CAPABILITIES_WIRE_LEN] {
@@ -60,43 +78,64 @@ impl Capabilities {
         buf[0] = self.version;
         buf[1] = self.flags;
         buf[2..4].copy_from_slice(&self.max_streams.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.max_buffer.to_le_bytes());
-        buf[8] = self.platform;
-        buf[9..13].copy_from_slice(&self.reserved);
+        buf[4..6].copy_from_slice(&self.initial_streams.to_le_bytes());
+        buf[6..10].copy_from_slice(&self.max_buffer.to_le_bytes());
+        buf[10] = self.platform;
+        buf[11..15].copy_from_slice(&self.reserved);
         buf
     }
 
+    /// Parses capability wire. Accepts legacy 13-byte (no initial_streams) or new 15-byte format.
     pub fn from_bytes(buf: &[u8]) -> Option<Self> {
-        if buf.len() < CAPABILITIES_WIRE_LEN {
+        const LEGACY_WIRE_LEN: usize = 1 + 1 + 2 + 4 + 1 + 4; // 13
+        if buf.len() < LEGACY_WIRE_LEN {
             return None;
         }
+        let max_streams = u16::from_le_bytes([buf[2], buf[3]]);
+        let (initial_streams, max_buffer, platform, reserved) = if buf.len() >= CAPABILITIES_WIRE_LEN {
+            (
+                u16::from_le_bytes([buf[4], buf[5]]),
+                u32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]]),
+                buf[10],
+                [buf[11], buf[12], buf[13], buf[14]],
+            )
+        } else {
+            (max_streams, u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]), buf[8], [buf[9], buf[10], buf[11], buf[12]])
+        };
         Some(Self {
             version: buf[0],
             flags: buf[1],
-            max_streams: u16::from_le_bytes([buf[2], buf[3]]),
-            max_buffer: u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
-            platform: buf[8],
-            reserved: [buf[9], buf[10], buf[11], buf[12]],
+            max_streams,
+            initial_streams,
+            max_buffer,
+            platform,
+            reserved,
         })
     }
 
-    /// Intersection: both sides use the minimum of numeric caps and AND of flags.
+    /// Intersection: max_streams = ceiling (min of both). initial_streams = min of both proposals, capped by max_streams (so either side can request fewer than the ceiling).
     pub fn negotiate(client: Capabilities, server: Capabilities) -> Capabilities {
         let flags = client.flags & server.flags;
+        let max_streams = client.max_streams.min(server.max_streams);
+        let initial_streams = client.initial_streams
+            .min(server.initial_streams)
+            .min(max_streams)
+            .max(1);
         Capabilities {
             version: client.version.min(server.version),
             flags,
-            max_streams: client.max_streams.min(server.max_streams),
+            max_streams,
+            initial_streams,
             max_buffer: client.max_buffer.min(server.max_buffer),
-            platform: server.platform, // server reports its platform
+            platform: server.platform,
             reserved: [0; 4],
         }
     }
 }
 
-/// Build client capabilities from config. Used by sender.
+/// Build client capabilities from config. Used by sender. max_streams = ceiling, initial_streams = starting count.
 pub fn capabilities_from_config(config: &TransferConfig) -> Capabilities {
-    use cap_flags::{BLAKE3, COMPRESSION, ENCRYPTION, RANGE_HASHES};
+    use cap_flags::{BLAKE3, COMPRESSION, ENCRYPTION, RANGE_HASHES, RTT_PROBE};
     let mut flags = 0u8;
     if config.enable_compression {
         flags |= COMPRESSION;
@@ -104,8 +143,9 @@ pub fn capabilities_from_config(config: &TransferConfig) -> Capabilities {
     if config.enable_encryption {
         flags |= ENCRYPTION;
     }
-    flags |= BLAKE3;   // we always support BLAKE3
-    flags |= RANGE_HASHES; // we always support range hashes
+    flags |= BLAKE3;
+    flags |= RANGE_HASHES;
+    flags |= RTT_PROBE;
     let platform = if cfg!(target_os = "linux") {
         1
     } else if cfg!(target_os = "windows") {
@@ -113,21 +153,25 @@ pub fn capabilities_from_config(config: &TransferConfig) -> Capabilities {
     } else {
         0
     };
+    let max_streams = config.max_streams.min(65535) as u16;
+    let initial_streams = (config.num_streams as u16).min(max_streams).max(1);
     Capabilities {
         version: 1,
         flags,
-        max_streams: config.num_streams as u16,
+        max_streams,
+        initial_streams,
         max_buffer: config.buffer_size as u32,
         platform,
         reserved: [0; 4],
     }
 }
 
-/// Apply negotiated capabilities to config. Both client and server use this.
+/// Apply negotiated capabilities to config. num_streams = initial (starting count), max_streams = ceiling.
 pub fn apply_capabilities_to_config(config: &TransferConfig, cap: Capabilities) -> TransferConfig {
     use cap_flags::{COMPRESSION, ENCRYPTION};
     let mut c = config.clone();
-    c.num_streams = cap.max_streams as usize;
+    c.num_streams = cap.initial_streams as usize;
+    c.max_streams = cap.max_streams as usize;
     c.buffer_size = cap.max_buffer as usize;
     c.enable_compression = (cap.flags & COMPRESSION) != 0;
     c.enable_encryption = (cap.flags & ENCRYPTION) != 0;
@@ -139,8 +183,10 @@ pub fn apply_capabilities_to_config(config: &TransferConfig, cap: Capabilities) 
 pub struct TransferConfig {
     /// Starting port number for the transfer.
     pub start_port: u16,
-    /// Number of parallel streams/threads to use.
+    /// Initial number of streams to open (after handshake). Adaptive can grow up to max_streams.
     pub num_streams: usize,
+    /// Ceiling: max streams (receiver pre-spawns this many listeners).
+    pub max_streams: usize,
     /// Buffer size for I/O operations in bytes.
     pub buffer_size: usize,
     /// Socket send buffer size in bytes (SO_SNDBUF).
@@ -164,6 +210,7 @@ impl Default for TransferConfig {
         Self {
             start_port: 8080,
             num_streams: 16,
+            max_streams: 16,
             buffer_size: 16 * 1024 * 1024,
             socket_send_buffer_size: Some(16 * 1024 * 1024),
             socket_recv_buffer_size: Some(16 * 1024 * 1024),
@@ -173,6 +220,22 @@ impl Default for TransferConfig {
             timeout_seconds: 30,
         }
     }
+}
+
+/// Per-file transfer report for --stats / --json output (scriptable, benchmarkable).
+#[derive(Debug, Default, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TransferReport {
+    pub transport: String,
+    pub bytes: u64,
+    pub duration_ms: u64,
+    pub throughput_mbps: f64,
+    pub streams_initial: usize,
+    pub streams_peak: usize,
+    pub streams_stalled: usize,
+    pub rtt_ms: u64,
+    pub ranges_total: usize,
+    pub ranges_resumed: usize,
 }
 
 /// Transfer statistics tracked during a transfer.
@@ -251,6 +314,12 @@ impl FileRange {
     }
 }
 
+/// Number of ranges to use for transfer (finer granularity than stream count for better load balance and stall recovery).
+/// Used by both sender and receiver so they agree on listener count.
+pub fn transfer_num_ranges(max_streams: usize) -> usize {
+    (max_streams * 4).min(128).max(1)
+}
+
 /// Split a file into ranges for parallel transfer.
 pub fn split_file_ranges(file_size: u64, num_ranges: usize) -> Vec<FileRange> {
     if num_ranges == 0 || file_size == 0 {
@@ -276,6 +345,15 @@ pub fn split_file_ranges(file_size: u64, num_ranges: usize) -> Vec<FileRange> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_transfer_num_ranges() {
+        assert_eq!(transfer_num_ranges(1), 4); // 1*4
+        assert_eq!(transfer_num_ranges(8), 32);
+        assert_eq!(transfer_num_ranges(32), 128);
+        assert_eq!(transfer_num_ranges(64), 128); // capped at 128
+        assert_eq!(transfer_num_ranges(256), 128);
+    }
 
     #[test]
     fn test_split_file_ranges() {

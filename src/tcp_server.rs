@@ -3,15 +3,17 @@
 //! The server listens on multiple ports: port 8080 for metadata,
 //! and ports 8081-808N for parallel data connections.
 
+use crate::base::cap_flags;
 use crate::base::msg;
 use crate::base::{apply_capabilities_to_config, capabilities_from_config, Capabilities, CAPABILITIES_WIRE_LEN};
 use crate::error::TransferError;
 use crate::base::TransferConfig;
 use crate::integrity::{hash_file_range_path, BLAKE3_LEN};
 use crate::tcp_transfer::{configure_tcp_socket, receive_range_tcp, run_ordered_hasher};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use socket2::{Domain, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -21,24 +23,20 @@ use tracing::error;
 /// TCP server that handles file transfers using parallel connections.
 pub struct TcpServer {
     base_port: u16,
-    num_connections: usize,
     output_dir: PathBuf,
     config: TransferConfig,
+    /// Path → BLAKE3 hash for completed receives (used by --update skip check).
+    completed_hashes: Arc<Mutex<HashMap<PathBuf, [u8; BLAKE3_LEN]>>>,
 }
 
 impl TcpServer {
-    /// Create a new TCP server.
-    pub fn new(
-        base_port: u16,
-        num_connections: usize,
-        output_dir: PathBuf,
-        config: TransferConfig,
-    ) -> Self {
+    /// Create a new TCP server. Listener count comes from negotiated max_streams (client sends it in metadata).
+    pub fn new(base_port: u16, output_dir: PathBuf, config: TransferConfig) -> Self {
         Self {
             base_port,
-            num_connections,
             output_dir,
             config,
+            completed_hashes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -86,11 +84,11 @@ impl TcpServer {
                     tracing::debug!(remote = %addr, "New metadata connection accepted");
                     let output_dir = self.output_dir.clone();
                     let config = self.config.clone();
-                    let num_connections = self.num_connections;
                     let base_port = self.base_port;
 
+                    let completed_hashes = self.completed_hashes.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = Self::handle_connection(stream, addr, output_dir, num_connections, base_port, config).await {
+                        if let Err(e) = Self::handle_connection(stream, addr, output_dir, base_port, config, completed_hashes).await {
                             error!(error = %e, "Connection handling failed");
                         }
                     });
@@ -106,9 +104,9 @@ impl TcpServer {
         mut stream: tokio::net::TcpStream,
         _addr: SocketAddr,
         output_dir: PathBuf,
-        _num_connections: usize,
         base_port: u16,
         config: TransferConfig,
+        completed_hashes: Arc<Mutex<HashMap<PathBuf, [u8; BLAKE3_LEN]>>>,
     ) -> Result<(), TransferError> {
         // Capability handshake: read client caps, negotiate, send negotiated, apply to config.
         let mut cap_buf = [0u8; CAPABILITIES_WIRE_LEN];
@@ -122,27 +120,91 @@ impl TcpServer {
             .map_err(|e| TransferError::NetworkError(format!("Failed to send negotiated capabilities: {}", e)))?;
         let config = apply_capabilities_to_config(&config, negotiated);
 
-        // Read metadata: filename_len (8) + filename + file_size (8) + num_streams (8)
-        let mut filename_len_buf = [0u8; 8];
-        stream.read_exact(&mut filename_len_buf).await
-            .map_err(|e| TransferError::NetworkError(format!("Failed to read filename length: {}", e)))?;
-        let filename_len = u64::from_le_bytes(filename_len_buf) as usize;
+        // After handshake: read 1 byte. If PING (RTT only) echo PONG and read 1 byte again. Then either CHECK_HASH (0x0A) or metadata (filename_len 8 + filename + file_size 8 + max_streams 8).
+        let mut first_byte = [0u8; 1];
+        if (negotiated.flags & cap_flags::RTT_PROBE) != 0 {
+            stream.read_exact(&mut first_byte).await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to read after handshake: {}", e)))?;
+            if first_byte[0] == msg::PING {
+                let mut ts_buf = [0u8; 8];
+                stream.read_exact(&mut ts_buf).await
+                    .map_err(|e| TransferError::NetworkError(format!("Failed to read PING timestamp: {}", e)))?;
+                let mut pong = [0u8; crate::base::PING_PONG_WIRE_LEN];
+                pong[0] = msg::PONG;
+                pong[1..9].copy_from_slice(&ts_buf);
+                stream.write_all(&pong).await
+                    .map_err(|e| TransferError::NetworkError(format!("Failed to send Pong: {}", e)))?;
+                stream.read_exact(&mut first_byte).await
+                    .map_err(|e| TransferError::NetworkError(format!("Failed to read after PONG: {}", e)))?;
+            }
+        } else {
+            stream.read_exact(&mut first_byte).await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to read filename length: {}", e)))?;
+        }
 
-        let mut filename_buf = vec![0u8; filename_len];
-        stream.read_exact(&mut filename_buf).await
-            .map_err(|e| TransferError::NetworkError(format!("Failed to read filename: {}", e)))?;
-        let filename = String::from_utf8(filename_buf)
-            .map_err(|e| TransferError::ProtocolError(format!("Invalid filename: {}", e)))?;
-
-        let mut file_size_buf = [0u8; 8];
-        stream.read_exact(&mut file_size_buf).await
-            .map_err(|e| TransferError::NetworkError(format!("Failed to read file size: {}", e)))?;
-        let file_size = u64::from_le_bytes(file_size_buf);
-
-        let mut num_streams_buf = [0u8; 8];
-        stream.read_exact(&mut num_streams_buf).await
-            .map_err(|e| TransferError::NetworkError(format!("Failed to read num streams: {}", e)))?;
-        let num_streams = u64::from_le_bytes(num_streams_buf) as usize;
+        let (filename, file_size, num_streams) = if first_byte[0] == msg::CHECK_HASH {
+            // --update skip check: read filename_len (8) + filename + hash (32)
+            let mut len_buf = [0u8; 8];
+            stream.read_exact(&mut len_buf).await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to read CHECK_HASH filename len: {}", e)))?;
+            let name_len = u64::from_le_bytes(len_buf) as usize;
+            let mut name_buf = vec![0u8; name_len];
+            stream.read_exact(&mut name_buf).await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to read CHECK_HASH filename: {}", e)))?;
+            let check_filename = String::from_utf8(name_buf)
+                .map_err(|e| TransferError::ProtocolError(format!("Invalid CHECK_HASH filename: {}", e)))?;
+            let mut hash_buf = [0u8; BLAKE3_LEN];
+            stream.read_exact(&mut hash_buf).await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to read CHECK_HASH hash: {}", e)))?;
+            let path = output_dir.join(&check_filename);
+            let have = completed_hashes.lock().unwrap().get(&path).map(|h| h == &hash_buf).unwrap_or(false);
+            if have {
+                stream.write_all(&[msg::HAVE_HASH]).await
+                    .map_err(|e| TransferError::NetworkError(format!("Failed to send HAVE_HASH: {}", e)))?;
+                eprintln!("Skipped (unchanged): {}", check_filename);
+                return Ok(());
+            }
+            stream.write_all(&[msg::NEED_FILE]).await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to send NEED_FILE: {}", e)))?;
+            // Read full metadata: filename_len (8) + filename + file_size (8) + max_streams (8)
+            stream.read_exact(&mut len_buf).await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to read metadata filename len: {}", e)))?;
+            let name_len = u64::from_le_bytes(len_buf) as usize;
+            let mut name_buf = vec![0u8; name_len];
+            stream.read_exact(&mut name_buf).await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to read metadata filename: {}", e)))?;
+            let filename = String::from_utf8(name_buf)
+                .map_err(|e| TransferError::ProtocolError(format!("Invalid filename: {}", e)))?;
+            let mut file_size_buf = [0u8; 8];
+            stream.read_exact(&mut file_size_buf).await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to read file size: {}", e)))?;
+            let file_size = u64::from_le_bytes(file_size_buf);
+            let mut num_streams_buf = [0u8; 8];
+            stream.read_exact(&mut num_streams_buf).await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to read num streams: {}", e)))?;
+            let num_streams = u64::from_le_bytes(num_streams_buf) as usize;
+            (filename, file_size, num_streams)
+        } else {
+            let mut filename_len_buf = [0u8; 8];
+            filename_len_buf[0] = first_byte[0];
+            stream.read_exact(&mut filename_len_buf[1..8]).await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to read filename length: {}", e)))?;
+            let filename_len = u64::from_le_bytes(filename_len_buf) as usize;
+            let mut filename_buf = vec![0u8; filename_len];
+            stream.read_exact(&mut filename_buf).await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to read filename: {}", e)))?;
+            let filename = String::from_utf8(filename_buf)
+                .map_err(|e| TransferError::ProtocolError(format!("Invalid filename: {}", e)))?;
+            let mut file_size_buf = [0u8; 8];
+            stream.read_exact(&mut file_size_buf).await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to read file size: {}", e)))?;
+            let file_size = u64::from_le_bytes(file_size_buf);
+            let mut num_streams_buf = [0u8; 8];
+            stream.read_exact(&mut num_streams_buf).await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to read num streams: {}", e)))?;
+            let num_streams = u64::from_le_bytes(num_streams_buf) as usize;
+            (filename, file_size, num_streams)
+        };
 
         // Minimal logging - just the filename
         eprintln!("Receiving: {}", filename);
@@ -156,7 +218,8 @@ impl TcpServer {
         file.set_len(file_size)?;
         let file = Arc::new(file);
 
-        let ranges = crate::base::split_file_ranges(file_size, num_streams);
+        let num_ranges = crate::base::transfer_num_ranges(num_streams);
+        let ranges = crate::base::split_file_ranges(file_size, num_ranges);
         let mut data_handles = Vec::new();
 
         // Receive-side hasher: hash bytes as written (symmetric with sender). Bounded channel 64.
@@ -320,6 +383,8 @@ impl TcpServer {
 
         stream.write_all(&[msg::HASH_OK]).await
             .map_err(|e| TransferError::NetworkError(format!("Failed to send hash OK: {}", e)))?;
+
+        completed_hashes.lock().unwrap().insert(output_path.clone(), expected_hash);
 
         // Minimal completion message
         eprintln!("Received: {} ({} bytes)", filename, total_received);

@@ -1,7 +1,7 @@
 //! QUIC transport using quinn. Implements Transport/Connection/Stream.
 
 use crate::error::TransferError;
-use crate::transport::{Connection, Platform, Stream, TransferMetaChannels, Transport};
+use crate::transport::{Connection, Platform, Stream, StreamOpener, TransferMetaChannels, Transport};
 use async_trait::async_trait;
 use quinn::{ClientConfig, Connection as QuinnConnection, Endpoint, RecvStream, SendStream};
 use std::net::SocketAddr;
@@ -82,6 +82,28 @@ impl Stream for QuinnStream {
         send.finish()
             .map_err(|e| TransferError::NetworkError(format!("QUIC stream finish: {}", e)))?;
         Ok(())
+    }
+}
+
+/// Opens QUIC data streams on demand. Holds the connection so it stays alive for the transfer.
+pub struct QuicStreamOpener {
+    connection: QuinnConnection,
+    max: usize,
+}
+
+#[async_trait]
+impl StreamOpener for QuicStreamOpener {
+    async fn open_stream(&self) -> Result<Box<dyn Stream>, TransferError> {
+        let (send, recv) = self
+            .connection
+            .open_bi()
+            .await
+            .map_err(|e| TransferError::NetworkError(format!("QUIC open_bi: {}", e)))?;
+        Ok(Box::new(QuinnStream::new(send, recv)))
+    }
+
+    fn max_streams(&self) -> usize {
+        self.max
     }
 }
 
@@ -227,6 +249,10 @@ impl QuicTransport {
 
 #[async_trait]
 impl Transport for QuicTransport {
+    fn name(&self) -> &'static str {
+        "quic"
+    }
+
     async fn connect(&self, addr: SocketAddr) -> Result<Box<dyn Connection>, TransferError> {
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
             .map_err(|e| TransferError::NetworkError(format!("QUIC client endpoint: {}", e)))?;
@@ -270,8 +296,9 @@ impl Transport for QuicTransport {
     async fn connect_for_transfer(
         &self,
         addr: SocketAddr,
-        num_data_streams: usize,
-    ) -> Result<(TransferMetaChannels, Vec<Box<dyn Stream>>), TransferError> {
+        _num_streams: usize,
+        max_streams: usize,
+    ) -> Result<(TransferMetaChannels, Arc<dyn StreamOpener>), TransferError> {
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
             .map_err(|e| TransferError::NetworkError(format!("QUIC client endpoint: {}", e)))?;
         endpoint.set_default_client_config(Self::make_client_config()?);
@@ -299,24 +326,10 @@ impl Transport for QuicTransport {
             writer: Box::new(writer),
         };
 
-        // Open all data streams in parallel (one RTT instead of N) so transfer starts faster
-        let mut data_streams: Vec<Box<dyn Stream>> = Vec::with_capacity(num_data_streams);
-        let mut join_handles = Vec::with_capacity(num_data_streams);
-        for _ in 0..num_data_streams {
-            let c = conn.clone();
-            join_handles.push(tokio::spawn(async move { c.open_bi().await }));
-        }
-        for h in join_handles {
-            let open_res = h.await.map_err(|e| {
-                TransferError::NetworkError(format!("QUIC open_bi task panicked: {:?}", e))
-            })?;
-            let (send, recv) = open_res.map_err(|e| {
-                TransferError::NetworkError(format!("QUIC open_bi (data): {}", e))
-            })?;
-            data_streams.push(Box::new(QuinnStream::new(send, recv)));
-        }
-
-        std::mem::forget(conn);
-        Ok((meta, data_streams))
+        let opener = QuicStreamOpener {
+            connection: conn,
+            max: max_streams,
+        };
+        Ok((meta, Arc::new(opener)))
     }
 }
