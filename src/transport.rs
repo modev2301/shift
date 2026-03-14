@@ -98,15 +98,118 @@ pub trait Transport: Send + Sync {
 use socket2::{Domain, Socket, Type};
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream};
 
-/// Wraps tokio TcpStream to implement the transport Stream trait (AsyncRead + AsyncWrite + shutdown).
+/// Inner stream type: plain TCP or TLS-wrapped (when tls feature and tls_cert_dir set).
+#[derive(Debug)]
+enum TcpOrTlsStream {
+    Plain(TokioTcpStream),
+    #[cfg(feature = "tls")]
+    Tls(tokio_rustls::client::TlsStream<TokioTcpStream>),
+}
+
+#[cfg(feature = "tls")]
+impl tokio::io::AsyncRead for TcpOrTlsStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            TcpOrTlsStream::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            TcpOrTlsStream::Tls(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+#[cfg(feature = "tls")]
+impl tokio::io::AsyncWrite for TcpOrTlsStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            TcpOrTlsStream::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            TcpOrTlsStream::Tls(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            TcpOrTlsStream::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
+            TcpOrTlsStream::Tls(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            TcpOrTlsStream::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            TcpOrTlsStream::Tls(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+#[cfg(not(feature = "tls"))]
+impl tokio::io::AsyncRead for TcpOrTlsStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            TcpOrTlsStream::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+#[cfg(not(feature = "tls"))]
+impl tokio::io::AsyncWrite for TcpOrTlsStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            TcpOrTlsStream::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            TcpOrTlsStream::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            TcpOrTlsStream::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Wraps tokio TcpStream (or TLS stream) to implement the transport Stream trait.
 pub struct TcpStreamImpl {
-    inner: tokio::sync::Mutex<tokio::net::TcpStream>,
+    inner: tokio::sync::Mutex<TcpOrTlsStream>,
 }
 
 impl TcpStreamImpl {
-    pub fn new(inner: tokio::net::TcpStream) -> Self {
+    pub fn new(inner: TokioTcpStream) -> Self {
         Self {
-            inner: tokio::sync::Mutex::new(inner),
+            inner: tokio::sync::Mutex::new(TcpOrTlsStream::Plain(inner)),
+        }
+    }
+
+    #[cfg(feature = "tls")]
+    pub fn new_tls(inner: tokio_rustls::client::TlsStream<TokioTcpStream>) -> Self {
+        Self {
+            inner: tokio::sync::Mutex::new(TcpOrTlsStream::Tls(inner)),
         }
     }
 }
@@ -163,16 +266,23 @@ impl AsyncWrite for TcpStreamImpl {
 impl Stream for TcpStreamImpl {
     async fn shutdown(&self) -> Result<(), TransferError> {
         let mut guard = self.inner.lock().await;
-        guard
-            .shutdown()
-            .await
-            .map_err(|e| TransferError::NetworkError(format!("Stream shutdown: {}", e)))
+        match &mut *guard {
+            TcpOrTlsStream::Plain(s) => s
+                .shutdown()
+                .await
+                .map_err(|e| TransferError::NetworkError(format!("Stream shutdown: {}", e))),
+            #[cfg(feature = "tls")]
+            TcpOrTlsStream::Tls(s) => s
+                .shutdown()
+                .await
+                .map_err(|e| TransferError::NetworkError(format!("TLS stream shutdown: {}", e))),
+        }
     }
 }
 
 /// TCP connection: one stream per connection. Stream is taken on first open_stream or accept_stream.
 pub struct TcpConnection {
-    stream: std::sync::Mutex<Option<tokio::net::TcpStream>>,
+    stream: std::sync::Mutex<Option<TcpStreamImpl>>,
     platform: Platform,
 }
 
@@ -185,7 +295,7 @@ impl Connection for TcpConnection {
         let s = guard.take().ok_or_else(|| {
             TransferError::ProtocolError("TCP connection: stream already taken".to_string())
         })?;
-        Ok(Box::new(TcpStreamImpl::new(s)))
+        Ok(Box::new(s))
     }
     async fn accept_stream(&self) -> Result<Box<dyn Stream>, TransferError> {
         let mut guard = self.stream.lock().map_err(|e| {
@@ -194,7 +304,7 @@ impl Connection for TcpConnection {
         let s = guard.take().ok_or_else(|| {
             TransferError::ProtocolError("TCP connection: stream already taken".to_string())
         })?;
-        Ok(Box::new(TcpStreamImpl::new(s)))
+        Ok(Box::new(s))
     }
     fn platform(&self) -> Platform {
         self.platform
@@ -216,7 +326,7 @@ impl Listener for TcpListenerImpl {
             .await
             .map_err(|e| TransferError::NetworkError(format!("Accept: {}", e)))?;
         Ok(Box::new(TcpConnection {
-            stream: std::sync::Mutex::new(Some(stream)),
+            stream: std::sync::Mutex::new(Some(TcpStreamImpl::new(stream))),
             platform: self.platform,
         }))
     }
@@ -225,11 +335,31 @@ impl Listener for TcpListenerImpl {
 /// TCP transport. Implements Transport for use with create_transport() when QUIC is added.
 pub struct TcpTransport {
     config: TransferConfig,
+    #[cfg(feature = "tls")]
+    client_config: Option<std::sync::Arc<rustls::ClientConfig>>,
 }
 
 impl TcpTransport {
     pub fn new(config: TransferConfig) -> Self {
-        Self { config }
+        #[cfg(feature = "tls")]
+        let client_config = config.tls_cert_dir.as_ref().and_then(|dir| {
+            crate::tls::client_config_from_dir(dir).ok()
+        });
+        Self {
+            config,
+            #[cfg(feature = "tls")]
+            client_config,
+        }
+    }
+
+    #[cfg(feature = "tls")]
+    fn server_name(addr: std::net::SocketAddr) -> Result<rustls::pki_types::ServerName<'static>, TransferError> {
+        if addr.ip().is_loopback() {
+            rustls::pki_types::ServerName::try_from("localhost".to_string())
+                .map_err(|e| TransferError::ProtocolError(format!("ServerName: {}", e)))
+        } else {
+            Ok(rustls::pki_types::ServerName::from(addr.ip()))
+        }
     }
 
     fn platform() -> Platform {
@@ -270,6 +400,8 @@ pub struct TcpStreamOpener {
     next_port: AtomicU16,
     max: usize,
     config: TransferConfig,
+    #[cfg(feature = "tls")]
+    client_config: Option<std::sync::Arc<rustls::ClientConfig>>,
 }
 
 #[async_trait]
@@ -293,7 +425,28 @@ impl StreamOpener for TcpStreamOpener {
         let std_stream = std::net::TcpStream::from(socket);
         let stream = TokioTcpStream::from_std(std_stream)
             .map_err(|e| TransferError::NetworkError(format!("Tokio stream: {}", e)))?;
-        Ok(Box::new(TcpStreamImpl::new(stream)))
+        #[cfg(feature = "tls")]
+        let stream = {
+            if let Some(ref cfg) = self.client_config {
+                let name = if data_addr.ip().is_loopback() {
+                    rustls::pki_types::ServerName::try_from("localhost".to_string())
+                        .map_err(|e| TransferError::ProtocolError(format!("ServerName: {}", e)))?
+                } else {
+                    rustls::pki_types::ServerName::from(data_addr.ip())
+                };
+                let connector = tokio_rustls::TlsConnector::from(cfg.clone());
+                let tls_stream = connector
+                    .connect(name, stream)
+                    .await
+                    .map_err(|e| TransferError::NetworkError(format!("TLS connect data: {}", e)))?;
+                TcpStreamImpl::new_tls(tls_stream)
+            } else {
+                TcpStreamImpl::new(stream)
+            }
+        };
+        #[cfg(not(feature = "tls"))]
+        let stream = TcpStreamImpl::new(stream);
+        Ok(Box::new(stream))
     }
 
     fn max_streams(&self) -> usize {
@@ -320,6 +473,22 @@ impl Transport for TcpTransport {
         let std_stream = std::net::TcpStream::from(socket);
         let stream = TokioTcpStream::from_std(std_stream)
             .map_err(|e| TransferError::NetworkError(format!("Tokio stream: {}", e)))?;
+        #[cfg(feature = "tls")]
+        let stream = {
+            if let Some(ref cfg) = self.client_config {
+                let name = Self::server_name(addr)?;
+                let connector = tokio_rustls::TlsConnector::from(cfg.clone());
+                let tls_stream = connector
+                    .connect(name, stream)
+                    .await
+                    .map_err(|e| TransferError::NetworkError(format!("TLS connect: {}", e)))?;
+                TcpStreamImpl::new_tls(tls_stream)
+            } else {
+                TcpStreamImpl::new(stream)
+            }
+        };
+        #[cfg(not(feature = "tls"))]
+        let stream = TcpStreamImpl::new(stream);
         Ok(Box::new(TcpConnection {
             stream: std::sync::Mutex::new(Some(stream)),
             platform: Self::platform(),
@@ -374,7 +543,31 @@ impl Transport for TcpTransport {
         let std_stream = std::net::TcpStream::from(socket);
         let meta_stream = TokioTcpStream::from_std(std_stream)
             .map_err(|e| TransferError::NetworkError(format!("Tokio stream: {}", e)))?;
+        #[cfg(feature = "tls")]
+        let meta = {
+            if let Some(ref cfg) = self.client_config {
+                let name = Self::server_name(addr)?;
+                let connector = tokio_rustls::TlsConnector::from(cfg.clone());
+                let tls_stream = connector
+                    .connect(name, meta_stream)
+                    .await
+                    .map_err(|e| TransferError::NetworkError(format!("TLS connect metadata: {}", e)))?;
+                let (r, w) = tokio::io::split(tls_stream);
+                TransferMetaChannels {
+                    reader: Box::new(r),
+                    writer: Box::new(w),
+                }
+            } else {
+                let (r, w) = tokio::io::split(meta_stream);
+                TransferMetaChannels {
+                    reader: Box::new(r),
+                    writer: Box::new(w),
+                }
+            }
+        };
+        #[cfg(not(feature = "tls"))]
         let (reader, writer) = tokio::io::split(meta_stream);
+        #[cfg(not(feature = "tls"))]
         let meta = TransferMetaChannels {
             reader: Box::new(reader),
             writer: Box::new(writer),
@@ -384,6 +577,8 @@ impl Transport for TcpTransport {
             next_port: AtomicU16::new(addr.port() + 1),
             max: max_streams,
             config: self.config.clone(),
+            #[cfg(feature = "tls")]
+            client_config: self.client_config.clone(),
         };
         Ok((meta, Arc::new(opener)))
     }

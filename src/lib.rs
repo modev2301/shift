@@ -30,13 +30,19 @@
 //!         enable_encryption: false,
 //!         encryption_key: None,
 //!         timeout_seconds: 30,
+//!         tls_cert_dir: None,
+//!         enable_fec: false,
+//!         fec_block_size: 65536,
+//!         fec_repair_packets: 4,
+//!         #[cfg(feature = "fec")]
+//!         fec_negotiated: false,
 //!     };
 //!     let server = TcpServer::new(
 //!         config.server.port,
 //!         config.server.output_directory.into(),
 //!         transfer_config,
 //!     );
-//!     server.run_forever().await?;
+//!     server.run_forever(None).await?;
 //!     Ok(())
 //! }
 //! ```
@@ -49,19 +55,37 @@ pub mod quinn_transport;
 pub mod transport;
 pub mod encryption;
 pub mod error;
+pub mod fec;
 pub mod file_io;
 pub mod integrity;
 pub mod metrics;
 pub mod progress;
 pub mod range_queue;
 pub mod resume;
+pub mod server_cache;
 pub mod tcp_server;
 pub mod tcp_transfer;
 pub mod utils;
 
-pub use base::{FileRange, TransferConfig, TransferReport, TransferStats};
+#[cfg(feature = "tls")]
+pub mod tls;
+
+#[cfg(not(feature = "tls"))]
+pub mod tls {
+    use crate::error::TransferError;
+    use std::path::Path;
+    /// No-op when TLS feature is disabled; returns an error.
+    pub fn keygen(_dir: &Path) -> Result<(), TransferError> {
+        Err(TransferError::ProtocolError(
+            "TLS support not compiled in; build with --features tls".to_string(),
+        ))
+    }
+}
+
+pub use base::{FileRange, TransferConfig, TransferReport, TransferStatus, TransferStats};
 pub use config::Config;
 pub use error::TransferError;
+pub use file_io::FileReader;
 pub use transport::{create_transport, Connection, Listener, Platform, Stream, Transport, TcpTransport};
 pub use quinn_transport::QuicTransport;
 

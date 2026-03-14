@@ -47,10 +47,19 @@ impl RangeQueue {
 
     /// Worker failed or stalled: put this worker's range back on pending and remove from in_flight.
     pub fn requeue(&self, id: WorkerId) {
+        let _ = self.requeue_returning_range(id);
+    }
+
+    /// Like requeue but returns the range that was requeued (for coordinator to mark stale completions).
+    pub fn requeue_returning_range(&self, id: WorkerId) -> Option<FileRange> {
         let mut in_flight = self.in_flight.lock().unwrap();
-        if let Some(range) = in_flight.remove(&id) {
-            drop(in_flight);
-            self.pending.lock().unwrap().push_front(range);
+        let range = in_flight.remove(&id);
+        drop(in_flight);
+        if let Some(r) = range {
+            self.pending.lock().unwrap().push_front(r);
+            Some(r)
+        } else {
+            None
         }
     }
 

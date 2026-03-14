@@ -8,45 +8,104 @@ use crate::base::msg;
 use crate::base::{apply_capabilities_to_config, capabilities_from_config, Capabilities, CAPABILITIES_WIRE_LEN};
 use crate::error::TransferError;
 use crate::base::TransferConfig;
-use crate::integrity::{hash_file_range_path, BLAKE3_LEN};
-use crate::tcp_transfer::{configure_tcp_socket, receive_range_tcp, run_ordered_hasher};
+use crate::base::FileRange;
+use crate::integrity::{hash_file, hash_file_range_path, BLAKE3_LEN};
+use crate::server_cache;
+use crate::tcp_transfer::{configure_tcp_socket, receive_range_tcp};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::sync::mpsc as std_mpsc;
 use socket2::{Domain, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tracing::error;
+
+#[cfg(feature = "tls")]
+use tokio_rustls::TlsAcceptor;
+
+#[cfg(feature = "tls")]
+enum MetaStream {
+    Plain(tokio::net::TcpStream),
+    Tls(tokio_rustls::server::TlsStream<tokio::net::TcpStream>),
+}
+
+#[cfg(feature = "tls")]
+impl tokio::io::AsyncRead for MetaStream {
+    fn poll_read(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MetaStream::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            MetaStream::Tls(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+#[cfg(feature = "tls")]
+impl tokio::io::AsyncWrite for MetaStream {
+    fn poll_write(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            MetaStream::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            MetaStream::Tls(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MetaStream::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
+            MetaStream::Tls(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MetaStream::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            MetaStream::Tls(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
 
 /// TCP server that handles file transfers using parallel connections.
 pub struct TcpServer {
     base_port: u16,
     output_dir: PathBuf,
     config: TransferConfig,
-    /// Path → BLAKE3 hash for completed receives (used by --update skip check).
     completed_hashes: Arc<Mutex<HashMap<PathBuf, [u8; BLAKE3_LEN]>>>,
+    persist_tx: Option<std_mpsc::Sender<(PathBuf, [u8; BLAKE3_LEN])>>,
+    #[cfg(feature = "tls")]
+    tls_acceptor: Option<TlsAcceptor>,
 }
 
 impl TcpServer {
-    /// Create a new TCP server. Listener count comes from negotiated max_streams (client sends it in metadata).
+    /// Create a new TCP server. When config.tls_cert_dir is set and build has `tls` feature, uses mutual TLS.
+    /// Loads completed file hashes from ~/.shift/server_cache.db so --update skip persists across restarts.
     pub fn new(base_port: u16, output_dir: PathBuf, config: TransferConfig) -> Self {
+        #[cfg(feature = "tls")]
+        let tls_acceptor = config.tls_cert_dir.as_ref().and_then(|dir| {
+            crate::tls::server_config_from_dir(dir)
+                .map(|cfg| TlsAcceptor::from(cfg))
+                .ok()
+        });
+        #[cfg(not(feature = "tls"))]
+        let _ = config.tls_cert_dir.is_some(); // ignore if no tls feature
+        let cache_path = server_cache::server_cache_path();
+        let _ = server_cache::ensure_cache_dir(&cache_path);
+        let (initial_hashes, persist_tx) = server_cache::load_and_spawn_persist(&cache_path);
         Self {
             base_port,
             output_dir,
             config,
-            completed_hashes: Arc::new(Mutex::new(HashMap::new())),
+            completed_hashes: Arc::new(Mutex::new(initial_hashes)),
+            persist_tx,
+            #[cfg(feature = "tls")]
+            tls_acceptor,
         }
     }
 
-    /// Run the server forever, accepting connections.
-    pub async fn run_forever(&self) -> Result<(), TransferError> {
-        // Create and configure metadata listener on base port
+    /// Run the server forever, accepting connections. If `base_port` is 0, binds to port 0 and sends the assigned port on `port_tx` when provided.
+    pub async fn run_forever(&self, port_tx: Option<oneshot::Sender<u16>>) -> Result<(), TransferError> {
         let metadata_socket = Socket::new(Domain::IPV4, Type::STREAM, None)
             .map_err(|e| TransferError::NetworkError(format!("Failed to create socket: {}", e)))?;
-        
-        // Configure socket for high throughput
         if let Some(size) = self.config.socket_send_buffer_size {
             metadata_socket.set_send_buffer_size(size)
                 .map_err(|e| TransferError::NetworkError(format!("Failed to set SO_SNDBUF: {}", e)))?;
@@ -61,34 +120,64 @@ impl TcpServer {
         let addr: SocketAddr = format!("0.0.0.0:{}", self.base_port)
             .parse()
             .map_err(|e| TransferError::NetworkError(format!("Invalid address: {}", e)))?;
-        
         metadata_socket.bind(&addr.into())
             .map_err(|e| TransferError::NetworkError(format!("Failed to bind: {}", e)))?;
         metadata_socket.listen(128)
             .map_err(|e| TransferError::NetworkError(format!("Failed to listen: {}", e)))?;
-
         metadata_socket.set_nonblocking(true)
             .map_err(|e| TransferError::NetworkError(format!("Failed to set nonblocking: {}", e)))?;
-        
         let std_listener = std::net::TcpListener::from(metadata_socket);
         let listener = TcpListener::from_std(std_listener)
             .map_err(|e| TransferError::NetworkError(format!("Failed to convert to tokio listener: {}", e)))?;
-
-        eprintln!("Shift server listening on port {}", self.base_port);
+        let base_port = listener.local_addr()
+            .map_err(|e| TransferError::NetworkError(format!("local_addr: {}", e)))?
+            .port();
+        if let Some(tx) = port_tx {
+            let _ = tx.send(base_port);
+        }
+        eprintln!("Shift server listening on port {}", base_port);
         eprintln!("Output directory: {}", self.output_dir.display());
+        #[cfg(feature = "tls")]
+        if self.tls_acceptor.is_some() {
+            eprintln!("TLS: mutual TLS enabled (cert dir from config)");
+        }
 
-        // Accept metadata connections
+        #[cfg(feature = "tls")]
+        let tls_acceptor = self.tls_acceptor.clone();
+        let completed_hashes = self.completed_hashes.clone();
+        let persist_tx = self.persist_tx.clone();
+        let output_dir = self.output_dir.clone();
+        let config = self.config.clone();
+
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) => {
                     tracing::debug!(remote = %addr, "New metadata connection accepted");
-                    let output_dir = self.output_dir.clone();
-                    let config = self.config.clone();
-                    let base_port = self.base_port;
-
-                    let completed_hashes = self.completed_hashes.clone();
+                    let output_dir = output_dir.clone();
+                    let config = config.clone();
+                    let completed_hashes = completed_hashes.clone();
+                    let persist_tx = persist_tx.clone();
+                    #[cfg(feature = "tls")]
+                    let tls_acceptor = tls_acceptor.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = Self::handle_connection(stream, addr, output_dir, base_port, config, completed_hashes).await {
+                        #[cfg(feature = "tls")]
+                        let result = async {
+                            let stream = if let Some(ref acceptor) = tls_acceptor {
+                                let tls_stream = acceptor.accept(stream).await.map_err(|e| TransferError::NetworkError(format!("TLS accept: {}", e)))?;
+                                MetaStream::Tls(tls_stream)
+                            } else {
+                                MetaStream::Plain(stream)
+                            };
+                            Self::handle_connection(stream, addr, output_dir, base_port, config, completed_hashes, persist_tx, tls_acceptor).await
+                        }.await;
+                        #[cfg(feature = "tls")]
+                        if let Err(e) = result {
+                            error!(error = %e, "Connection handling failed");
+                        }
+                        #[cfg(not(feature = "tls"))]
+                        let result = Self::handle_connection(stream, addr, output_dir, base_port, config, completed_hashes, persist_tx).await;
+                        #[cfg(not(feature = "tls"))]
+                        if let Err(e) = result {
                             error!(error = %e, "Connection handling failed");
                         }
                     });
@@ -100,14 +189,68 @@ impl TcpServer {
         }
     }
 
-    async fn handle_connection(
-        mut stream: tokio::net::TcpStream,
+    /// Run one transfer then return. Binds to `0.0.0.0:0` (port 0); sends the assigned port on `port_tx` so the client can connect. Use for tests and oneshot usage.
+    pub async fn run_oneshot(&self, port_tx: oneshot::Sender<u16>) -> Result<(), TransferError> {
+        let metadata_socket = Socket::new(Domain::IPV4, Type::STREAM, None)
+            .map_err(|e| TransferError::NetworkError(format!("Failed to create socket: {}", e)))?;
+        if let Some(size) = self.config.socket_send_buffer_size {
+            metadata_socket.set_send_buffer_size(size)
+                .map_err(|e| TransferError::NetworkError(format!("Failed to set SO_SNDBUF: {}", e)))?;
+        }
+        if let Some(size) = self.config.socket_recv_buffer_size {
+            metadata_socket.set_recv_buffer_size(size)
+                .map_err(|e| TransferError::NetworkError(format!("Failed to set SO_RCVBUF: {}", e)))?;
+        }
+        metadata_socket.set_nodelay(true)
+            .map_err(|e| TransferError::NetworkError(format!("Failed to set TCP_NODELAY: {}", e)))?;
+        let addr: SocketAddr = "0.0.0.0:0".parse()
+            .map_err(|e| TransferError::NetworkError(format!("Invalid address: {}", e)))?;
+        metadata_socket.bind(&addr.into())
+            .map_err(|e| TransferError::NetworkError(format!("Failed to bind: {}", e)))?;
+        metadata_socket.listen(1)
+            .map_err(|e| TransferError::NetworkError(format!("Failed to listen: {}", e)))?;
+        metadata_socket.set_nonblocking(true)
+            .map_err(|e| TransferError::NetworkError(format!("Failed to set nonblocking: {}", e)))?;
+        let std_listener = std::net::TcpListener::from(metadata_socket);
+        let listener = TcpListener::from_std(std_listener)
+            .map_err(|e| TransferError::NetworkError(format!("Failed to convert to tokio listener: {}", e)))?;
+        let base_port = listener.local_addr()
+            .map_err(|e| TransferError::NetworkError(format!("local_addr: {}", e)))?
+            .port();
+        let _ = port_tx.send(base_port);
+
+        let (stream, addr) = listener.accept().await
+            .map_err(|e| TransferError::NetworkError(format!("Accept failed: {}", e)))?;
+        tracing::debug!(remote = %addr, "Oneshot: accepted metadata connection");
+        #[cfg(feature = "tls")]
+        let result = {
+            let tls_acceptor = self.tls_acceptor.clone();
+            let stream = if let Some(ref acceptor) = tls_acceptor {
+                let tls_stream = acceptor.accept(stream).await.map_err(|e| TransferError::NetworkError(format!("TLS accept: {}", e)))?;
+                MetaStream::Tls(tls_stream)
+            } else {
+                MetaStream::Plain(stream)
+            };
+            Self::handle_connection(stream, addr, self.output_dir.clone(), base_port, self.config.clone(), self.completed_hashes.clone(), self.persist_tx.clone(), tls_acceptor).await
+        };
+        #[cfg(not(feature = "tls"))]
+        let result = Self::handle_connection(stream, addr, self.output_dir.clone(), base_port, self.config.clone(), self.completed_hashes.clone(), self.persist_tx.clone()).await;
+        result
+    }
+
+    async fn handle_connection<S>(
+        mut stream: S,
         _addr: SocketAddr,
         output_dir: PathBuf,
         base_port: u16,
         config: TransferConfig,
         completed_hashes: Arc<Mutex<HashMap<PathBuf, [u8; BLAKE3_LEN]>>>,
-    ) -> Result<(), TransferError> {
+        persist_tx: Option<std_mpsc::Sender<(PathBuf, [u8; BLAKE3_LEN])>>,
+        #[cfg(feature = "tls")] tls_acceptor: Option<TlsAcceptor>,
+    ) -> Result<(), TransferError>
+    where
+        S: AsyncReadExt + AsyncWriteExt + Unpin + Send,
+    {
         // Capability handshake: read client caps, negotiate, send negotiated, apply to config.
         let mut cap_buf = [0u8; CAPABILITIES_WIRE_LEN];
         stream.read_exact(&mut cap_buf).await
@@ -157,7 +300,28 @@ impl TcpServer {
             stream.read_exact(&mut hash_buf).await
                 .map_err(|e| TransferError::NetworkError(format!("Failed to read CHECK_HASH hash: {}", e)))?;
             let path = output_dir.join(&check_filename);
-            let have = completed_hashes.lock().unwrap().get(&path).map(|h| h == &hash_buf).unwrap_or(false);
+            let cached_matches = completed_hashes.lock().unwrap().get(&path).map(|h| *h == hash_buf).unwrap_or(false);
+            let have = if cached_matches {
+                if path.exists() {
+                    match std::fs::metadata(&path) {
+                        Ok(meta) if meta.len() > 0 => {
+                            match hash_file(&path, meta.len()) {
+                                Ok(disk_hash) if disk_hash == hash_buf => true,
+                                _ => {
+                                    completed_hashes.lock().unwrap().remove(&path);
+                                    false
+                                }
+                            }
+                        }
+                        _ => false,
+                    }
+                } else {
+                    completed_hashes.lock().unwrap().remove(&path);
+                    false
+                }
+            } else {
+                false
+            };
             if have {
                 stream.write_all(&[msg::HAVE_HASH]).await
                     .map_err(|e| TransferError::NetworkError(format!("Failed to send HAVE_HASH: {}", e)))?;
@@ -222,15 +386,17 @@ impl TcpServer {
         let ranges = crate::base::split_file_ranges(file_size, num_ranges);
         let mut data_handles = Vec::new();
 
-        // Receive-side hasher: hash bytes as written (symmetric with sender). Bounded channel 64.
-        let (hasher_tx, hasher_rx) = mpsc::channel(64);
-        let hasher_handle = tokio::spawn(async move { run_ordered_hasher(hasher_rx, file_size).await });
+        let (range_hash_tx, mut range_hash_rx) = mpsc::channel::<(FileRange, [u8; BLAKE3_LEN])>(64);
 
+        #[cfg(feature = "tls")]
+        let tls_acceptor = tls_acceptor.clone();
         for (thread_id, _range) in ranges.into_iter().enumerate() {
             let file = Arc::clone(&file);
             let config = config.clone();
             let data_port = base_port + 1 + thread_id as u16;
-            let range_hasher_tx = hasher_tx.clone();
+            let range_hash_tx = range_hash_tx.clone();
+            #[cfg(feature = "tls")]
+            let tls_acceptor = tls_acceptor.clone();
 
             let handle = tokio::spawn(async move {
                 // Create and configure listening socket
@@ -262,7 +428,20 @@ impl TcpServer {
                 let (data_stream, _) = listener.accept().await
                     .map_err(|e| TransferError::NetworkError(format!("Accept failed: {}", e)))?;
 
-                receive_range_tcp(thread_id, file, data_stream, config, None, Some(range_hasher_tx)).await
+                #[cfg(feature = "tls")]
+                let data_stream = {
+                    if let Some(acceptor) = tls_acceptor {
+                        let tls_stream = acceptor
+                            .accept(data_stream)
+                            .await
+                            .map_err(|e| TransferError::NetworkError(format!("TLS accept data: {}", e)))?;
+                        MetaStream::Tls(tls_stream)
+                    } else {
+                        MetaStream::Plain(data_stream)
+                    }
+                };
+
+                receive_range_tcp(thread_id, file, data_stream, config, None, Some(range_hash_tx)).await
             });
 
             data_handles.push(handle);
@@ -311,8 +490,10 @@ impl TcpServer {
         }
         // else 0x00: no range verify, proceed to data listeners
 
-        // Wait for all data connections to complete
+        // Wait for all data connections to complete. Defer returning error so we can do hash
+        // exchange and send HASH_OK/HASH_MISMATCH before closing (avoids client "early eof").
         let mut total_received = 0u64;
+        let mut data_error: Option<TransferError> = None;
         for (thread_id, handle) in data_handles.into_iter().enumerate() {
             match handle.await {
                 Ok(Ok(bytes)) => {
@@ -324,12 +505,14 @@ impl TcpServer {
                     );
                 }
                 Ok(Err(e)) => {
-                    drop(hasher_tx);
-                    return Err(e);
+                    if data_error.is_none() {
+                        data_error = Some(e);
+                    }
                 }
                 Err(e) => {
-                    drop(hasher_tx);
-                    return Err(TransferError::NetworkError(format!("Data connection panicked: {:?}", e)));
+                    if data_error.is_none() {
+                        data_error = Some(TransferError::NetworkError(format!("Data connection panicked: {:?}", e)));
+                    }
                 }
             }
         }
@@ -351,8 +534,6 @@ impl TcpServer {
             file_mut.sync_all()?;
         }
 
-        // Hash comparison order (docs/INTEGRITY_DESIGN.md §9): all data streams are complete
-        // and fsync done above. Only then read expected_hash from client, then finalize our hasher.
         let mut hash_type_buf = [0u8; 1];
         stream.read_exact(&mut hash_type_buf).await
             .map_err(|e| TransferError::NetworkError(format!("Failed to read hash message type: {}", e)))?;
@@ -366,12 +547,12 @@ impl TcpServer {
         stream.read_exact(&mut expected_hash).await
             .map_err(|e| TransferError::NetworkError(format!("Failed to read file hash: {}", e)))?;
 
-        // Finalize receive-side hasher (channel close + drain BTreeMap) → actual_hash.
-        drop(hasher_tx);
-        let actual_hash = hasher_handle
-            .await
-            .map_err(|e| TransferError::NetworkError(format!("Receive hasher task panicked: {:?}", e)))?
-            .map_err(|e| TransferError::ProtocolError(format!("Receive hasher: {}", e)))?;
+        drop(range_hash_tx);
+        let mut received_ranges: Vec<(FileRange, [u8; BLAKE3_LEN])> = Vec::new();
+        while let Some(rh) = range_hash_rx.recv().await {
+            received_ranges.push(rh);
+        }
+        let actual_hash = hash_file(&output_path, file_size)?;
         if actual_hash != expected_hash {
             // Tell client to keep checkpoint for retry (0x05), then return error.
             let _ = stream.write_all(&[msg::HASH_MISMATCH]).await;
@@ -383,12 +564,29 @@ impl TcpServer {
 
         stream.write_all(&[msg::HASH_OK]).await
             .map_err(|e| TransferError::NetworkError(format!("Failed to send hash OK: {}", e)))?;
+        stream.flush().await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to flush hash OK: {}", e)))?;
+        // Drain read until client closes (close handshake: client reads HASH_OK then drops connection, we see EOF).
+        let mut buf = [0u8; 256];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
 
-        completed_hashes.lock().unwrap().insert(output_path.clone(), expected_hash);
+        if data_error.is_none() {
+            completed_hashes.lock().unwrap().insert(output_path.clone(), expected_hash);
+            if let Some(ref tx) = persist_tx {
+                let _ = tx.send((output_path.clone(), expected_hash));
+            }
+            eprintln!("Received: {} ({} bytes)", filename, total_received);
+        }
 
-        // Minimal completion message
-        eprintln!("Received: {} ({} bytes)", filename, total_received);
-
+        if let Some(e) = data_error {
+            return Err(e);
+        }
         Ok(())
     }
 }

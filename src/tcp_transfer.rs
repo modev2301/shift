@@ -6,23 +6,27 @@
 
 use crate::base::msg;
 use crate::error::TransferError;
-use crate::base::{split_file_ranges, transfer_num_ranges, FileRange, TransferConfig, TransferReport};
+use crate::base::{split_file_ranges, transfer_num_ranges, FileRange, TransferConfig, TransferReport, TransferStatus};
 use crate::metrics::BandwidthEstimator;
 use crate::range_queue::{RangeQueue, StreamReport, WorkerId};
 use crate::transport::{Stream as TransportStreamTrait, StreamOpener, Transport};
 use crate::compression::{compress, decompress, should_compress};
 use crate::encryption::{Decryptor, Encryptor};
-use crate::file_io::{open_file_optimized, read_at};
+use crate::file_io::{open_file_optimized, FileReader};
 use crate::integrity::{hash_file, hash_file_range_path, BLAKE3_LEN};
 use crate::progress::{ProgressHandle, TransferProgress};
 use crate::resume::{delete_checkpoint, get_checkpoint_path, TransferCheckpoint};
 use crate::utils::is_file_compressible;
-use std::collections::BTreeMap;
+use std::collections::HashSet;
+
+/// Data channel frame type: payload is a FEC-encoded block (RaptorQ). Inner payload starts with fec::FEC_PACKET_TYPE.
+/// 0x00 = raw, 0x01 = compressed, 0x02 = FEC block.
+const DATA_FRAME_FEC: u8 = 0x02;
 use std::fs::File;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use socket2::{Domain, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -30,57 +34,8 @@ use tokio::net::TcpStream;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::time::interval;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
-
-/// Runs in a dedicated task: receives (offset, plaintext) from range senders/receivers,
-/// reassembles in file order, and hashes with BLAKE3. Used for both send (bytes sent)
-/// and receive (bytes written). Channel must be bounded for backpressure.
-/// BTreeMap worst case: one range (file_size/num_streams), e.g. 671 MB for 10 GB/16.
-/// See docs/INTEGRITY_DESIGN.md.
-pub(crate) async fn run_ordered_hasher(
-    mut rx: mpsc::Receiver<(u64, Vec<u8>)>,
-    file_size: u64,
-) -> Result<[u8; BLAKE3_LEN], TransferError> {
-    let mut buf: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
-    let mut current_pos = 0u64;
-    let mut hasher = blake3::Hasher::new();
-
-    fn drain_contiguous(
-        buf: &mut BTreeMap<u64, Vec<u8>>,
-        hasher: &mut blake3::Hasher,
-        current_pos: &mut u64,
-    ) {
-        while let Some((&pos, _)) = buf.first_key_value() {
-            if pos != *current_pos {
-                break;
-            }
-            let data = buf.remove(&pos).expect("just saw it");
-            hasher.update(&data);
-            *current_pos += data.len() as u64;
-        }
-    }
-
-    while let Some((offset, data)) = rx.recv().await {
-        buf.insert(offset, data);
-        drain_contiguous(&mut buf, &mut hasher, &mut current_pos);
-    }
-    drain_contiguous(&mut buf, &mut hasher, &mut current_pos);
-
-    if current_pos != file_size {
-        return Err(TransferError::ProtocolError(format!(
-            "Send hasher: expected {} bytes, got {} (gap or duplicate)",
-            file_size, current_pos
-        )));
-    }
-    if !buf.is_empty() {
-        return Err(TransferError::ProtocolError(
-            "Send hasher: leftover buffered chunks".to_string(),
-        ));
-    }
-
-    let hash = hasher.finalize();
-    Ok(*hash.as_bytes())
-}
 
 /// Configure TCP socket for high throughput.
 ///
@@ -218,17 +173,17 @@ pub fn configure_tcp_socket(
 }
 
 /// Transfer a file range over a single TCP connection.
-/// If `hasher_tx` is Some, the plaintext bytes actually sent (before compression/encryption)
-/// are fed to the hasher so the final hash is of bytes-sent, not a pre-send read.
+/// Final file hash is computed from per-range BLAKE3 hashes in the coordinator (no streaming hasher).
 async fn transfer_range_tcp(
     thread_id: usize,
     range: FileRange,
-    file: Arc<File>,
+    file: FileReader,
     mut stream: tokio::net::TcpStream,
     config: TransferConfig,
     progress: Option<ProgressHandle>,
-    hasher_tx: Option<mpsc::Sender<(u64, Vec<u8>)>>,
     metrics_tx: Option<mpsc::Sender<StreamReport>>,
+    enable_fec_auto: Option<&AtomicBool>,
+    cancel: Option<&CancellationToken>,
 ) -> Result<u64, TransferError> {
     tracing::debug!(
         thread_id,
@@ -271,50 +226,70 @@ async fn transfer_range_tcp(
     let mut total_sent = 0u64;
 
     while offset < range.end {
+        if cancel.map(|c| c.is_cancelled()).unwrap_or(false) {
+            return Err(TransferError::Cancelled);
+        }
         let chunk_start = Instant::now();
         let remaining = (range.end - offset) as usize;
         let read_size = buffer.len().min(remaining);
 
-        // Use optimized read_at function
-        let bytes_read = read_at(&file, &mut buffer[..read_size], offset)?;
+        let bytes_read = file.read_at(&mut buffer[..read_size], offset).await?;
 
         if bytes_read == 0 {
             break;
         }
 
-        // Feed plaintext to hasher: per-read chunk (same granularity as send), not per-range.
-        if let Some(ref tx) = hasher_tx {
-            let plaintext = buffer[..bytes_read].to_vec();
-            let _ = tx.send((offset, plaintext)).await; // backpressure: bounded channel
+        if cancel.map(|c| c.is_cancelled()).unwrap_or(false) {
+            return Err(TransferError::Cancelled);
         }
 
-        let mut data_to_send = buffer[..bytes_read].to_vec();
-        
-        // Compress if enabled and data is compressible
-        if config.enable_compression && should_compress(&data_to_send) {
-            match compress(&data_to_send) {
-                Ok(compressed) => {
+        let use_fec = config.enable_fec
+            || enable_fec_auto.map(|a| a.load(Ordering::Relaxed)).unwrap_or(false);
+        let (frame_type, data_to_send) = if use_fec {
+            #[cfg(feature = "fec")]
+            {
+                let fec_payload = crate::fec::encode_block(
+                    &buffer[..bytes_read],
+                    crate::fec::DEFAULT_FEC_SYMBOL_SIZE,
+                    config.fec_repair_packets,
+                )?;
+                (DATA_FRAME_FEC, fec_payload)
+            }
+            #[cfg(not(feature = "fec"))]
+            {
+                let mut data = buffer[..bytes_read].to_vec();
+                if config.enable_compression && should_compress(&data) {
+                    if let Ok(c) = compress(&data) {
+                        data = c;
+                    }
+                }
+                if let Some(ref mut enc) = encryptor {
+                    enc.encrypt_in_place(&mut data)?;
+                }
+                let flag = if config.enable_compression && data.len() < bytes_read { 0x01 } else { 0x00 };
+                (flag, data)
+            }
+        } else {
+            let mut data_to_send = buffer[..bytes_read].to_vec();
+            if config.enable_compression && should_compress(&data_to_send) {
+                if let Ok(compressed) = compress(&data_to_send) {
                     data_to_send = compressed;
                 }
-                Err(_) => {
-                    // Compression failed, continue with uncompressed
-                }
             }
-        }
-        
-        // Encrypt if enabled
-        if let Some(ref mut enc) = encryptor {
-            enc.encrypt_in_place(&mut data_to_send)?;
-        }
-        
-        // Send packet: compression flag (1) + size (8) + data
-        let mut packet = Vec::with_capacity(9 + data_to_send.len());
-        let compression_flag = if config.enable_compression && data_to_send.len() < bytes_read {
-            0x01
-        } else {
-            0x00
+            if let Some(ref mut enc) = encryptor {
+                enc.encrypt_in_place(&mut data_to_send)?;
+            }
+            let compression_flag = if config.enable_compression && data_to_send.len() < bytes_read {
+                0x01
+            } else {
+                0x00
+            };
+            (compression_flag, data_to_send)
         };
-        packet.push(compression_flag);
+
+        // Send packet: frame type (1) + size (8) + data
+        let mut packet = Vec::with_capacity(9 + data_to_send.len());
+        packet.push(frame_type);
         packet.extend_from_slice(&(data_to_send.len() as u64).to_le_bytes());
         packet.extend_from_slice(&data_to_send);
         
@@ -377,12 +352,13 @@ async fn transfer_range_tcp(
 async fn transfer_range_stream(
     thread_id: usize,
     range: FileRange,
-    file: Arc<File>,
+    file: FileReader,
     mut stream: Box<dyn TransportStreamTrait>,
     config: TransferConfig,
     progress: Option<ProgressHandle>,
-    hasher_tx: Option<mpsc::Sender<(u64, Vec<u8>)>>,
     metrics_tx: Option<mpsc::Sender<StreamReport>>,
+    enable_fec_auto: Option<&AtomicBool>,
+    cancel: Option<&CancellationToken>,
 ) -> Result<u64, TransferError> {
     tracing::debug!(
         thread_id,
@@ -423,40 +399,69 @@ async fn transfer_range_stream(
     const SEND_RETRY_MAX: u32 = 120;
 
     while offset < range.end {
+        if cancel.map(|c| c.is_cancelled()).unwrap_or(false) {
+            return Err(TransferError::Cancelled);
+        }
         let chunk_start = Instant::now();
         let remaining = (range.end - offset) as usize;
         let read_size = buffer.len().min(remaining);
 
-        let bytes_read = read_at(&file, &mut buffer[..read_size], offset)?;
+        let bytes_read = file.read_at(&mut buffer[..read_size], offset).await?;
 
         if bytes_read == 0 {
             break;
         }
 
-        if let Some(ref tx) = hasher_tx {
-            let plaintext = buffer[..bytes_read].to_vec();
-            let _ = tx.send((offset, plaintext)).await;
+        if cancel.map(|c| c.is_cancelled()).unwrap_or(false) {
+            return Err(TransferError::Cancelled);
         }
 
-        let mut data_to_send = buffer[..bytes_read].to_vec();
-
-        if config.enable_compression && should_compress(&data_to_send) {
-            if let Ok(compressed) = compress(&data_to_send) {
-                data_to_send = compressed;
+        let use_fec = config.enable_fec
+            || enable_fec_auto.map(|a| a.load(Ordering::Relaxed)).unwrap_or(false);
+        let (frame_type, data_to_send) = if use_fec {
+            #[cfg(feature = "fec")]
+            {
+                let fec_payload = crate::fec::encode_block(
+                    &buffer[..bytes_read],
+                    crate::fec::DEFAULT_FEC_SYMBOL_SIZE,
+                    config.fec_repair_packets,
+                )?;
+                (DATA_FRAME_FEC, fec_payload)
             }
-        }
-
-        if let Some(ref mut enc) = encryptor {
-            enc.encrypt_in_place(&mut data_to_send)?;
-        }
+            #[cfg(not(feature = "fec"))]
+            {
+                let mut data = buffer[..bytes_read].to_vec();
+                if config.enable_compression && should_compress(&data) {
+                    if let Ok(c) = compress(&data) {
+                        data = c;
+                    }
+                }
+                if let Some(ref mut enc) = encryptor {
+                    enc.encrypt_in_place(&mut data)?;
+                }
+                let flag = if config.enable_compression && data.len() < bytes_read { 0x01 } else { 0x00 };
+                (flag, data)
+            }
+        } else {
+            let mut data_to_send = buffer[..bytes_read].to_vec();
+            if config.enable_compression && should_compress(&data_to_send) {
+                if let Ok(compressed) = compress(&data_to_send) {
+                    data_to_send = compressed;
+                }
+            }
+            if let Some(ref mut enc) = encryptor {
+                enc.encrypt_in_place(&mut data_to_send)?;
+            }
+            let compression_flag = if config.enable_compression && data_to_send.len() < bytes_read {
+                0x01
+            } else {
+                0x00
+            };
+            (compression_flag, data_to_send)
+        };
 
         let mut packet = Vec::with_capacity(9 + data_to_send.len());
-        let compression_flag = if config.enable_compression && data_to_send.len() < bytes_read {
-            0x01
-        } else {
-            0x00
-        };
-        packet.push(compression_flag);
+        packet.push(frame_type);
         packet.extend_from_slice(&(data_to_send.len() as u64).to_le_bytes());
         packet.extend_from_slice(&data_to_send);
 
@@ -509,26 +514,28 @@ async fn transfer_range_stream(
     Ok(total_sent)
 }
 
-/// Coordinator state for one active worker: last activity time (for stall detection) and join handle.
+/// Coordinator state for one active worker: last activity time (for stall detection), join handle, and cancellation token (cancel on stall so worker stops sending to hasher).
 struct WorkerState {
     last_active: Instant,
     handle: tokio::task::JoinHandle<()>,
+    cancel: CancellationToken,
 }
 
 /// One TCP stream worker: pulls ranges from queue, connects to pre-assigned port, sends range, reports completion or requeues on error.
 async fn tcp_stream_worker(
     id: WorkerId,
     queue: Arc<RangeQueue>,
-    file: Arc<File>,
+    file: FileReader,
     file_path: PathBuf,
     config: TransferConfig,
     server_ip: std::net::IpAddr,
     base_port: u16,
     progress: Option<ProgressHandle>,
-    hasher_tx: Option<mpsc::Sender<(u64, Vec<u8>)>>,
     metrics_tx: Option<mpsc::Sender<StreamReport>>,
-    completed_tx: mpsc::Sender<(FileRange, [u8; BLAKE3_LEN])>,
+    completed_tx: mpsc::Sender<(WorkerId, FileRange, [u8; BLAKE3_LEN])>,
     done_tx: mpsc::Sender<(WorkerId, Result<(), TransferError>)>,
+    enable_fec_auto: Option<Arc<AtomicBool>>,
+    cancel: CancellationToken,
 ) {
     let target_port = base_port + 1 + id as u16;
     loop {
@@ -553,11 +560,15 @@ async fn tcp_stream_worker(
             let std_stream = std::net::TcpStream::from(socket);
             let stream = TcpStream::from_std(std_stream)
                 .map_err(|e| TransferError::NetworkError(format!("Failed to convert to tokio stream: {}", e)))?;
-            transfer_range_tcp(id, range, file.clone(), stream, config.clone(), progress.clone(), hasher_tx.clone(), metrics_tx.clone()).await
+            transfer_range_tcp(id, range, file.clone(), stream, config.clone(), progress.clone(), metrics_tx.clone(), enable_fec_auto.as_deref(), Some(&cancel)).await
         }
         .await;
         match result {
             Ok(_) => {
+                if cancel.is_cancelled() {
+                    let _ = done_tx.send((id, Ok(()))).await;
+                    return;
+                }
                 let range_hash = match hash_file_range_path(&file_path, range.start, range.end) {
                     Ok(h) => h,
                     Err(e) => {
@@ -566,8 +577,17 @@ async fn tcp_stream_worker(
                         return;
                     }
                 };
-                let _ = completed_tx.send((range, range_hash)).await;
+                let _ = completed_tx.send((id, range, range_hash)).await;
                 queue.complete(id);
+                // If we were marked stalled, exit without popping again (avoid re-sending same range).
+                if cancel.is_cancelled() {
+                    let _ = done_tx.send((id, Ok(()))).await;
+                    return;
+                }
+            }
+            Err(TransferError::Cancelled) => {
+                let _ = done_tx.send((id, Ok(()))).await;
+                return;
             }
             Err(e) => {
                 queue.requeue(id);
@@ -584,14 +604,15 @@ async fn transport_stream_worker(
     id: WorkerId,
     opener: Arc<dyn StreamOpener>,
     queue: Arc<RangeQueue>,
-    file: Arc<File>,
+    file: FileReader,
     file_path: PathBuf,
     config: TransferConfig,
     progress: Option<ProgressHandle>,
-    hasher_tx: Option<mpsc::Sender<(u64, Vec<u8>)>>,
     metrics_tx: mpsc::Sender<StreamReport>,
-    completed_tx: mpsc::Sender<(FileRange, [u8; BLAKE3_LEN])>,
+    completed_tx: mpsc::Sender<(WorkerId, FileRange, [u8; BLAKE3_LEN])>,
     done_tx: mpsc::Sender<(WorkerId, Result<(), TransferError>)>,
+    enable_fec_auto: Option<Arc<AtomicBool>>,
+    cancel: CancellationToken,
 ) {
     loop {
         let range = match queue.pop() {
@@ -615,12 +636,17 @@ async fn transport_stream_worker(
             stream,
             config.clone(),
             progress.clone(),
-            hasher_tx.clone(),
             Some(metrics_tx.clone()),
+            enable_fec_auto.as_deref(),
+            Some(&cancel),
         )
         .await;
         match result {
             Ok(_) => {
+                if cancel.is_cancelled() {
+                    let _ = done_tx.send((id, Ok(()))).await;
+                    return;
+                }
                 let range_hash = match hash_file_range_path(&file_path, range.start, range.end) {
                     Ok(h) => h,
                     Err(e) => {
@@ -629,8 +655,16 @@ async fn transport_stream_worker(
                         return;
                     }
                 };
-                let _ = completed_tx.send((range, range_hash)).await;
+                let _ = completed_tx.send((id, range, range_hash)).await;
                 queue.complete(id);
+                if cancel.is_cancelled() {
+                    let _ = done_tx.send((id, Ok(()))).await;
+                    return;
+                }
+            }
+            Err(TransferError::Cancelled) => {
+                let _ = done_tx.send((id, Ok(()))).await;
+                return;
             }
             Err(e) => {
                 queue.requeue(id);
@@ -642,17 +676,20 @@ async fn transport_stream_worker(
     let _ = done_tx.send((id, Ok(()))).await;
 }
 
-/// Receive a file range over a single TCP connection.
-/// If `hasher_tx` is Some, plaintext bytes written are fed to the receive-side hasher (bytes actually written).
-pub async fn receive_range_tcp(
+/// Receive a file range over a single TCP (or TLS) connection.
+/// If `range_hash_tx` is Some, BLAKE3 of this range's plaintext is sent on completion (for optional per-range verification).
+pub async fn receive_range_tcp<S>(
     thread_id: usize,
     file: Arc<File>,
-    mut stream: tokio::net::TcpStream,
+    stream: S,
     config: TransferConfig,
     progress: Option<ProgressHandle>,
-    hasher_tx: Option<mpsc::Sender<(u64, Vec<u8>)>>,
-) -> Result<u64, TransferError> {
-    let (mut reader, _writer) = stream.split();
+    range_hash_tx: Option<mpsc::Sender<(FileRange, [u8; BLAKE3_LEN])>>,
+) -> Result<u64, TransferError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    let (mut reader, _writer) = tokio::io::split(stream);
 
     // Read range header: start (8) + end (8) + flags (1)
     let mut start_buf = [0u8; 8];
@@ -695,15 +732,26 @@ pub async fn receive_range_tcp(
     let mut decompress_buffer = Vec::new();
     let mut total_received = 0u64;
 
+    let range_len = end_offset - start_offset;
+    let range = FileRange { start: start_offset, end: end_offset };
+    let mut range_hasher = range_hash_tx.is_some().then(blake3::Hasher::new);
     while offset < end_offset {
         let remaining = (end_offset - offset) as usize;
         let read_size = buffer.len().min(remaining);
 
-        // Read packet: compression flag (1) + size (8) + data
+        // Read packet: compression flag (1) + size (8) + data. EOF/closed here after full range = sender closed, success.
         let mut flag_buf = [0u8; 1];
-        reader.read_exact(&mut flag_buf).await
-            .map_err(|e| TransferError::NetworkError(format!("Failed to read compression flag: {}", e)))?;
-        
+        match reader.read_exact(&mut flag_buf).await {
+            Ok(_) => {}
+            Err(e) => {
+                // Sender closes stream after last chunk; treat any read error as success if we got the full range.
+                if total_received >= range_len {
+                    return Ok(total_received);
+                }
+                return Err(TransferError::NetworkError(format!("Failed to read compression flag: {}", e)));
+            }
+        }
+
         let mut size_buf = [0u8; 8];
         reader.read_exact(&mut size_buf).await
             .map_err(|e| TransferError::NetworkError(format!("Failed to read data size: {}", e)))?;
@@ -723,32 +771,48 @@ pub async fn receive_range_tcp(
             let plaintext_len = dec.decrypt_in_place(&mut data_buf)?;
             data_buf.truncate(plaintext_len);
         }
-        
-        // Decompress if needed
-        let bytes_read = if flag_buf[0] == 0x01 {
-            decompress_buffer = decompress(&data_buf, read_size)?;
-            decompress_buffer.len()
+
+        // FEC block (0x02): decode then use decoded payload as this chunk
+        let (bytes_read, data) = if flag_buf[0] == DATA_FRAME_FEC {
+            #[cfg(feature = "fec")]
+            {
+                let decoded = crate::fec::decode_fec_block(&data_buf)?
+                    .ok_or_else(|| TransferError::ProtocolError("FEC decode failed (insufficient packets)".to_string()))?;
+                let len = decoded.len();
+                decompress_buffer = decoded;
+                (len, decompress_buffer[..].as_ref())
+            }
+            #[cfg(not(feature = "fec"))]
+            return Err(TransferError::ProtocolError("Received FEC block but FEC support not compiled in".to_string()));
         } else {
-            // Copy uncompressed data to buffer
-            let copy_len = data_buf.len().min(buffer.len());
-            buffer[..copy_len].copy_from_slice(&data_buf[..copy_len]);
-            copy_len
+            // Decompress if needed (0x01) or raw (0x00)
+            let bytes_read = if flag_buf[0] == 0x01 {
+                decompress_buffer = decompress(&data_buf, read_size)?;
+                decompress_buffer.len()
+            } else {
+                let copy_len = data_buf.len().min(buffer.len());
+                buffer[..copy_len].copy_from_slice(&data_buf[..copy_len]);
+                copy_len
+            };
+
+            if bytes_read == 0 {
+                break;
+            }
+
+            let data: &[u8] = if flag_buf[0] == 0x01 && !decompress_buffer.is_empty() {
+                &decompress_buffer[..bytes_read]
+            } else {
+                &buffer[..bytes_read]
+            };
+            (bytes_read, data)
         };
-        
+
         if bytes_read == 0 {
             break;
         }
-        
-        // Determine which buffer to use for writing
-        let data = if flag_buf[0] == 0x01 && !decompress_buffer.is_empty() {
-            &decompress_buffer[..bytes_read]
-        } else {
-            &buffer[..bytes_read]
-        };
 
-        // Feed plaintext to receive-side hasher (same granularity as write). See docs/INTEGRITY_DESIGN.md.
-        if let Some(ref tx) = hasher_tx {
-            let _ = tx.send((offset, data.to_vec())).await;
+        if let Some(ref mut h) = range_hasher {
+            h.update(data);
         }
 
         // Use pwrite for thread-safe writes (Unix) or seek+write (other platforms)
@@ -802,6 +866,12 @@ pub async fn receive_range_tcp(
         ));
     }
 
+    if let Some(tx) = range_hash_tx {
+        if let Some(h) = range_hasher {
+            let _ = tx.send((range, *h.finalize().as_bytes())).await;
+        }
+    }
+
     // Sync file data to ensure it's written to disk
     #[cfg(unix)]
     {
@@ -835,7 +905,7 @@ pub(crate) async fn receive_range_stream(
     mut stream: Box<dyn TransportStreamTrait>,
     config: TransferConfig,
     progress: Option<ProgressHandle>,
-    hasher_tx: Option<mpsc::Sender<(u64, Vec<u8>)>>,
+    range_hash_tx: Option<mpsc::Sender<(FileRange, [u8; BLAKE3_LEN])>>,
 ) -> Result<u64, TransferError> {
     let mut start_buf = [0u8; 8];
     stream.read_exact(&mut start_buf).await
@@ -861,6 +931,9 @@ pub(crate) async fn receive_range_stream(
     } else {
         None
     };
+
+    let range = FileRange { start: start_offset, end: end_offset };
+    let mut range_hasher = range_hash_tx.is_some().then(blake3::Hasher::new);
 
     tracing::debug!(
         thread_id,
@@ -901,27 +974,45 @@ pub(crate) async fn receive_range_stream(
             data_buf.truncate(plaintext_len);
         }
 
-        let bytes_read = if flag_buf[0] == 0x01 {
-            decompress_buffer = decompress(&data_buf, read_size)?;
-            decompress_buffer.len()
+        let (bytes_read, data) = if flag_buf[0] == DATA_FRAME_FEC {
+            #[cfg(feature = "fec")]
+            {
+                let decoded = crate::fec::decode_fec_block(&data_buf)?
+                    .ok_or_else(|| TransferError::ProtocolError("FEC decode failed (insufficient packets)".to_string()))?;
+                let len = decoded.len();
+                decompress_buffer = decoded;
+                (len, decompress_buffer[..].as_ref())
+            }
+            #[cfg(not(feature = "fec"))]
+            return Err(TransferError::ProtocolError("Received FEC block but FEC support not compiled in".to_string()));
         } else {
-            let copy_len = data_buf.len().min(buffer.len());
-            buffer[..copy_len].copy_from_slice(&data_buf[..copy_len]);
-            copy_len
+            let bytes_read = if flag_buf[0] == 0x01 {
+                decompress_buffer = decompress(&data_buf, read_size)?;
+                decompress_buffer.len()
+            } else {
+                let copy_len = data_buf.len().min(buffer.len());
+                buffer[..copy_len].copy_from_slice(&data_buf[..copy_len]);
+                copy_len
+            };
+
+            if bytes_read == 0 {
+                break;
+            }
+
+            let data: &[u8] = if flag_buf[0] == 0x01 && !decompress_buffer.is_empty() {
+                &decompress_buffer[..bytes_read]
+            } else {
+                &buffer[..bytes_read]
+            };
+            (bytes_read, data)
         };
 
         if bytes_read == 0 {
             break;
         }
 
-        let data = if flag_buf[0] == 0x01 && !decompress_buffer.is_empty() {
-            &decompress_buffer[..bytes_read]
-        } else {
-            &buffer[..bytes_read]
-        };
-
-        if let Some(ref tx) = hasher_tx {
-            let _ = tx.send((offset, data.to_vec())).await;
+        if let Some(ref mut h) = range_hasher {
+            h.update(data);
         }
 
         #[cfg(unix)]
@@ -970,6 +1061,12 @@ pub(crate) async fn receive_range_stream(
         ));
     }
 
+    if let Some(tx) = range_hash_tx {
+        if let Some(h) = range_hasher {
+            let _ = tx.send((range, *h.finalize().as_bytes())).await;
+        }
+    }
+
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
@@ -993,10 +1090,12 @@ pub(crate) async fn receive_range_stream(
 }
 
 /// Send a file using parallel TCP connections.
+/// When `file_reader` is `Some` (e.g. `FileReader::Uring` from inside `tokio_uring::start()`), it is used for reads; otherwise the file is opened with `open_file_optimized`.
 pub async fn send_file_tcp(
     file_path: &std::path::Path,
     server_addr: SocketAddr,
     config: TransferConfig,
+    file_reader: Option<FileReader>,
 ) -> Result<u64, TransferError> {
     let metadata = std::fs::metadata(file_path)?;
     let file_size = metadata.len();
@@ -1240,30 +1339,22 @@ pub async fn send_file_tcp(
         );
     }
 
-    // Open file with optimizations (O_DIRECT for large files on Linux)
-    let file = Arc::new(open_file_optimized(file_path, file_size)?);
+    let file = match file_reader {
+        Some(r) => r,
+        None => FileReader::std(open_file_optimized(file_path, file_size)?),
+    };
 
-    // Full transfer: hash = bytes we actually send (hasher task). Resume: we only send
-    // missing ranges so we can't get full-file hash from bytes-sent; use one read at start.
+    // Full transfer: final hash = combine per-range BLAKE3 hashes (no streaming). Resume: full-file hash at start.
     let resume_hash = if is_resume {
         Some(hash_file(file_path, file_size)?)
     } else {
         None
     };
-    // Bounded channel so fast senders can't flood the hasher (backpressure). Each chunk is
-    // at most buffer_size; 64 slots cap memory. See docs/INTEGRITY_DESIGN.md.
-    let (hasher_tx, hasher_handle) = if resume_hash.is_none() {
-        let (tx, rx) = mpsc::channel(64);
-        let handle = tokio::spawn(async move { run_ordered_hasher(rx, file_size).await });
-        (Some(tx), Some(handle))
-    } else {
-        (None, None)
-    };
 
     // Range queue: workers pull from pending, report completion or requeue on error. Coordinator updates checkpoint, stall detection, and smart scale-up.
     let num_pending = missing_ranges.len();
     let queue = Arc::new(RangeQueue::new(missing_ranges));
-    let (completed_tx, mut completed_rx) = mpsc::channel::<(FileRange, [u8; BLAKE3_LEN])>(64);
+    let (completed_tx, mut completed_rx) = mpsc::channel::<(WorkerId, FileRange, [u8; BLAKE3_LEN])>(64);
     let (done_tx, mut done_rx) = mpsc::channel::<(WorkerId, Result<(), TransferError>)>(32);
     let (metrics_tx, mut metrics_rx) = mpsc::channel::<StreamReport>(256);
     let base_port = server_addr.port();
@@ -1272,29 +1363,42 @@ pub async fn send_file_tcp(
     let num_workers_initial = config.num_streams.min(num_pending).max(1);
     let mut next_worker_id = num_workers_initial;
     let mut active_workers: std::collections::HashMap<WorkerId, WorkerState> = std::collections::HashMap::new();
+    let mut completed_worker_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut completed_ranges: Vec<(FileRange, [u8; BLAKE3_LEN])> = Vec::new();
+    let mut stale_completions: HashSet<(WorkerId, u64, u64)> = HashSet::new();
     let mut estimator = BandwidthEstimator::new(10);
     let mut last_change = Instant::now();
 
+    #[cfg(feature = "fec")]
+    let enable_fec_auto: Option<Arc<AtomicBool>> = if config.fec_negotiated {
+        Some(Arc::new(AtomicBool::new(false)))
+    } else {
+        None
+    };
+    #[cfg(not(feature = "fec"))]
+    let enable_fec_auto: Option<Arc<AtomicBool>> = None;
+
     let spawn_worker = |id: WorkerId,
                         queue: &Arc<RangeQueue>,
-                        file: &Arc<File>,
+                        file: &FileReader,
                         file_path_buf: &PathBuf,
                         config: &TransferConfig,
                         progress_handle: &ProgressHandle,
-                        hasher_tx: &Option<mpsc::Sender<(u64, Vec<u8>)>>,
                         metrics_tx: &mpsc::Sender<StreamReport>,
-                        completed_tx: &mpsc::Sender<(FileRange, [u8; BLAKE3_LEN])>,
-                        done_tx: &mpsc::Sender<(WorkerId, Result<(), TransferError>)>|
+                        completed_tx: &mpsc::Sender<(WorkerId, FileRange, [u8; BLAKE3_LEN])>,
+                        done_tx: &mpsc::Sender<(WorkerId, Result<(), TransferError>)>,
+                        enable_fec_auto: &Option<Arc<AtomicBool>>,
+                        cancel_child: CancellationToken|
      -> tokio::task::JoinHandle<()> {
         let queue = Arc::clone(queue);
-        let file = Arc::clone(file);
+        let file = file.clone();
         let file_path = file_path_buf.clone();
         let config = config.clone();
         let progress = progress_handle.clone();
-        let hasher_tx = hasher_tx.clone();
         let metrics_tx = metrics_tx.clone();
         let completed_tx = completed_tx.clone();
         let done_tx = done_tx.clone();
+        let enable_fec_auto = enable_fec_auto.clone();
         tokio::spawn(async move {
             tcp_stream_worker(
                 id,
@@ -1305,16 +1409,19 @@ pub async fn send_file_tcp(
                 server_ip,
                 base_port,
                 Some(progress),
-                hasher_tx,
                 Some(metrics_tx),
                 completed_tx,
                 done_tx,
+                enable_fec_auto,
+                cancel_child,
             )
             .await
         })
     };
 
     for id in 0..num_workers_initial {
+        let cancel = CancellationToken::new();
+        let cancel_child = cancel.child_token();
         let handle = spawn_worker(
             id,
             &queue,
@@ -1322,12 +1429,13 @@ pub async fn send_file_tcp(
             &file_path_buf,
             &config,
             &progress_handle,
-            &hasher_tx,
             &metrics_tx,
             &completed_tx,
             &done_tx,
+            &enable_fec_auto,
+            cancel_child,
         );
-        active_workers.insert(id, WorkerState { last_active: Instant::now(), handle });
+        active_workers.insert(id, WorkerState { last_active: Instant::now(), handle, cancel });
     }
 
     let mut interval = interval(Duration::from_secs(2));
@@ -1335,9 +1443,15 @@ pub async fn send_file_tcp(
         tokio::select! {
             completed = completed_rx.recv() => {
                 match completed {
-                    Some((range, range_hash)) => {
-                        checkpoint.mark_completed(range, range_hash);
-                        checkpoint.save(&checkpoint_path)?;
+                    Some((id, range, range_hash)) => {
+                        let key = (id, range.start, range.end);
+                        if stale_completions.remove(&key) {
+                            tracing::debug!("discarding stale completion for requeued range");
+                        } else {
+                            checkpoint.mark_completed(range, range_hash);
+                            checkpoint.save(&checkpoint_path)?;
+                            completed_ranges.push((range, range_hash));
+                        }
                     }
                     None => break,
                 }
@@ -1353,12 +1467,16 @@ pub async fn send_file_tcp(
             done = done_rx.recv() => {
                 match done {
                     Some((id, result)) => {
-                        active_workers.remove(&id);
+                        if let Some(state) = active_workers.remove(&id) {
+                            completed_worker_handles.push(state.handle);
+                        }
                         if result.is_err() {
                             queue.requeue(id);
                             if !queue.is_done() {
-                                let handle = spawn_worker(id, &queue, &file, &file_path_buf, &config, &progress_handle, &hasher_tx, &metrics_tx, &completed_tx, &done_tx);
-                                active_workers.insert(id, WorkerState { last_active: Instant::now(), handle });
+                                let cancel = CancellationToken::new();
+                                let cancel_child = cancel.child_token();
+                                let handle = spawn_worker(id, &queue, &file, &file_path_buf, &config, &progress_handle, &metrics_tx, &completed_tx, &done_tx, &enable_fec_auto, cancel_child);
+                                active_workers.insert(id, WorkerState { last_active: Instant::now(), handle, cancel });
                             }
                         }
                     }
@@ -1366,20 +1484,38 @@ pub async fn send_file_tcp(
                 }
             }
             _ = interval.tick() => {
-                let stall_threshold = Duration::from_millis((rtt_ms * 2).max(4000));
+                let stall_threshold = if cfg!(debug_assertions) {
+                    Duration::from_secs(60)
+                } else {
+                    Duration::from_millis((rtt_ms * 2).max(15_000))
+                };
                 let stalled: Vec<WorkerId> = active_workers
                     .iter()
                     .filter(|(_, s)| s.last_active.elapsed() > stall_threshold)
                     .map(|(id, _)| *id)
                     .collect();
+                #[cfg(feature = "fec")]
+                if !stalled.is_empty() {
+                    if let Some(ref auto) = enable_fec_auto {
+                        if !auto.load(Ordering::Relaxed) {
+                            auto.store(true, Ordering::Relaxed);
+                            tracing::info!("loss-like stall detected, enabling FEC for remaining chunks");
+                        }
+                    }
+                }
                 for id in stalled {
                     if let Some(state) = active_workers.remove(&id) {
+                        state.cancel.cancel();
                         state.handle.abort();
                     }
-                    queue.requeue(id);
+                    if let Some(range) = queue.requeue_returning_range(id) {
+                        stale_completions.insert((id, range.start, range.end));
+                    }
                     if !queue.is_done() {
-                        let handle = spawn_worker(id, &queue, &file, &file_path_buf, &config, &progress_handle, &hasher_tx, &metrics_tx, &completed_tx, &done_tx);
-                        active_workers.insert(id, WorkerState { last_active: Instant::now(), handle });
+                        let cancel = CancellationToken::new();
+                        let cancel_child = cancel.child_token();
+                        let handle = spawn_worker(id, &queue, &file, &file_path_buf, &config, &progress_handle, &metrics_tx, &completed_tx, &done_tx, &enable_fec_auto, cancel_child);
+                        active_workers.insert(id, WorkerState { last_active: Instant::now(), handle, cancel });
                     }
                     tracing::warn!(worker_id = id, "worker stalled, requeuing range");
                 }
@@ -1392,8 +1528,10 @@ pub async fn send_file_tcp(
                 if can_scale && should_scale && cooldown_ok {
                     let id_new = next_worker_id;
                     next_worker_id += 1;
-                    let handle = spawn_worker(id_new, &queue, &file, &file_path_buf, &config, &progress_handle, &hasher_tx, &metrics_tx, &completed_tx, &done_tx);
-                    active_workers.insert(id_new, WorkerState { last_active: Instant::now(), handle });
+                    let cancel = CancellationToken::new();
+                    let cancel_child = cancel.child_token();
+                    let handle = spawn_worker(id_new, &queue, &file, &file_path_buf, &config, &progress_handle, &metrics_tx, &completed_tx, &done_tx, &enable_fec_auto, cancel_child);
+                    active_workers.insert(id_new, WorkerState { last_active: Instant::now(), handle, cancel });
                     last_change = Instant::now();
                 }
 
@@ -1410,25 +1548,26 @@ pub async fn send_file_tcp(
     let worker_ids: Vec<WorkerId> = active_workers.keys().cloned().collect();
     for id in worker_ids {
         if let Some(state) = active_workers.remove(&id) {
-            let _ = state.handle.await;
+            completed_worker_handles.push(state.handle);
         }
+    }
+    for h in completed_worker_handles {
+        let _ = h.await;
     }
     while completed_rx.recv().await.is_some() {}
     while done_rx.recv().await.is_some() {}
 
     let total_sent = progress_handle.transferred.load(Ordering::Relaxed);
 
-    // Hash: full transfer = bytes we just sent; resume = full file at start of this run
-    let file_hash = match (resume_hash, hasher_handle) {
-        (Some(h), _) => h,
-        (None, Some(handle)) => {
-            drop(hasher_tx);
-            handle
+    let file_hash = match resume_hash {
+        Some(h) => h,
+        None => {
+            let path = file_path.to_path_buf();
+            tokio::task::spawn_blocking(move || hash_file(&path, file_size))
                 .await
-                .map_err(|e| TransferError::NetworkError(format!("Hasher task panicked: {:?}", e)))?
-                .map_err(|e| TransferError::ProtocolError(format!("Hasher: {}", e)))?
+                .map_err(|e| TransferError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e))))?
+                ?
         }
-        (None, None) => unreachable!("full transfer always spawns hasher"),
     };
     // Framed hash message: 0x03 (type) + 32 bytes (BLAKE3). See docs/INTEGRITY_DESIGN.md.
     writer.write_all(&[msg::HASH]).await.map_err(|e| {
@@ -1489,6 +1628,7 @@ pub async fn send_file_tcp(
 /// Send a file over a transport (TCP or QUIC). Uses same protocol as send_file_tcp.
 /// If `stats_out` is `Some`, it is filled with transfer report data on success (for --stats / --json).
 /// If `skip_unchanged` is true, send CHECK_HASH first and skip transfer when server already has this hash (--update).
+/// When `file_reader` is `Some` (e.g. `FileReader::Uring` from inside `tokio_uring::start()`), it is used for reads.
 pub async fn send_file_over_transport(
     transport: &dyn Transport,
     file_path: &std::path::Path,
@@ -1496,6 +1636,7 @@ pub async fn send_file_over_transport(
     config: TransferConfig,
     stats_out: Option<&mut TransferReport>,
     skip_unchanged: bool,
+    file_reader: Option<FileReader>,
 ) -> Result<u64, TransferError> {
     let metadata = std::fs::metadata(file_path)?;
     let file_size = metadata.len();
@@ -1597,7 +1738,11 @@ pub async fn send_file_over_transport(
 
     // --update: optional skip check (CHECK_HASH). If server has same hash, skip transfer.
     if skip_unchanged {
-        let file_hash = hash_file(file_path, file_size)?;
+        let skip_start = std::time::Instant::now();
+        let path_buf = file_path.to_path_buf();
+        let file_hash = tokio::task::spawn_blocking(move || hash_file(&path_buf, file_size))
+            .await
+            .map_err(|e| TransferError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))??;
         writer.write_all(&[msg::CHECK_HASH]).await
             .map_err(|e| TransferError::NetworkError(format!("Failed to send CHECK_HASH: {}", e)))?;
         writer.write_all(&(filename.len() as u64).to_le_bytes()).await
@@ -1612,6 +1757,15 @@ pub async fn send_file_over_transport(
         if reply[0] == msg::HAVE_HASH {
             tracing::debug!(file = %filename, "Server already has file (unchanged), skipping");
             eprintln!("Skipped (unchanged): {}", filename);
+            let duration_ms = skip_start.elapsed().as_millis() as u64;
+            if let Some(out) = stats_out {
+                out.status = TransferStatus::Skipped { reason: "unchanged" };
+                out.reason = Some("unchanged");
+                out.bytes = 0;
+                out.bytes_checked = file_size;
+                out.duration_ms = duration_ms;
+                out.transport = transport.name().to_string();
+            }
             return Ok(0);
         }
         if reply[0] != msg::NEED_FILE {
@@ -1735,35 +1889,42 @@ pub async fn send_file_over_transport(
         );
     }
 
-    let file = Arc::new(open_file_optimized(file_path, file_size)?);
+    let file = match file_reader {
+        Some(r) => r,
+        None => FileReader::std(open_file_optimized(file_path, file_size)?),
+    };
 
     let resume_hash = if is_resume {
         Some(hash_file(file_path, file_size)?)
     } else {
         None
     };
-    let (hasher_tx, hasher_handle) = if resume_hash.is_none() {
-        let (tx, rx) = mpsc::channel(64);
-        let handle = tokio::spawn(async move { run_ordered_hasher(rx, file_size).await });
-        (Some(tx), Some(handle))
-    } else {
-        (None, None)
-    };
 
     // Unified queue + coordinator (same as send_file_tcp). Opener held here so connection stays alive until workers complete.
     let num_pending = missing_ranges.len();
     let queue = Arc::new(RangeQueue::new(missing_ranges));
-    let (completed_tx, mut completed_rx) = mpsc::channel::<(FileRange, [u8; BLAKE3_LEN])>(64);
+    let (completed_tx, mut completed_rx) = mpsc::channel::<(WorkerId, FileRange, [u8; BLAKE3_LEN])>(64);
     let (done_tx, mut done_rx) = mpsc::channel::<(WorkerId, Result<(), TransferError>)>(32);
     let (metrics_tx, mut metrics_rx) = mpsc::channel::<StreamReport>(256);
     let file_path_buf = file_path.to_path_buf();
     let num_workers_initial = config.num_streams.min(num_pending).max(1);
     let mut next_worker_id = num_workers_initial;
     let mut active_workers: std::collections::HashMap<WorkerId, WorkerState> = std::collections::HashMap::new();
+    let mut completed_worker_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut completed_ranges: Vec<(FileRange, [u8; BLAKE3_LEN])> = Vec::new();
+    let mut stale_completions: HashSet<(WorkerId, u64, u64)> = HashSet::new();
     let mut streams_peak = num_workers_initial;
     let mut streams_stalled: usize = 0;
     let mut estimator = BandwidthEstimator::new(10);
     let mut last_change = Instant::now();
+    #[cfg(feature = "fec")]
+    let enable_fec_auto: Option<Arc<AtomicBool>> = if config.fec_negotiated {
+        Some(Arc::new(AtomicBool::new(false)))
+    } else {
+        None
+    };
+    #[cfg(not(feature = "fec"))]
+    let enable_fec_auto: Option<Arc<AtomicBool>> = None;
     let transport_label = match transport.name() {
         "quic" => "⚡ QUIC",
         _ => "🔌 TCP",
@@ -1772,31 +1933,34 @@ pub async fn send_file_over_transport(
     let spawn_transport_worker = |id: WorkerId,
                                  opener: &Arc<dyn StreamOpener>,
                                  queue: &Arc<RangeQueue>,
-                                 file: &Arc<File>,
+                                 file: &FileReader,
                                  file_path_buf: &PathBuf,
                                  config: &TransferConfig,
                                  progress_handle: &ProgressHandle,
-                                 hasher_tx: &Option<mpsc::Sender<(u64, Vec<u8>)>>,
                                  metrics_tx: &mpsc::Sender<StreamReport>,
-                                 completed_tx: &mpsc::Sender<(FileRange, [u8; BLAKE3_LEN])>,
-                                 done_tx: &mpsc::Sender<(WorkerId, Result<(), TransferError>)>|
+                                 completed_tx: &mpsc::Sender<(WorkerId, FileRange, [u8; BLAKE3_LEN])>,
+                                 done_tx: &mpsc::Sender<(WorkerId, Result<(), TransferError>)>,
+                                 enable_fec_auto: &Option<Arc<AtomicBool>>,
+                                 cancel_child: CancellationToken|
      -> tokio::task::JoinHandle<()> {
         let opener = Arc::clone(opener);
         let queue = Arc::clone(queue);
-        let file = Arc::clone(file);
+        let file = file.clone();
         let file_path = file_path_buf.clone();
         let config = config.clone();
         let progress = progress_handle.clone();
-        let hasher_tx = hasher_tx.clone();
         let metrics_tx = metrics_tx.clone();
         let completed_tx = completed_tx.clone();
         let done_tx = done_tx.clone();
+        let enable_fec_auto = enable_fec_auto.clone();
         tokio::spawn(async move {
-            transport_stream_worker(id, opener, queue, file, file_path, config, Some(progress), hasher_tx, metrics_tx, completed_tx, done_tx).await
+            transport_stream_worker(id, opener, queue, file, file_path, config, Some(progress), metrics_tx, completed_tx, done_tx, enable_fec_auto, cancel_child).await
         })
     };
 
     for id in 0..num_workers_initial {
+        let cancel = CancellationToken::new();
+        let cancel_child = cancel.child_token();
         let handle = spawn_transport_worker(
             id,
             &opener,
@@ -1805,12 +1969,13 @@ pub async fn send_file_over_transport(
             &file_path_buf,
             &config,
             &progress_handle,
-            &hasher_tx,
             &metrics_tx,
             &completed_tx,
             &done_tx,
+            &enable_fec_auto,
+            cancel_child,
         );
-        active_workers.insert(id, WorkerState { last_active: Instant::now(), handle });
+        active_workers.insert(id, WorkerState { last_active: Instant::now(), handle, cancel });
     }
     progress_handle.set_message(format!("{}  {}→{}", transport_label, num_workers_initial, streams_peak));
 
@@ -1819,9 +1984,15 @@ pub async fn send_file_over_transport(
         tokio::select! {
             completed = completed_rx.recv() => {
                 match completed {
-                    Some((range, range_hash)) => {
-                        checkpoint.mark_completed(range, range_hash);
-                        checkpoint.save(&checkpoint_path)?;
+                    Some((id, range, range_hash)) => {
+                        let key = (id, range.start, range.end);
+                        if stale_completions.remove(&key) {
+                            tracing::debug!("discarding stale completion for requeued range");
+                        } else {
+                            checkpoint.mark_completed(range, range_hash);
+                            checkpoint.save(&checkpoint_path)?;
+                            completed_ranges.push((range, range_hash));
+                        }
                     }
                     None => break,
                 }
@@ -1837,12 +2008,16 @@ pub async fn send_file_over_transport(
             done = done_rx.recv() => {
                 match done {
                     Some((id, result)) => {
-                        active_workers.remove(&id);
+                        if let Some(state) = active_workers.remove(&id) {
+                            completed_worker_handles.push(state.handle);
+                        }
                         if result.is_err() {
                             queue.requeue(id);
                             if !queue.is_done() {
-                                let handle = spawn_transport_worker(id, &opener, &queue, &file, &file_path_buf, &config, &progress_handle, &hasher_tx, &metrics_tx, &completed_tx, &done_tx);
-                                active_workers.insert(id, WorkerState { last_active: Instant::now(), handle });
+                                let cancel = CancellationToken::new();
+                                let cancel_child = cancel.child_token();
+                                let handle = spawn_transport_worker(id, &opener, &queue, &file, &file_path_buf, &config, &progress_handle, &metrics_tx, &completed_tx, &done_tx, &enable_fec_auto, cancel_child);
+                                active_workers.insert(id, WorkerState { last_active: Instant::now(), handle, cancel });
                             }
                         }
                     }
@@ -1850,21 +2025,39 @@ pub async fn send_file_over_transport(
                 }
             }
             _ = interval.tick() => {
-                let stall_threshold = Duration::from_millis((rtt_ms * 2).max(4000));
+                let stall_threshold = if cfg!(debug_assertions) {
+                    Duration::from_secs(60)
+                } else {
+                    Duration::from_millis((rtt_ms * 2).max(15_000))
+                };
                 let stalled: Vec<WorkerId> = active_workers
                     .iter()
                     .filter(|(_, s)| s.last_active.elapsed() > stall_threshold)
                     .map(|(id, _)| *id)
                     .collect();
+                #[cfg(feature = "fec")]
+                if !stalled.is_empty() {
+                    if let Some(ref auto) = enable_fec_auto {
+                        if !auto.load(Ordering::Relaxed) {
+                            auto.store(true, Ordering::Relaxed);
+                            tracing::info!("loss-like stall detected, enabling FEC for remaining chunks");
+                        }
+                    }
+                }
                 for id in stalled {
                     streams_stalled += 1;
                     if let Some(state) = active_workers.remove(&id) {
+                        state.cancel.cancel();
                         state.handle.abort();
                     }
-                    queue.requeue(id);
+                    if let Some(range) = queue.requeue_returning_range(id) {
+                        stale_completions.insert((id, range.start, range.end));
+                    }
                     if !queue.is_done() {
-                        let handle = spawn_transport_worker(id, &opener, &queue, &file, &file_path_buf, &config, &progress_handle, &hasher_tx, &metrics_tx, &completed_tx, &done_tx);
-                        active_workers.insert(id, WorkerState { last_active: Instant::now(), handle });
+                        let cancel = CancellationToken::new();
+                        let cancel_child = cancel.child_token();
+                        let handle = spawn_transport_worker(id, &opener, &queue, &file, &file_path_buf, &config, &progress_handle, &metrics_tx, &completed_tx, &done_tx, &enable_fec_auto, cancel_child);
+                        active_workers.insert(id, WorkerState { last_active: Instant::now(), handle, cancel });
                     }
                     tracing::warn!(worker_id = id, "worker stalled, requeuing range");
                 }
@@ -1877,8 +2070,10 @@ pub async fn send_file_over_transport(
                 if can_scale && should_scale && cooldown_ok {
                     let id_new = next_worker_id;
                     next_worker_id += 1;
-                    let handle = spawn_transport_worker(id_new, &opener, &queue, &file, &file_path_buf, &config, &progress_handle, &hasher_tx, &metrics_tx, &completed_tx, &done_tx);
-                    active_workers.insert(id_new, WorkerState { last_active: Instant::now(), handle });
+                    let cancel = CancellationToken::new();
+                    let cancel_child = cancel.child_token();
+                    let handle = spawn_transport_worker(id_new, &opener, &queue, &file, &file_path_buf, &config, &progress_handle, &metrics_tx, &completed_tx, &done_tx, &enable_fec_auto, cancel_child);
+                    active_workers.insert(id_new, WorkerState { last_active: Instant::now(), handle, cancel });
                     last_change = Instant::now();
                 }
 
@@ -1898,24 +2093,26 @@ pub async fn send_file_over_transport(
     let worker_ids: Vec<WorkerId> = active_workers.keys().cloned().collect();
     for id in worker_ids {
         if let Some(state) = active_workers.remove(&id) {
-            let _ = state.handle.await;
+            completed_worker_handles.push(state.handle);
         }
+    }
+    for h in completed_worker_handles {
+        let _ = h.await;
     }
     while completed_rx.recv().await.is_some() {}
     while done_rx.recv().await.is_some() {}
 
     let total_sent = progress_handle.transferred.load(Ordering::Relaxed);
 
-    let file_hash = match (resume_hash, hasher_handle) {
-        (Some(h), _) => h,
-        (None, Some(handle)) => {
-            drop(hasher_tx);
-            handle
+    let file_hash = match resume_hash {
+        Some(h) => h,
+        None => {
+            let path = file_path.to_path_buf();
+            tokio::task::spawn_blocking(move || hash_file(&path, file_size))
                 .await
-                .map_err(|e| TransferError::NetworkError(format!("Hasher task panicked: {:?}", e)))?
-                .map_err(|e| TransferError::ProtocolError(format!("Hasher: {}", e)))?
+                .map_err(|e| TransferError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e))))?
+                ?
         }
-        (None, None) => unreachable!("full transfer always spawns hasher"),
     };
 
     writer.write_all(&[msg::HASH]).await.map_err(|e| {
@@ -2014,10 +2211,9 @@ pub async fn receive_file_tcp(
     // Split file into ranges (finer granularity for load balance)
     let ranges = split_file_ranges(file_size, transfer_num_ranges(num_connections));
 
-    // Optional receive-side hasher for integrity (symmetric with server path).
-    let (hasher_tx, hasher_rx) = if expected_hash.is_some() {
-        let (tx, rx) = mpsc::channel(64);
-        (Some(tx), Some(tokio::spawn(async move { run_ordered_hasher(rx, file_size).await })))
+    let (range_hash_tx, range_hash_rx) = if expected_hash.is_some() {
+        let (tx, rx) = mpsc::channel::<(FileRange, [u8; BLAKE3_LEN])>(64);
+        (Some(tx), Some(rx))
     } else {
         (None, None)
     };
@@ -2027,7 +2223,7 @@ pub async fn receive_file_tcp(
         let file = Arc::clone(&file);
         let config = config.clone();
         let listen_port = base_port + thread_id as u16;
-        let range_hasher_tx = hasher_tx.clone();
+        let range_hash_tx = range_hash_tx.clone();
 
         let handle = tokio::spawn(async move {
             let socket = Socket::new(Domain::IPV4, Type::STREAM, None)
@@ -2058,7 +2254,7 @@ pub async fn receive_file_tcp(
             let (stream, _) = listener.accept().await
                 .map_err(|e| TransferError::NetworkError(format!("Accept failed: {}", e)))?;
 
-            receive_range_tcp(thread_id, file, stream, config, None, range_hasher_tx).await
+            receive_range_tcp(thread_id, file, stream, config, None, range_hash_tx).await
         });
 
         handles.push(handle);
@@ -2072,22 +2268,32 @@ pub async fn receive_file_tcp(
                 info!(thread_id, bytes, "Connection completed");
             }
             Ok(Err(e)) => {
-                drop(hasher_tx);
+                drop(range_hash_tx);
                 return Err(e);
             }
             Err(e) => {
-                drop(hasher_tx);
+                drop(range_hash_tx);
                 return Err(TransferError::NetworkError(format!("Connection panicked: {:?}", e)));
             }
         }
     }
 
-    if let (Some(expected), Some(hasher_handle)) = (expected_hash, hasher_rx) {
-        drop(hasher_tx);
-        let actual_hash = hasher_handle
-            .await
-            .map_err(|e| TransferError::NetworkError(format!("Receive hasher task panicked: {:?}", e)))?
-            .map_err(|e| TransferError::ProtocolError(format!("Receive hasher: {}", e)))?;
+    if let (Some(expected), Some(mut rx)) = (expected_hash, range_hash_rx) {
+        drop(range_hash_tx);
+        while rx.recv().await.is_some() {}
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let f = std::fs::File::open(output_path)?;
+            let fd = f.as_raw_fd();
+            unsafe { libc::fsync(fd); }
+        }
+        #[cfg(not(unix))]
+        {
+            let f = std::fs::File::open(output_path)?;
+            f.sync_all()?;
+        }
+        let actual_hash = hash_file(output_path, file_size)?;
         if actual_hash != expected {
             return Err(TransferError::IntegrityCheckFailed(
                 "BLAKE3 mismatch on standalone receive".to_string(),

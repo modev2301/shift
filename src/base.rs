@@ -67,6 +67,8 @@ pub mod cap_flags {
     pub const QUIC: u8 = 1 << 4;
     /// Both sides support RTT probe (PING/PONG) on control channel before metadata.
     pub const RTT_PROBE: u8 = 1 << 5;
+    /// Both sides support FEC (RaptorQ) on data channel; frame type 0x02 = FEC block.
+    pub const FEC: u8 = 1 << 6;
 }
 
 /// Wire size of Capabilities (LE: version, flags, max_streams, initial_streams, max_buffer, platform, reserved).
@@ -146,6 +148,11 @@ pub fn capabilities_from_config(config: &TransferConfig) -> Capabilities {
     flags |= BLAKE3;
     flags |= RANGE_HASHES;
     flags |= RTT_PROBE;
+    // Advertise FEC support when built with fec so receiver is ready; enable_fec can be turned on mid-transfer (auto-trigger).
+    #[cfg(feature = "fec")]
+    {
+        flags |= cap_flags::FEC;
+    }
     let platform = if cfg!(target_os = "linux") {
         1
     } else if cfg!(target_os = "windows") {
@@ -175,6 +182,13 @@ pub fn apply_capabilities_to_config(config: &TransferConfig, cap: Capabilities) 
     c.buffer_size = cap.max_buffer as usize;
     c.enable_compression = (cap.flags & COMPRESSION) != 0;
     c.enable_encryption = (cap.flags & ENCRYPTION) != 0;
+    // Only enable FEC at start when both sides support it and sender asked for it; coordinator can set enable_fec_auto later.
+    #[cfg(feature = "fec")]
+    {
+        let fec_supported = (cap.flags & cap_flags::FEC) != 0;
+        c.enable_fec = fec_supported && config.enable_fec;
+        c.fec_negotiated = fec_supported;
+    }
     c
 }
 
@@ -203,6 +217,17 @@ pub struct TransferConfig {
     pub encryption_key: Option<[u8; 32]>,
     /// Timeout for network operations in seconds.
     pub timeout_seconds: u64,
+    /// If set (and build has `tls` feature), TCP uses mutual TLS; directory must contain ca.pem, server.pem, server-key.pem (server) or ca.pem, client.pem, client-key.pem (client). Generate with `shift tls-keygen <dir>`.
+    pub tls_cert_dir: Option<std::path::PathBuf>,
+    /// Enable FEC (RaptorQ) for this transfer. Requires build with --features fec.
+    pub enable_fec: bool,
+    /// FEC block size in bytes (e.g. 65536). Only used when enable_fec is true.
+    pub fec_block_size: usize,
+    /// FEC repair packets per block (redundancy). Only used when enable_fec is true.
+    pub fec_repair_packets: u32,
+    /// True when both sides negotiated FEC (receiver can decode 0x02). Used for auto-trigger.
+    #[cfg(feature = "fec")]
+    pub fec_negotiated: bool,
 }
 
 impl Default for TransferConfig {
@@ -218,24 +243,88 @@ impl Default for TransferConfig {
             enable_encryption: false,
             encryption_key: None,
             timeout_seconds: 30,
+            tls_cert_dir: None,
+            enable_fec: false,
+            fec_block_size: 65536,
+            fec_repair_packets: 4,
+            #[cfg(feature = "fec")]
+            fec_negotiated: false,
         }
     }
 }
 
+/// Status of a single-file transfer for --stats / --json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum TransferStatus {
+    #[default]
+    Completed,
+    Skipped {
+        reason: &'static str,
+    },
+    Failed,
+}
+
+impl serde::Serialize for TransferStatus {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(match self {
+            TransferStatus::Completed => "completed",
+            TransferStatus::Skipped { .. } => "skipped",
+            TransferStatus::Failed => "failed",
+        })
+    }
+}
+
 /// Per-file transfer report for --stats / --json output (scriptable, benchmarkable).
-#[derive(Debug, Default, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct TransferReport {
-    pub transport: String,
+    #[serde(default)]
+    pub status: TransferStatus,
+    /// When skipped: human-readable reason (e.g. "unchanged"). Omitted in JSON when not set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    /// Bytes transferred (0 when skipped).
     pub bytes: u64,
+    /// When skipped: file size that was hashed for the check.
+    #[serde(default)]
+    pub bytes_checked: u64,
     pub duration_ms: u64,
+    #[serde(default)]
     pub throughput_mbps: f64,
+    #[serde(default)]
     pub streams_initial: usize,
+    #[serde(default)]
     pub streams_peak: usize,
+    #[serde(default)]
     pub streams_stalled: usize,
+    #[serde(default)]
     pub rtt_ms: u64,
+    #[serde(default)]
     pub ranges_total: usize,
+    #[serde(default)]
     pub ranges_resumed: usize,
+    #[serde(default)]
+    pub transport: String,
+}
+
+impl Default for TransferReport {
+    fn default() -> Self {
+        Self {
+            status: TransferStatus::Completed,
+            reason: None,
+            bytes: 0,
+            bytes_checked: 0,
+            duration_ms: 0,
+            throughput_mbps: 0.0,
+            streams_initial: 0,
+            streams_peak: 0,
+            streams_stalled: 0,
+            rtt_ms: 0,
+            ranges_total: 0,
+            ranges_resumed: 0,
+            transport: String::new(),
+        }
+    }
 }
 
 /// Transfer statistics tracked during a transfer.

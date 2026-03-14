@@ -6,15 +6,18 @@ use crate::base::{
     apply_capabilities_to_config, capabilities_from_config, Capabilities, CAPABILITIES_WIRE_LEN,
 };
 use crate::error::TransferError;
-use crate::integrity::{hash_file_range_path, BLAKE3_LEN};
+use crate::base::FileRange;
+use crate::integrity::{hash_file, hash_file_range_path, BLAKE3_LEN};
 use crate::quinn_transport::QuicTransport;
-use crate::tcp_transfer::{receive_range_stream, run_ordered_hasher};
+use crate::server_cache;
+use crate::tcp_transfer::receive_range_stream;
 use crate::base::TransferConfig;
 use crate::transport::Transport;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::sync::mpsc as std_mpsc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::error;
@@ -25,15 +28,20 @@ pub struct QuicServer {
     output_dir: PathBuf,
     config: TransferConfig,
     completed_hashes: Arc<Mutex<HashMap<PathBuf, [u8; BLAKE3_LEN]>>>,
+    persist_tx: Option<std_mpsc::Sender<(PathBuf, [u8; BLAKE3_LEN])>>,
 }
 
 impl QuicServer {
     pub fn new(port: u16, output_dir: PathBuf, config: TransferConfig) -> Self {
+        let cache_path = server_cache::server_cache_path();
+        let _ = server_cache::ensure_cache_dir(&cache_path);
+        let (initial_hashes, persist_tx) = server_cache::load_and_spawn_persist(&cache_path);
         Self {
             port,
             output_dir,
             config,
-            completed_hashes: Arc::new(Mutex::new(HashMap::new())),
+            completed_hashes: Arc::new(Mutex::new(initial_hashes)),
+            persist_tx,
         }
     }
 
@@ -51,8 +59,9 @@ impl QuicServer {
                     let output_dir = self.output_dir.clone();
                     let config = self.config.clone();
                     let completed_hashes = self.completed_hashes.clone();
+                    let persist_tx = self.persist_tx.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = Self::handle_connection(conn, output_dir, config, completed_hashes).await {
+                        if let Err(e) = Self::handle_connection(conn, output_dir, config, completed_hashes, persist_tx).await {
                             error!(error = %e, "QUIC connection handling failed");
                         }
                     });
@@ -69,6 +78,7 @@ impl QuicServer {
         output_dir: PathBuf,
         config: TransferConfig,
         completed_hashes: Arc<Mutex<HashMap<PathBuf, [u8; BLAKE3_LEN]>>>,
+        persist_tx: Option<std_mpsc::Sender<(PathBuf, [u8; BLAKE3_LEN])>>,
     ) -> Result<(), TransferError> {
         let mut meta_stream = conn.accept_stream().await?;
 
@@ -177,8 +187,7 @@ impl QuicServer {
 
         let num_ranges = crate::base::transfer_num_ranges(num_streams);
         let ranges = crate::base::split_file_ranges(file_size, num_ranges);
-        let (hasher_tx, hasher_rx) = mpsc::channel(64);
-        let hasher_handle = tokio::spawn(async move { run_ordered_hasher(hasher_rx, file_size).await });
+        let (range_hash_tx, mut range_hash_rx) = mpsc::channel::<(FileRange, [u8; BLAKE3_LEN])>(64);
 
         meta_stream.write_all(&[msg::READY]).await
             .map_err(|e| TransferError::NetworkError(format!("Failed to send READY: {}", e)))?;
@@ -225,7 +234,7 @@ impl QuicServer {
         for (thread_id, _range) in ranges.into_iter().enumerate() {
             let file = Arc::clone(&file);
             let config = config.clone();
-            let range_hasher_tx = hasher_tx.clone();
+            let range_hash_tx = range_hash_tx.clone();
             let stream = conn.accept_stream().await?;
             let handle = tokio::spawn(async move {
                 receive_range_stream(
@@ -234,7 +243,7 @@ impl QuicServer {
                     stream,
                     config,
                     None,
-                    Some(range_hasher_tx),
+                    Some(range_hash_tx),
                 )
                 .await
             });
@@ -242,6 +251,7 @@ impl QuicServer {
         }
 
         let mut total_received = 0u64;
+        let mut data_error: Option<TransferError> = None;
         for (thread_id, handle) in data_handles.into_iter().enumerate() {
             match handle.await {
                 Ok(Ok(bytes)) => {
@@ -249,12 +259,14 @@ impl QuicServer {
                     tracing::debug!(thread_id, bytes, "QUIC data stream completed");
                 }
                 Ok(Err(e)) => {
-                    drop(hasher_tx);
-                    return Err(e);
+                    if data_error.is_none() {
+                        data_error = Some(e);
+                    }
                 }
                 Err(e) => {
-                    drop(hasher_tx);
-                    return Err(TransferError::NetworkError(format!("QUIC data task panicked: {:?}", e)));
+                    if data_error.is_none() {
+                        data_error = Some(TransferError::NetworkError(format!("QUIC data task panicked: {:?}", e)));
+                    }
                 }
             }
         }
@@ -284,11 +296,12 @@ impl QuicServer {
         meta_stream.read_exact(&mut expected_hash).await
             .map_err(|e| TransferError::NetworkError(format!("Failed to read file hash: {}", e)))?;
 
-        drop(hasher_tx);
-        let actual_hash = hasher_handle
-            .await
-            .map_err(|e| TransferError::NetworkError(format!("Receive hasher task panicked: {:?}", e)))?
-            .map_err(|e| TransferError::ProtocolError(format!("Receive hasher: {}", e)))?;
+        drop(range_hash_tx);
+        let mut received_ranges: Vec<(FileRange, [u8; BLAKE3_LEN])> = Vec::new();
+        while let Some(rh) = range_hash_rx.recv().await {
+            received_ranges.push(rh);
+        }
+        let actual_hash = hash_file(&output_path, file_size)?;
         if actual_hash != expected_hash {
             let _ = meta_stream.write_all(&[msg::HASH_MISMATCH]).await;
             return Err(TransferError::IntegrityCheckFailed(format!(
@@ -301,11 +314,19 @@ impl QuicServer {
             .map_err(|e| TransferError::NetworkError(format!("Failed to send hash OK: {}", e)))?;
         meta_stream.flush().await
             .map_err(|e| TransferError::NetworkError(format!("Failed to flush hash OK: {}", e)))?;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        completed_hashes.lock().unwrap().insert(output_path.clone(), expected_hash);
+        if data_error.is_none() {
+            completed_hashes.lock().unwrap().insert(output_path.clone(), expected_hash);
+            if let Some(ref tx) = persist_tx {
+                let _ = tx.send((output_path.clone(), expected_hash));
+            }
+            eprintln!("Received: {} ({} bytes)", filename, total_received);
+        }
 
-        eprintln!("Received: {} ({} bytes)", filename, total_received);
-
+        if let Some(e) = data_error {
+            return Err(e);
+        }
         Ok(())
     }
 }

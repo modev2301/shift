@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use shift::config::{DEFAULT_PARALLEL_STREAMS, DEFAULT_TIMEOUT_SECONDS};
-use shift::TransferReport;
+use shift::{TransferReport, TransferStatus};
 use shift::Config;
 use std::path::PathBuf;
 use tracing::info;
@@ -25,6 +25,14 @@ struct Cli {
     /// Force TCP transport (use when comparing with QUIC or if QUIC is unavailable)
     #[arg(long = "tcp")]
     force_tcp: bool,
+
+    /// Use mutual TLS for TCP (metadata + data). Cert dir from --tls-dir or env TLS_CERT_DIR or ./tls-certs. Requires build with --features tls.
+    #[arg(long = "tls")]
+    tls: bool,
+
+    /// Directory for TLS certs (ca.pem, server.pem, client.pem, etc.). Used when --tls is set. Default: env TLS_CERT_DIR or ./tls-certs.
+    #[arg(long = "tls-dir", value_name = "DIR")]
+    tls_dir: Option<PathBuf>,
 
     /// Print transfer stats after each file (human-readable)
     #[arg(long = "stats")]
@@ -53,6 +61,12 @@ enum Commands {
         /// Listen with QUIC (UDP) instead of TCP
         #[arg(long)]
         quic: bool,
+    },
+    /// Generate TLS certs for mutual auth (ca.pem, server.pem, client.pem, etc.) into DIR. Requires build with --features tls.
+    TlsKeygen {
+        /// Output directory for PEM files [default: ./tls-certs]
+        #[arg(default_value = "./tls-certs")]
+        dir: PathBuf,
     },
 }
 
@@ -110,6 +124,18 @@ fn is_remote_path(s: &str) -> bool {
     s.contains(':') && (s.contains('@') || s.matches(':').count() >= 2)
 }
 
+/// Resolve TLS cert directory when --tls is set: --tls-dir, or env TLS_CERT_DIR, or ./tls-certs.
+fn tls_cert_dir(cli: &Cli) -> Option<PathBuf> {
+    if !cli.tls {
+        return None;
+    }
+    Some(
+        cli.tls_dir.clone()
+            .or_else(|| std::env::var("TLS_CERT_DIR").ok().map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("./tls-certs")),
+    )
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing with info level by default, but allow RUST_LOG env var to override
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -121,8 +147,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     
     // Handle explicit commands first
-    if let Some(command) = cli.command {
+    if let Some(ref command) = cli.command {
         match command {
+            Commands::TlsKeygen { dir } => {
+                shift::tls::keygen(&dir)?;
+                eprintln!("TLS certs written to {}", dir.display());
+                return Ok(());
+            }
             Commands::Server { quic } => {
                 let config = Config::load_or_create(&cli.config)?;
                 use shift::TransferConfig;
@@ -145,12 +176,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     enable_encryption: false,
                     encryption_key: None,
                     timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+                    tls_cert_dir: tls_cert_dir(&cli),
+                    enable_fec: false,
+                    fec_block_size: 65536,
+                    fec_repair_packets: 4,
+                    #[cfg(feature = "fec")]
+                    fec_negotiated: false,
                 };
                 eprintln!("Shift Transfer Server");
                 eprintln!("Port: {}", transfer_config.start_port);
                 eprintln!("Output directory: {}", config.server.output_directory);
+                if transfer_config.tls_cert_dir.is_some() {
+                    eprintln!("TLS: mutual auth enabled (cert dir: {:?})", transfer_config.tls_cert_dir);
+                }
                 let rt = tokio::runtime::Runtime::new()?;
-                if quic {
+                if *quic {
                     use shift::quic_server::QuicServer;
                     eprintln!("Transport: QUIC (UDP)");
                     let server = QuicServer::new(
@@ -167,7 +207,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         PathBuf::from(&config.server.output_directory),
                         transfer_config,
                     );
-                    rt.block_on(server.run_forever())?;
+                    rt.block_on(server.run_forever(None))?;
                 }
                 return Ok(());
             }
@@ -327,6 +367,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             enable_encryption: false,
             encryption_key: None,
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            tls_cert_dir: tls_cert_dir(&cli),
+            enable_fec: false,
+            fec_block_size: 65536,
+            fec_repair_packets: 4,
+            #[cfg(feature = "fec")]
+            fec_negotiated: false,
         };
         
         // Sort files by size (largest first) for better parallelism utilization
@@ -363,24 +409,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 transfer_config.clone(),
                 stats_out,
                 cli.skip_unchanged,
+                None,
             )) {
                 Ok(_) => {
                     if cli.json {
                         println!("{}", serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()));
                     } else if cli.stats {
-                        eprintln!(
-                            "transport: {}  bytes: {}  duration_ms: {}  throughput_mbps: {:.2}  streams: {}→{}  stalled: {}  rtt_ms: {}  ranges: {} total, {} resumed",
-                            report.transport,
-                            report.bytes,
-                            report.duration_ms,
-                            report.throughput_mbps,
-                            report.streams_initial,
-                            report.streams_peak,
-                            report.streams_stalled,
-                            report.rtt_ms,
-                            report.ranges_total,
-                            report.ranges_resumed,
-                        );
+                        if matches!(report.status, TransferStatus::Skipped { .. }) {
+                            let gb = report.bytes_checked as f64 / (1024.0 * 1024.0 * 1024.0);
+                            let size_str = if gb >= 1.0 {
+                                format!("{:.2} GB", gb)
+                            } else {
+                                format!("{} bytes", report.bytes_checked)
+                            };
+                            eprintln!(
+                                "{}  skipped (unchanged)  {} checked  {}ms",
+                                local_file.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(),
+                                size_str,
+                                report.duration_ms,
+                            );
+                        } else {
+                            eprintln!(
+                                "transport: {}  bytes: {}  duration_ms: {}  throughput_mbps: {:.2}  streams: {}→{}  stalled: {}  rtt_ms: {}  ranges: {} total, {} resumed",
+                                report.transport,
+                                report.bytes,
+                                report.duration_ms,
+                                report.throughput_mbps,
+                                report.streams_initial,
+                                report.streams_peak,
+                                report.streams_stalled,
+                                report.rtt_ms,
+                                report.ranges_total,
+                                report.ranges_resumed,
+                            );
+                        }
                     }
                 }
                 Err(e) => {

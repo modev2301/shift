@@ -2,11 +2,14 @@
 //!
 //! This module provides high-performance file I/O operations that leverage
 //! platform-specific features like O_DIRECT on Linux to bypass the page cache
-//! for large file transfers.
+//! for large file transfers. When the `iouring` feature is enabled on Linux,
+//! use `FileReader::open_uring` and run the transfer inside `tokio_uring::start()`
+//! for io_uring-backed reads.
 
 use crate::error::TransferError;
 use std::fs::File;
 use std::path::Path;
+use std::sync::Arc;
 
 /// Disk block size for alignment (typically 512 bytes or 4KB).
 /// O_DIRECT requires buffers and offsets to be aligned to this size.
@@ -73,6 +76,59 @@ fn open_with_odirect(path: &Path) -> Result<File, TransferError> {
 
     // Safety: We own the file descriptor and will close it when File is dropped
     Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// Abstraction for reading at offset: either std `File` (pread/spawn_blocking) or
+/// io_uring-backed file when `iouring` feature and Linux. Use `FileReader::std()` for
+/// normal opens; use `FileReader::open_uring(path).await` inside `tokio_uring::start()` for uring.
+#[derive(Clone)]
+pub enum FileReader {
+    Std(Arc<File>),
+    #[cfg(all(feature = "iouring", target_os = "linux"))]
+    Uring(Arc<tokio_uring::fs::File>),
+}
+
+impl FileReader {
+    pub fn std(file: File) -> Self {
+        FileReader::Std(Arc::new(file))
+    }
+
+    /// Open a file for reading using io_uring. Must be called from within `tokio_uring::start()`.
+    #[cfg(all(feature = "iouring", target_os = "linux"))]
+    pub async fn open_uring(path: &Path) -> Result<Self, TransferError> {
+        let file = tokio_uring::fs::File::open(path.to_path_buf())
+            .await
+            .map_err(|e| TransferError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        Ok(FileReader::Uring(Arc::new(file)))
+    }
+
+    /// Async read at offset. For Std uses spawn_blocking(pread); for Uring uses uring read.
+    pub async fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize, TransferError> {
+        match self {
+            FileReader::Std(file) => {
+                let file = Arc::clone(file);
+                let mut vec = buf.to_vec();
+                let (n, returned) = tokio::task::spawn_blocking(move || {
+                    let n = read_at(&file, &mut vec, offset)?;
+                    Ok::<_, TransferError>((n, vec))
+                })
+                .await
+                .map_err(|e| TransferError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))??;
+                let n = n.min(buf.len());
+                buf[..n].copy_from_slice(&returned[..n]);
+                Ok(n)
+            }
+            #[cfg(all(feature = "iouring", target_os = "linux"))]
+            FileReader::Uring(file) => {
+                let buf_vec = buf.to_vec();
+                let (res, returned) = file.read_at(buf_vec, offset).await;
+                let n = res.map_err(|e| TransferError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                let n = n.min(buf.len());
+                buf[..n].copy_from_slice(&returned[..n]);
+                Ok(n)
+            }
+        }
+    }
 }
 
 /// Reads data from a file at a specific offset using the most efficient method available.

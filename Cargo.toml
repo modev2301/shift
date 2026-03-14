@@ -8,6 +8,7 @@ license = "MIT"
 
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
+tokio-util = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 bytes = "1.0"
@@ -30,10 +31,15 @@ rcgen = "0.12"
 rustls = { version = "0.23", default-features = false, features = ["std"] }
 tokio-rustls = { version = "0.26", optional = true }
 rustls-pemfile = { version = "2", optional = true }
+raptorq = { version = "1.8", optional = true }
+tokio-uring = { version = "0.5", optional = true }
 
 [features]
 default = []
 tls = ["dep:tokio-rustls", "dep:rustls-pemfile"]
+fec = ["dep:raptorq"]
+# Linux only: use io_uring for async file reads when running inside tokio_uring::start()
+iouring = ["dep:tokio-uring"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -142,9 +142,10 @@ For very high throughput datacenter transfers (100Gbps+). Separate transport imp
 | Finer range granularity (max_streams×4) | ✅ Done |
 | `--update` (skip unchanged by hash) | ✅ Done |
 | `--dedup` (block deduplication) | ❌ Not started (CLI flag only) |
-| FEC (raptorq) | ❌ Not started |
-| TCP mutual TLS | ❌ Not started |
-| io_uring on Linux | ❌ Not started |
+| FEC (raptorq) | ✅ Done: `fec` feature, CAP_FEC negotiation, frame type 0x02, encode per chunk in transfer_range_tcp and stream sender; decode in receive_range_tcp and stream receiver |
+| FEC auto-trigger (loss heuristic) | ❌ Not started. When revisiting: enable FEC in coordinator when `stall_looks_like_loss(&estimator)`; receiver must know FEC switched on mid-transfer — either negotiate FEC upfront (simpler, small overhead when unused) or add a control message. Prefer upfront; document and revisit after `--update`. |
+| TCP mutual TLS | ✅ Done |
+| io_uring on Linux | 🔶 Scaffolding: `iouring` feature, `FileReader` (Std + Uring), async `read_at`; Linux-only, transfer path not yet switched to `FileReader` |
 | RDMA transport | ❌ Not started |
 
 ---
@@ -161,9 +162,24 @@ After QUIC queue lands, items 2, 3, and 7 are small and can be done in parallel.
 
 ---
 
+## Control channel (for --update and FEC auto-trigger)
+
+**Order today:** Capability handshake → optional RTT (PING/PONG) → **then** either:
+- **CHECK_HASH (0x0A)** — client sends filename_len + filename + hash (32). Server checks; HAVE_HASH → skip, NEED_FILE → then full metadata and data streams.
+- **Metadata** — first byte = start of filename_len (8 LE), then filename, file_size (8), max_streams (8). Server ACK (READY 0x01), then range-hash exchange if any, then data streams open.
+
+So there **is** metadata exchange (and an existing --update-style CHECK_HASH path) before data streams. Wiring `--update` needs: fast mtime+size check, slow BLAKE3 fallback, and ensuring receiver records BLAKE3 on completion; no new message type required.
+
+---
+
+## Integration tests
+
+- **`tests/loopback_transfer.rs`** — `test_loopback_via_cli`: runs the `shift` binary as server and client over loopback; verifies file size and BLAKE3. Requires `cargo build --bin shift`. In-process tests (`test_loopback_tcp_transfer_end_to_end`, `test_loopback_tcp_update_skip_unchanged`) are `#[ignore]`; run with `-- --ignored` to execute them.
+
 ## What to do next
 
-- **--dedup**: Block-level deduplication (rolling hash, block index, protocol) — larger feature.
-- **FEC**: raptorq + loss heuristic; fits after observability.
-- **TCP mutual TLS**: Add `tokio-rustls`, rcgen for certs, mutual auth; then wrap TCP metadata + data streams in TLS when enabled.
-- **io_uring**: Feature-flag and optional `tokio-uring` for Linux zero-copy read path.
+- **--update**: Done (CHECK_HASH, server cache at `~/.shift/server_cache.db`, persist on completion).
+- **--dedup**: CLI flag only; block-level deduplication not implemented. Defer until there is evidence of the use case.
+- **FEC auto-trigger**: Not started. Loss heuristic in coordinator + notify receiver (upfront FEC negotiation preferred). See table.
+- **TCP mutual TLS**: Done.
+- **io_uring end-to-end**: Not started. Scaffolding only; wire transfer path to `FileReader` when benchmarks show disk read as bottleneck (e.g. on EC2).

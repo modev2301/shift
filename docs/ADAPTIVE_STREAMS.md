@@ -185,3 +185,9 @@ Sender                          Receiver
 - **Steps 1 and 2** — Implement first; independently useful and unblock the rest.
 - **Steps 3–6** — Build on each other; implement together.
 - **Step 7** — Can go in at any point.
+
+---
+
+## Status
+
+This design is implemented: adaptive stream count, RTT probe, range queue, coordinator, bandwidth estimator, stall detection, finer range granularity. For current feature status (FEC, io_uring, --dedup, etc.) see `docs/ROADMAP.md`.

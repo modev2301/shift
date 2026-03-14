@@ -2,7 +2,11 @@
 //!
 //! Computes and verifies full-file BLAKE3 hashes so the receiver can confirm
 //! the transferred file matches the source (critical on lossy WAN).
+//!
+//! Full-file hash is computed from per-range BLAKE3 hashes (see `final_hash_from_ranges`)
+//! so that parallel send/receive does not require ordered chunk delivery.
 
+use crate::base::FileRange;
 use crate::error::TransferError;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -66,6 +70,20 @@ pub fn hash_file_range(file: &mut File, start: u64, end: u64) -> Result<[u8; BLA
 pub fn hash_file_range_path(path: &Path, start: u64, end: u64) -> Result<[u8; BLAKE3_LEN], TransferError> {
     let mut file = File::open(path).map_err(TransferError::Io)?;
     hash_file_range(&mut file, start, end)
+}
+
+/// Compute full-file BLAKE3 from per-range hashes (deterministic, no streaming).
+///
+/// Used by both sender and receiver so they agree on the same hash without requiring
+/// ordered chunk delivery. Sorted by range start so the result is deterministic.
+pub fn final_hash_from_ranges(ranges: &[(FileRange, [u8; BLAKE3_LEN])]) -> [u8; BLAKE3_LEN] {
+    let mut sorted: Vec<_> = ranges.to_vec();
+    sorted.sort_by_key(|(r, _)| r.start);
+    let mut hasher = blake3::Hasher::new();
+    for (_, hash) in &sorted {
+        hasher.update(hash);
+    }
+    *hasher.finalize().as_bytes()
 }
 
 #[cfg(test)]
