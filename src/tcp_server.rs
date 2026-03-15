@@ -307,6 +307,51 @@ impl TcpServer {
                 .map_err(|e| TransferError::NetworkError(format!("Failed to read after PROBE: {}", e)))?;
         }
 
+        if first_byte[0] == msg::MANIFEST && crate::base::manifest_supported(&negotiated) {
+            let mut num_buf = [0u8; 4];
+            stream.read_exact(&mut num_buf).await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to read MANIFEST num_files: {}", e)))?;
+            let num_files = u32::from_le_bytes(num_buf) as usize;
+            let mut need_send = Vec::with_capacity(num_files);
+            for _ in 0..num_files {
+                let mut plen_buf = [0u8; 2];
+                stream.read_exact(&mut plen_buf).await
+                    .map_err(|e| TransferError::NetworkError(format!("Failed to read MANIFEST path_len: {}", e)))?;
+                let path_len = u16::from_le_bytes(plen_buf) as usize;
+                let mut path_buf = vec![0u8; path_len];
+                stream.read_exact(&mut path_buf).await
+                    .map_err(|e| TransferError::NetworkError(format!("Failed to read MANIFEST path: {}", e)))?;
+                let rel_path = String::from_utf8(path_buf)
+                    .map_err(|e| TransferError::ProtocolError(format!("Invalid MANIFEST path: {}", e)))?;
+                let mut size_buf = [0u8; 8];
+                stream.read_exact(&mut size_buf).await
+                    .map_err(|e| TransferError::NetworkError(format!("Failed to read MANIFEST size: {}", e)))?;
+                let _size = u64::from_le_bytes(size_buf);
+                let mut hash_buf = [0u8; BLAKE3_LEN];
+                stream.read_exact(&mut hash_buf).await
+                    .map_err(|e| TransferError::NetworkError(format!("Failed to read MANIFEST hash: {}", e)))?;
+                let path = output_dir.join(&rel_path);
+                std::fs::create_dir_all(path.parent().unwrap_or(&output_dir))?;
+                let have = completed_hashes
+                    .lock()
+                    .unwrap()
+                    .get(&path)
+                    .map(|h| *h == hash_buf)
+                    .unwrap_or(false)
+                    && path.exists()
+                    && std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false)
+                    && hash_file(&path, std::fs::metadata(&path).unwrap().len()).map(|h| h == hash_buf).unwrap_or(false);
+                need_send.push(if have { 1u8 } else { 0u8 });
+            }
+            stream.write_all(&[msg::MANIFEST_ACK]).await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to send MANIFEST_ACK: {}", e)))?;
+            stream.write_all(&need_send).await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to send MANIFEST_ACK body: {}", e)))?;
+            stream.flush().await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to flush MANIFEST_ACK: {}", e)))?;
+            return Ok(());
+        }
+
         let (filename, file_size, num_streams) = if first_byte[0] == msg::CHECK_HASH {
             // --update skip check: read filename_len (8) + filename + hash (32)
             let mut len_buf = [0u8; 8];
@@ -423,20 +468,107 @@ impl TcpServer {
             file_size,
             "server split file into ranges"
         );
+
+        let (range_hash_tx, mut range_hash_rx) = mpsc::channel::<(FileRange, [u8; BLAKE3_LEN])>(64);
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+        let (done_tx, mut done_rx) = mpsc::channel::<()>(64);
+        let mut data_handles = Vec::new();
+        let mut total_received = 0u64;
+        let mut data_error: Option<TransferError> = None;
+
+        if config.use_tcp_multiplexed {
+            // One data connection: client sends frames [range_id u32][start u64][len u64][data].
+            tracing::debug!(num_ranges, "server multiplexed: one data connection");
+            let (write_tx, write_rx) = std::sync::mpsc::sync_channel::<(u64, Vec<u8>)>(num_ranges);
+            let output_path_mult = output_dir.join(&filename);
+            let writer_handle = std::thread::spawn(move || -> Result<u64, TransferError> {
+                use std::io::{Seek, SeekFrom, Write};
+                let mut f = std::fs::File::create(&output_path_mult)?;
+                f.set_len(file_size)?;
+                let mut total = 0u64;
+                for (start, data) in write_rx {
+                    f.seek(SeekFrom::Start(start))?;
+                    f.write_all(&data)?;
+                    total += data.len() as u64;
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::io::AsRawFd;
+                    let fd = f.as_raw_fd();
+                    unsafe { libc::fsync(fd); }
+                }
+                #[cfg(not(unix))]
+                {
+                    f.sync_all()?;
+                }
+                Ok(total)
+            });
+
+            stream.write_all(&[msg::READY]).await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to send READY (multiplexed): {}", e)))?;
+
+            let data_port = base_port + 1;
+            let socket = Socket::new(Domain::IPV4, Type::STREAM, None)
+                .map_err(|e| TransferError::NetworkError(format!("Failed to create socket: {}", e)))?;
+            configure_tcp_socket(&socket, config.socket_send_buffer_size, config.socket_recv_buffer_size)?;
+            let addr: SocketAddr = format!("0.0.0.0:{}", data_port).parse()
+                .map_err(|e| TransferError::NetworkError(format!("Invalid address: {}", e)))?;
+            socket.bind(&addr.into())
+                .map_err(|e| TransferError::NetworkError(format!("Failed to bind: {}", e)))?;
+            socket.listen(1)
+                .map_err(|e| TransferError::NetworkError(format!("Failed to listen: {}", e)))?;
+            socket.set_nonblocking(true)
+                .map_err(|e| TransferError::NetworkError(format!("Failed to set nonblocking: {}", e)))?;
+            let std_listener = std::net::TcpListener::from(socket);
+            let listener = TcpListener::from_std(std_listener)
+                .map_err(|e| TransferError::NetworkError(format!("Tokio listener: {}", e)))?;
+            let (data_stream, _) = listener.accept().await
+                .map_err(|e| TransferError::NetworkError(format!("Accept (multiplexed): {}", e)))?;
+
+            #[cfg(feature = "tls")]
+            let data_stream = {
+                if let Some(acceptor) = tls_acceptor {
+                    let tls_stream = acceptor.accept(data_stream).await
+                        .map_err(|e| TransferError::NetworkError(format!("TLS accept data: {}", e)))?;
+                    MetaStream::Tls(tls_stream)
+                } else {
+                    MetaStream::Plain(data_stream)
+                }
+            };
+
+            let mut data_reader = data_stream;
+            for _ in 0..num_ranges {
+                let mut rid_buf = [0u8; 4];
+                data_reader.read_exact(&mut rid_buf).await
+                    .map_err(|e| TransferError::NetworkError(format!("Read range_id: {}", e)))?;
+                let mut start_buf = [0u8; 8];
+                data_reader.read_exact(&mut start_buf).await
+                    .map_err(|e| TransferError::NetworkError(format!("Read start: {}", e)))?;
+                let mut len_buf = [0u8; 8];
+                data_reader.read_exact(&mut len_buf).await
+                    .map_err(|e| TransferError::NetworkError(format!("Read len: {}", e)))?;
+                let start = u64::from_le_bytes(start_buf);
+                let len = u64::from_le_bytes(len_buf) as usize;
+                let mut buf = vec![0u8; len];
+                data_reader.read_exact(&mut buf).await
+                    .map_err(|e| TransferError::NetworkError(format!("Read data: {}", e)))?;
+                write_tx.send((start, buf))
+                    .map_err(|e| TransferError::NetworkError(format!("Writer channel: {}", e)))?;
+            }
+            drop(write_tx);
+            total_received = writer_handle.join()
+                .map_err(|_| TransferError::NetworkError("Writer thread panicked".to_string()))??;
+
+            // Fall through to range verify read and hash exchange (range_hash_rx will be empty)
+        } else {
         tracing::debug!(
             num_connections_expected = ranges.len(),
             "server waiting for data connections"
         );
-        let mut data_handles = Vec::new();
-
-        let (range_hash_tx, mut range_hash_rx) = mpsc::channel::<(FileRange, [u8; BLAKE3_LEN])>(64);
-        // Listeners: at least num_streams (one per concurrent worker), plus extra for requeued ranges; collector signals shutdown when num_ranges received
-        let (shutdown_tx, _) = broadcast::channel::<()>(1);
-        let (done_tx, mut done_rx) = mpsc::channel::<()>(64);
-        let num_listeners = (2 * num_ranges).max(num_streams);
 
         #[cfg(feature = "tls")]
         let tls_acceptor = tls_acceptor.clone();
+        let num_listeners = (2 * num_ranges).max(num_streams);
         for thread_id in 0..num_listeners {
             let file = Arc::clone(&file);
             let config = config.clone();
@@ -572,8 +704,6 @@ impl TcpServer {
         let (_collector_result, handle_results) = tokio::join!(collector, join_all_handles);
         let _ = _collector_result;
 
-        let mut total_received = 0u64;
-        let mut data_error: Option<TransferError> = None;
         for (thread_id, result) in handle_results.into_iter().enumerate() {
             match result {
                 Ok(Ok(bytes)) => {
@@ -596,22 +726,23 @@ impl TcpServer {
                 }
             }
         }
+        } // end else (non-multiplexed)
 
-        // Sync file to ensure all data is written to disk
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            use libc;
-            let fd = file.as_raw_fd();
-            unsafe {
-                libc::fsync(fd);
+        if !config.use_tcp_multiplexed {
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                use libc;
+                let fd = file.as_raw_fd();
+                unsafe {
+                    libc::fsync(fd);
+                }
             }
-        }
-
-        #[cfg(not(unix))]
-        {
-            let file_mut = std::fs::File::try_clone(&*file)?;
-            file_mut.sync_all()?;
+            #[cfg(not(unix))]
+            {
+                let file_mut = std::fs::File::try_clone(&*file)?;
+                file_mut.sync_all()?;
+            }
         }
 
         let mut hash_type_buf = [0u8; 1];

@@ -186,6 +186,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     fec_repair_packets: 4,
                     #[cfg(feature = "fec")]
                     fec_negotiated: false,
+                    use_tcp_multiplexed: false,
                 };
                 eprintln!("Shift Transfer Server");
                 eprintln!("Port: {}", transfer_config.start_port);
@@ -311,7 +312,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         }
         
-        use shift::tcp_transfer::send_file_over_transport;
+        use shift::integrity::{hash_file, BLAKE3_LEN};
+        use shift::tcp_transfer::{send_file_over_transport, send_manifest_over_transport};
         use shift::transport::create_transport;
         use shift::TransferConfig;
         use shift::utils::calculate_optimal_parallel_streams;
@@ -378,6 +380,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             fec_repair_packets: 4,
             #[cfg(feature = "fec")]
             fec_negotiated: false,
+            use_tcp_multiplexed: false,
         };
         
         // Sort files by size (largest first) for better parallelism utilization
@@ -396,19 +399,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let output_stats = cli.stats || cli.json;
         let mut report = TransferReport::default();
 
-        for (idx, local_file) in files_to_transfer.iter().enumerate() {
+        let server_addr_str = format!("{}:{}", remote.host, remote.port.unwrap_or(8080));
+        let server_addr = server_addr_str
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| "Failed to resolve server address")?;
+
+        let files_to_send: Vec<std::path::PathBuf> = if files_to_transfer.len() > 1 && (cli.skip_unchanged && !cli.force) {
+            let transfer_root = files_to_transfer[0].parent().unwrap_or_else(|| std::path::Path::new("."));
+            let mut manifest_entries: Vec<(String, u64, [u8; BLAKE3_LEN])> = Vec::with_capacity(files_to_transfer.len());
+            for path in &files_to_transfer {
+                let size = std::fs::metadata(path).ok().map(|m| m.len()).unwrap_or(0);
+                let rel = path
+                    .strip_prefix(transfer_root)
+                    .unwrap_or(path.as_path())
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let hash = hash_file(path, size).unwrap_or([0u8; BLAKE3_LEN]);
+                manifest_entries.push((rel, size, hash));
+            }
+            match rt.block_on(send_manifest_over_transport(
+                transport.as_ref(),
+                server_addr,
+                &transfer_config,
+                &manifest_entries,
+            )) {
+                Ok(Some(need)) => {
+                    files_to_transfer
+                        .iter()
+                        .zip(need.iter())
+                        .filter(|(_, &n)| n)
+                        .map(|(p, _)| p.clone())
+                        .collect()
+                }
+                _ => files_to_transfer.clone(),
+            }
+        } else {
+            files_to_transfer.clone()
+        };
+
+        for (idx, local_file) in files_to_send.iter().enumerate() {
             let file_idx = idx + 1;
-            let total_files = files_to_transfer.len();
+            let total_files = files_to_send.len();
 
             if total_files > 1 {
                 eprintln!("[{}/{}] {}", file_idx, total_files, local_file.display());
             }
-
-            let server_addr_str = format!("{}:{}", remote.host, remote.port.unwrap_or(8080));
-            let server_addr = server_addr_str
-                .to_socket_addrs()?
-                .next()
-                .ok_or_else(|| "Failed to resolve server address")?;
 
             let stats_out = if output_stats { Some(&mut report) } else { None };
             let skip_unchanged = cli.skip_unchanged && !cli.force;

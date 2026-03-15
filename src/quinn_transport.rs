@@ -106,6 +106,11 @@ impl StreamOpener for QuicStreamOpener {
     fn max_streams(&self) -> usize {
         self.max
     }
+
+    fn loss_stats(&self) -> Option<crate::transport::LossStats> {
+        let s = self.connection.stats();
+        Some((s.path.lost_packets, s.path.sent_packets))
+    }
 }
 
 /// QUIC connection (quinn): can open and accept bidirectional streams.

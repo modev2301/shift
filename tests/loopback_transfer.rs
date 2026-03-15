@@ -51,6 +51,7 @@ fn transfer_config(port: u16) -> TransferConfig {
         fec_repair_packets: 4,
         #[cfg(feature = "fec")]
         fec_negotiated: false,
+        use_tcp_multiplexed: false,
     }
 }
 

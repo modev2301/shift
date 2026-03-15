@@ -134,6 +134,51 @@ impl QuicServer {
                 .map_err(|e| TransferError::NetworkError(format!("Failed to read after PROBE: {}", e)))?;
         }
 
+        if first_byte[0] == msg::MANIFEST && crate::base::manifest_supported(&negotiated) {
+            let mut num_buf = [0u8; 4];
+            meta_stream.read_exact(&mut num_buf).await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to read MANIFEST num_files: {}", e)))?;
+            let num_files = u32::from_le_bytes(num_buf) as usize;
+            let mut need_send = Vec::with_capacity(num_files);
+            for _ in 0..num_files {
+                let mut plen_buf = [0u8; 2];
+                meta_stream.read_exact(&mut plen_buf).await
+                    .map_err(|e| TransferError::NetworkError(format!("Failed to read MANIFEST path_len: {}", e)))?;
+                let path_len = u16::from_le_bytes(plen_buf) as usize;
+                let mut path_buf = vec![0u8; path_len];
+                meta_stream.read_exact(&mut path_buf).await
+                    .map_err(|e| TransferError::NetworkError(format!("Failed to read MANIFEST path: {}", e)))?;
+                let rel_path = String::from_utf8(path_buf)
+                    .map_err(|e| TransferError::ProtocolError(format!("Invalid MANIFEST path: {}", e)))?;
+                let mut size_buf = [0u8; 8];
+                meta_stream.read_exact(&mut size_buf).await
+                    .map_err(|e| TransferError::NetworkError(format!("Failed to read MANIFEST size: {}", e)))?;
+                let _size = u64::from_le_bytes(size_buf);
+                let mut hash_buf = [0u8; BLAKE3_LEN];
+                meta_stream.read_exact(&mut hash_buf).await
+                    .map_err(|e| TransferError::NetworkError(format!("Failed to read MANIFEST hash: {}", e)))?;
+                let path = output_dir.join(&rel_path);
+                std::fs::create_dir_all(path.parent().unwrap_or(&output_dir))?;
+                let have = completed_hashes
+                    .lock()
+                    .unwrap()
+                    .get(&path)
+                    .map(|h| *h == hash_buf)
+                    .unwrap_or(false)
+                    && path.exists()
+                    && std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false)
+                    && hash_file(&path, std::fs::metadata(&path).unwrap().len()).map(|h| h == hash_buf).unwrap_or(false);
+                need_send.push(if have { 1u8 } else { 0u8 });
+            }
+            meta_stream.write_all(&[msg::MANIFEST_ACK]).await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to send MANIFEST_ACK: {}", e)))?;
+            meta_stream.write_all(&need_send).await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to send MANIFEST_ACK body: {}", e)))?;
+            meta_stream.flush().await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to flush MANIFEST_ACK: {}", e)))?;
+            return Ok(());
+        }
+
         let (filename, file_size, num_streams) = if first_byte[0] == msg::CHECK_HASH {
             let mut len_buf = [0u8; 8];
             meta_stream.read_exact(&mut len_buf).await

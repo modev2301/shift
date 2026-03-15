@@ -36,6 +36,7 @@
 //!         fec_repair_packets: 4,
 //!         #[cfg(feature = "fec")]
 //!         fec_negotiated: false,
+//!         use_tcp_multiplexed: false,
 //!     };
 //!     let server = TcpServer::new(
 //!         config.server.port,

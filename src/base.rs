@@ -42,6 +42,12 @@ pub mod msg {
     pub const PROBE: u8 = 0x0D;
     /// Server -> Client: sent after draining PROBE so client can measure end-to-end bandwidth.
     pub const PROBE_ACK: u8 = 0x0E;
+    /// Client -> Server: directory manifest. Wire: 0x0F (1) + num_files (4 LE) + for each: path_len (2 LE), path (UTF-8), size (8 LE), hash (32).
+    pub const MANIFEST: u8 = 0x0F;
+    /// Server -> Client: which files to send. Wire: 0x10 (1) + num_files bytes (0 = need, 1 = have).
+    pub const MANIFEST_ACK: u8 = 0x10;
+    /// Client -> Server: start one file in directory session. Wire: 0x11 (1) + filename_len (8 LE) + filename + size (8 LE) + num_streams (8 LE).
+    pub const FILE_START: u8 = 0x11;
 }
 /// Wire size of Ping/Pong: 1 byte type + 8 bytes timestamp_us LE.
 pub const PING_PONG_WIRE_LEN: usize = 9;
@@ -169,6 +175,9 @@ pub fn capabilities_from_config(config: &TransferConfig) -> Capabilities {
     };
     let max_streams = config.max_streams.min(65535) as u16;
     let initial_streams = (config.num_streams as u16).min(max_streams).max(1);
+    let mut reserved = [0u8; 4];
+    reserved[0] = 1; // bit 0: manifest (directory transfer) supported
+    reserved[1] = 1; // bit 0: TCP multiplexed (one data connection)
     Capabilities {
         version: 1,
         flags,
@@ -176,8 +185,18 @@ pub fn capabilities_from_config(config: &TransferConfig) -> Capabilities {
         initial_streams,
         max_buffer: config.buffer_size as u32,
         platform,
-        reserved: [0; 4],
+        reserved,
     }
+}
+
+/// True when both sides advertised manifest support (reserved[0] bit 0).
+pub fn manifest_supported(cap: &Capabilities) -> bool {
+    cap.reserved[0] & 1 != 0
+}
+
+/// True when both sides support TCP multiplexed data (one connection; reserved[1] bit 0).
+pub fn tcp_multiplexed_supported(cap: &Capabilities) -> bool {
+    cap.reserved[1] & 1 != 0
 }
 
 /// Apply negotiated capabilities to config. num_streams = initial (starting count), max_streams = ceiling.
@@ -197,6 +216,7 @@ pub fn apply_capabilities_to_config(config: &TransferConfig, cap: Capabilities) 
         c.enable_fec = fec_supported && config.enable_fec;
         c.fec_negotiated = fec_supported;
     }
+    c.use_tcp_multiplexed = tcp_multiplexed_supported(&cap);
     c
 }
 
@@ -236,6 +256,8 @@ pub struct TransferConfig {
     /// True when both sides negotiated FEC (receiver can decode 0x02). Used for auto-trigger.
     #[cfg(feature = "fec")]
     pub fec_negotiated: bool,
+    /// True when both sides use TCP multiplexed data (one data connection; fewer ports for enterprise).
+    pub use_tcp_multiplexed: bool,
 }
 
 impl Default for TransferConfig {
@@ -257,6 +279,7 @@ impl Default for TransferConfig {
             fec_repair_packets: 4,
             #[cfg(feature = "fec")]
             fec_negotiated: false,
+            use_tcp_multiplexed: false,
         }
     }
 }

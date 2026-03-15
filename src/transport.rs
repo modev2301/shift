@@ -51,12 +51,19 @@ pub struct TransferMetaChannels {
     pub writer: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
 }
 
+/// Optional loss stats for FEC auto-trigger. (lost_packets, sent_packets). Loss rate = lost / (lost + sent) when sent > 0.
+pub type LossStats = (u64, u64);
+
 /// Opens data streams on demand (TCP: connect to next port, QUIC: open_bi). Coordinator holds this for transfer duration.
 #[async_trait]
 pub trait StreamOpener: Send + Sync {
     /// Open one new stream. TCP: connect to next data port; QUIC: open_bi on the connection.
     async fn open_stream(&self) -> Result<Box<dyn Stream>, TransferError>;
     fn max_streams(&self) -> usize;
+    /// When available (e.g. QUIC), returns (lost_packets, sent_packets) for loss-based FEC auto-trigger. Default: None.
+    fn loss_stats(&self) -> Option<LossStats> {
+        None
+    }
 }
 
 /// Transport: connect (client) or listen (server). TCP and QUIC implement this.

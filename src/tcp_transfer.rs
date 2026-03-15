@@ -1814,6 +1814,74 @@ pub async fn probe_bandwidth_for_transport(
     }
 }
 
+/// Send directory manifest and get which files server needs. Entries are (relative_path, size, hash).
+/// Returns Ok(Some(need)) where need[i] true = send file i; Ok(None) if manifest not supported.
+pub async fn send_manifest_over_transport(
+    transport: &dyn Transport,
+    addr: SocketAddr,
+    config: &TransferConfig,
+    entries: &[(String, u64, [u8; BLAKE3_LEN])],
+) -> Result<Option<Vec<bool>>, TransferError> {
+    if entries.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let (meta, _opener) = transport.connect_for_transfer(addr, 1, 1).await?;
+    let mut reader = meta.reader;
+    let mut writer = meta.writer;
+
+    let client_caps = crate::base::capabilities_from_config(config);
+    writer.write_all(&client_caps.to_bytes()).await?;
+    let mut cap_buf = [0u8; crate::base::CAPABILITIES_WIRE_LEN];
+    reader.read_exact(&mut cap_buf).await?;
+    let negotiated = crate::base::Capabilities::from_bytes(&cap_buf)
+        .ok_or_else(|| TransferError::ProtocolError("Invalid capabilities".to_string()))?;
+
+    if (negotiated.flags & crate::base::cap_flags::RTT_PROBE) != 0 {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64;
+        let mut ping = [0u8; crate::base::PING_PONG_WIRE_LEN];
+        ping[0] = crate::base::msg::PING;
+        ping[1..9].copy_from_slice(&ts.to_le_bytes());
+        writer.write_all(&ping).await?;
+        let mut pong_buf = [0u8; crate::base::PING_PONG_WIRE_LEN];
+        reader.read_exact(&mut pong_buf).await?;
+        if pong_buf[0] != crate::base::msg::PONG {
+            return Ok(None);
+        }
+    }
+
+    if (negotiated.flags & crate::base::cap_flags::BANDWIDTH_PROBE) != 0 {
+        let _ = run_bandwidth_probe(&mut writer, &mut reader).await;
+    }
+
+    if !crate::base::manifest_supported(&negotiated) {
+        return Ok(None);
+    }
+
+    writer.write_all(&[crate::base::msg::MANIFEST]).await?;
+    writer.write_all(&(entries.len() as u32).to_le_bytes()).await?;
+    for (rel_path, size, hash) in entries.iter() {
+        let path_bytes = rel_path.as_bytes();
+        writer.write_all(&(path_bytes.len() as u16).to_le_bytes()).await?;
+        writer.write_all(path_bytes).await?;
+        writer.write_all(&size.to_le_bytes()).await?;
+        writer.write_all(hash).await?;
+    }
+    writer.flush().await?;
+
+    let mut ack_byte = [0u8; 1];
+    reader.read_exact(&mut ack_byte).await?;
+    if ack_byte[0] != crate::base::msg::MANIFEST_ACK {
+        return Err(TransferError::ProtocolError("Expected MANIFEST_ACK".to_string()));
+    }
+    let mut need_buf = vec![0u8; entries.len()];
+    reader.read_exact(&mut need_buf).await?;
+    let need: Vec<bool> = need_buf.into_iter().map(|b| b == 0).collect();
+    Ok(Some(need))
+}
+
 /// Send a file over a transport (TCP or QUIC). Uses same protocol as send_file_tcp.
 /// If `stats_out` is `Some`, it is filled with transfer report data on success (for --stats / --json).
 /// If `skip_unchanged` is true, send CHECK_HASH first and skip transfer when server already has this hash (--update).
@@ -1940,7 +2008,9 @@ pub async fn send_file_over_transport(
     } else {
         None
     };
-    let effective_max_streams = if let Some(bw) = bandwidth_bps {
+    let effective_max_streams = if config.use_tcp_multiplexed {
+        1
+    } else if let Some(bw) = bandwidth_bps {
         let bdp_streams = optimal_streams_from_bdp(bw, rtt_ms, config.buffer_size, config.max_streams);
         let streams = bdp_streams.max(FALLBACK_MAX_STREAMS).min(config.max_streams);
         tracing::debug!(bandwidth_bps = bw, rtt_ms, bdp_streams = bdp_streams, effective_streams = streams, "probe BDP stream count");
@@ -2175,6 +2245,73 @@ pub async fn send_file_over_transport(
         })
     };
 
+    if config.use_tcp_multiplexed && transport.name() == "tcp" {
+        let mut stream = opener.open_stream().await
+            .map_err(|e| TransferError::NetworkError(format!("Multiplexed open_stream: {}", e)))?;
+        let (tx, mut rx) = mpsc::channel::<(u32, u64, u64, Vec<u8>)>(32);
+        use tokio::io::AsyncWriteExt;
+        let sender_handle = tokio::spawn(async move {
+            while let Some((range_id, start, len, data)) = rx.recv().await {
+                stream.write_all(&range_id.to_le_bytes()).await
+                    .map_err(|e| TransferError::NetworkError(format!("Multiplexed write: {}", e)))?;
+                stream.write_all(&start.to_le_bytes()).await
+                    .map_err(|e| TransferError::NetworkError(format!("Multiplexed write: {}", e)))?;
+                stream.write_all(&len.to_le_bytes()).await
+                    .map_err(|e| TransferError::NetworkError(format!("Multiplexed write: {}", e)))?;
+                stream.write_all(&data).await
+                    .map_err(|e| TransferError::NetworkError(format!("Multiplexed write: {}", e)))?;
+            }
+            stream.shutdown().await
+                .map_err(|e| TransferError::NetworkError(format!("Multiplexed shutdown: {}", e)))?;
+            Ok::<(), TransferError>(())
+        });
+        let queue_mux = Arc::clone(&queue);
+        let file_mux = file.clone();
+        let file_path_mux = file_path_buf.clone();
+        let progress_mux = progress_handle.clone();
+        let completed_tx_mux = completed_tx.clone();
+        let done_tx_mux = done_tx.clone();
+        let worker_handle = tokio::spawn(async move {
+            while let Some(range) = queue_mux.pop_and_mark(0) {
+                let len = (range.end - range.start) as usize;
+                let mut buf = vec![0u8; len];
+                file_mux.read_at(&mut buf, range.start).await?;
+                let range_hash = crate::integrity::hash_file_range_path(&file_path_mux, range.start, range.end)?;
+                tx.send((0u32, range.start, len as u64, buf)).await
+                    .map_err(|_| TransferError::NetworkError("multiplexed channel closed".into()))?;
+                let _ = completed_tx_mux.send((0, range, range_hash)).await;
+                let _ = done_tx_mux.send((0, Ok(()))).await;
+                progress_mux.update((range.end - range.start) as u64);
+            }
+            Ok::<(), TransferError>(())
+        });
+        for _ in 0..num_pending {
+            if done_rx.recv().await.is_none() {
+                break;
+            }
+            if let Some((_, range, hash)) = completed_rx.recv().await {
+                checkpoint.mark_completed(range, hash);
+                let _ = checkpoint.save(&checkpoint_path);
+            }
+        }
+        worker_handle.await
+            .map_err(|_| TransferError::NetworkError("multiplexed worker panicked".into()))??;
+        sender_handle.await
+            .map_err(|_| TransferError::NetworkError("multiplexed sender panicked".into()))??;
+        writer.write_all(&[msg::HASH]).await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to send HASH: {}", e)))?;
+        writer.write_all(&file_hash).await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to send hash bytes: {}", e)))?;
+        let mut hash_ack = [0u8; 1];
+        reader.read_exact(&mut hash_ack).await
+            .map_err(|e| TransferError::NetworkError(format!("Failed to read HASH_OK: {}", e)))?;
+        if hash_ack[0] != msg::HASH_OK {
+            return Err(TransferError::ProtocolError("Expected HASH_OK".to_string()));
+        }
+        delete_checkpoint(file_path)?;
+        return Ok(file_size);
+    }
+
     for id in 0..num_workers_initial {
         let cancel = CancellationToken::new();
         let cancel_child = cancel.child_token();
@@ -2309,6 +2446,22 @@ pub async fn send_file_over_transport(
                         if !auto.load(Ordering::Relaxed) {
                             auto.store(true, Ordering::Relaxed);
                             tracing::info!("throughput sudden drop, enabling FEC");
+                        }
+                    }
+                }
+                #[cfg(feature = "fec")]
+                if let Some(ref auto) = enable_fec_auto {
+                    if !auto.load(Ordering::Relaxed) {
+                        if let Some((lost, sent)) = opener.loss_stats() {
+                            const LOSS_RATE_THRESHOLD: f64 = 0.005;
+                            let total = lost.saturating_add(sent);
+                            if total >= 1000 {
+                                let rate = lost as f64 / total as f64;
+                                if rate >= LOSS_RATE_THRESHOLD {
+                                    auto.store(true, Ordering::Relaxed);
+                                    tracing::info!(lost, sent, rate = %format!("{:.2}%", rate * 100.0), "QUIC loss detected, enabling FEC");
+                                }
+                            }
                         }
                     }
                 }
