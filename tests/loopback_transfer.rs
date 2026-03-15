@@ -80,7 +80,7 @@ async fn test_loopback_tcp_transfer_end_to_end() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     let config = transfer_config(port);
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().expect("parse addr");
-    let transport = create_transport(&config, true).await;
+    let transport = create_transport(&config, true, None).await;
     // Clear any existing checkpoint so we don't resume from a previous failed run
     let _ = shift::resume::delete_checkpoint(&src_path);
     let result = send_file_over_transport(
@@ -249,7 +249,7 @@ async fn test_loopback_tcp_update_skip_unchanged() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     let config = transfer_config(port);
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().expect("parse addr");
-    let transport = create_transport(&config, true).await;
+    let transport = create_transport(&config, true, None).await;
 
     let sent1 = send_file_over_transport(
         transport.as_ref(),
@@ -309,7 +309,7 @@ async fn test_loopback_detects_corruption() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     let config = transfer_config(port);
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().expect("parse addr");
-    let transport = create_transport(&config, true).await;
+    let transport = create_transport(&config, true, None).await;
 
     let sent1 = send_file_over_transport(
         transport.as_ref(),

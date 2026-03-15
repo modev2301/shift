@@ -622,16 +622,39 @@ impl Transport for TcpTransport {
     }
 }
 
-/// Create a transport: QUIC (if available and not force_tcp) or TCP.
-/// Tries QuicTransport::probe() first when force_tcp is false; on failure or if force_tcp is true, returns TcpTransport.
+/// Create a transport: QUIC or TCP.
+/// When `server_addr` is `Some` and `force_tcp` is false, runs bandwidth probes for both TCP and QUIC
+/// and picks QUIC if its bandwidth is within 10% of TCP (for connection migration, mobile); otherwise TCP.
+/// When `server_addr` is `None`, uses QUIC if QuicTransport::probe() succeeds, else TCP.
 pub async fn create_transport(
     config: &TransferConfig,
     force_tcp: bool,
+    server_addr: Option<SocketAddr>,
 ) -> Box<dyn Transport> {
-    if !force_tcp {
-        if let Ok(quic) = crate::quinn_transport::QuicTransport::probe().await {
-            return Box::new(quic);
+    if force_tcp {
+        return Box::new(TcpTransport::new(config.clone()));
+    }
+    if let Some(addr) = server_addr {
+        let tcp_transport = TcpTransport::new(config.clone());
+        let tcp_bw = crate::tcp_transfer::probe_bandwidth_for_transport(
+            &tcp_transport as &dyn Transport,
+            addr,
+            config,
+        )
+        .await;
+        if let Ok(quic_transport) = crate::quinn_transport::QuicTransport::probe().await {
+            let quic_bw =
+                crate::tcp_transfer::probe_bandwidth_for_transport(&quic_transport as &dyn Transport, addr, config).await;
+            if let (Some(tb), Some(qb)) = (tcp_bw, quic_bw) {
+                if qb * 10 >= tb * 9 {
+                    return Box::new(quic_transport);
+                }
+            }
         }
+        return Box::new(tcp_transport);
+    }
+    if let Ok(quic) = crate::quinn_transport::QuicTransport::probe().await {
+        return Box::new(quic);
     }
     Box::new(TcpTransport::new(config.clone()))
 }

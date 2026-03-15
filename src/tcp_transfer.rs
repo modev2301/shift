@@ -284,9 +284,9 @@ async fn transfer_range_tcp(
         None
     };
 
-    // Read and send file data. Cap read size to avoid EINVAL on some kernels (pread) or stacks (large writes).
+    // Read and send file data (same buffer size as transport stream path).
     let mut offset = range.start;
-    let buffer_size = config.buffer_size.min(16 * 1024 * 1024).min(MAX_STREAM_CHUNK);
+    let buffer_size = config.buffer_size.min(16 * 1024 * 1024);
     let mut buffer = vec![0u8; buffer_size];
     let mut total_sent = 0u64;
 
@@ -358,8 +358,8 @@ async fn transfer_range_tcp(
         packet.extend_from_slice(&(data_to_send.len() as u64).to_le_bytes());
         packet.extend_from_slice(&data_to_send);
         
-        // Write in chunks to avoid EINVAL on some kernels/stacks; retry on ENOBUFS / WouldBlock / EINVAL.
-        const SEND_WRITE_CHUNK: usize = 64 * 1024;
+        // Write in chunks; use large chunks to match TCP throughput. Retry on ENOBUFS / WouldBlock / EINVAL.
+        const SEND_WRITE_CHUNK: usize = 16 * 1024 * 1024;
         const SEND_RETRY_DELAY_MS: u64 = 50;
         const SEND_RETRY_MAX: u32 = 120; // ~6s of retries then fail
         let mut written = 0usize;
@@ -416,10 +416,6 @@ async fn transfer_range_tcp(
     Ok(total_sent)
 }
 
-/// Max chunk size for transport streams (QUIC/TCP via opener). QUIC flow control and some kernels
-/// (GSO) can hit EINVAL on very large single writes; smaller chunks avoid that.
-const MAX_STREAM_CHUNK: usize = 256 * 1024;
-
 /// Transfer a file range over a transport stream (TCP or QUIC). Same protocol as transfer_range_tcp.
 async fn transfer_range_stream(
     thread_id: usize,
@@ -463,7 +459,7 @@ async fn transfer_range_stream(
     };
 
     let mut offset = range.start;
-    let buffer_size = config.buffer_size.min(16 * 1024 * 1024).min(MAX_STREAM_CHUNK);
+    let buffer_size = config.buffer_size.min(16 * 1024 * 1024);
     let mut buffer = vec![0u8; buffer_size];
     let mut total_sent = 0u64;
 
@@ -537,7 +533,7 @@ async fn transfer_range_stream(
         packet.extend_from_slice(&(data_to_send.len() as u64).to_le_bytes());
         packet.extend_from_slice(&data_to_send);
 
-        const SEND_WRITE_CHUNK: usize = 64 * 1024;
+        const SEND_WRITE_CHUNK: usize = 16 * 1024 * 1024;
         let mut written = 0usize;
         let mut retries = 0u32;
         while written < packet.len() {
@@ -1776,6 +1772,46 @@ pub async fn send_file_tcp(
     );
 
     Ok(total_sent)
+}
+
+/// Probe bandwidth for a transport: connect, handshake, RTT, bandwidth probe; return bandwidth bps or None.
+/// Used for transport auto-selection (pick TCP vs QUIC by measured bandwidth).
+pub async fn probe_bandwidth_for_transport(
+    transport: &dyn Transport,
+    addr: SocketAddr,
+    config: &TransferConfig,
+) -> Option<u64> {
+    let (meta, _opener) = transport.connect_for_transfer(addr, 1, 1).await.ok()?;
+    let mut reader = meta.reader;
+    let mut writer = meta.writer;
+
+    let client_caps = crate::base::capabilities_from_config(config);
+    writer.write_all(&client_caps.to_bytes()).await.ok()?;
+    let mut cap_buf = [0u8; crate::base::CAPABILITIES_WIRE_LEN];
+    reader.read_exact(&mut cap_buf).await.ok()?;
+    let negotiated = crate::base::Capabilities::from_bytes(&cap_buf)?;
+
+    if (negotiated.flags & crate::base::cap_flags::RTT_PROBE) != 0 {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64;
+        let mut ping = [0u8; crate::base::PING_PONG_WIRE_LEN];
+        ping[0] = crate::base::msg::PING;
+        ping[1..9].copy_from_slice(&ts.to_le_bytes());
+        writer.write_all(&ping).await.ok()?;
+        let mut pong_buf = [0u8; crate::base::PING_PONG_WIRE_LEN];
+        reader.read_exact(&mut pong_buf).await.ok()?;
+        if pong_buf[0] != crate::base::msg::PONG {
+            return None;
+        }
+    }
+
+    if (negotiated.flags & crate::base::cap_flags::BANDWIDTH_PROBE) != 0 {
+        run_bandwidth_probe(&mut writer, &mut reader).await
+    } else {
+        None
+    }
 }
 
 /// Send a file over a transport (TCP or QUIC). Uses same protocol as send_file_tcp.

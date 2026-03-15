@@ -387,8 +387,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             size_b.cmp(&size_a)
         });
         
+        let server_addr_for_probe = (!cli.force_tcp).then(|| {
+            let s = format!("{}:{}", remote.host, remote.port.unwrap_or(8080));
+            s.to_socket_addrs().ok().and_then(|mut a| a.next())
+        }).flatten();
         let rt = tokio::runtime::Runtime::new()?;
-        let transport = rt.block_on(create_transport(&transfer_config, cli.force_tcp));
+        let transport = rt.block_on(create_transport(&transfer_config, cli.force_tcp, server_addr_for_probe));
         let output_stats = cli.stats || cli.json;
         let mut report = TransferReport::default();
 

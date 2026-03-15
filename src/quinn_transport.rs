@@ -3,8 +3,9 @@
 use crate::error::TransferError;
 use crate::transport::{Connection, Platform, Stream, StreamOpener, TransferMetaChannels, Transport};
 use async_trait::async_trait;
-use quinn::{ClientConfig, Connection as QuinnConnection, Endpoint, RecvStream, SendStream};
+use quinn::{ClientConfig, Connection as QuinnConnection, Endpoint, RecvStream, SendStream, TransportConfig, VarInt};
 use std::net::SocketAddr;
+use std::time::Duration;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -243,7 +244,16 @@ impl QuicTransport {
             .with_no_client_auth();
         let quic_cfg = QuicClientConfig::try_from(Arc::new(tls))
             .map_err(|e| TransferError::ProtocolError(format!("QUIC client config: {}", e)))?;
-        Ok(ClientConfig::new(Arc::new(quic_cfg)))
+
+        let mut transport_config = TransportConfig::default();
+        transport_config.receive_window(VarInt::from_u64(64 * 1024 * 1024).unwrap()); // 64MB connection window
+        transport_config.stream_receive_window(VarInt::from_u64(16 * 1024 * 1024).unwrap()); // 16MB per stream
+        transport_config.send_window(64 * 1024 * 1024); // 64MB send window
+        transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
+
+        let mut client_config = ClientConfig::new(Arc::new(quic_cfg));
+        client_config.transport_config(Arc::new(transport_config));
+        Ok(client_config)
     }
 }
 
@@ -285,6 +295,10 @@ impl Transport for QuicTransport {
             .map_err(|e| TransferError::ProtocolError(format!("QUIC server config: {}", e)))?;
         let transport = Arc::get_mut(&mut server_config.transport).unwrap();
         transport.max_concurrent_uni_streams(0u8.into());
+        transport.receive_window(VarInt::from_u64(64 * 1024 * 1024).unwrap());
+        transport.stream_receive_window(VarInt::from_u64(16 * 1024 * 1024).unwrap());
+        transport.send_window(64 * 1024 * 1024);
+        transport.keep_alive_interval(Some(Duration::from_secs(5)));
         let endpoint = Endpoint::server(server_config, addr)
             .map_err(|e| TransferError::NetworkError(format!("QUIC server bind: {}", e)))?;
         Ok(Box::new(QuinnListenerImpl {
