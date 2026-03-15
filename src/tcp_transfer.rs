@@ -1378,7 +1378,6 @@ pub async fn send_file_tcp(
     // Range queue: workers pull from pending, report completion or requeue on error. Coordinator updates checkpoint, stall detection, and smart scale-up.
     let num_pending = missing_ranges.len();
     let queue = Arc::new(RangeQueue::new(missing_ranges));
-    eprintln!("COORDINATOR: queue created with {} ranges", queue.pending_count());
     let (completed_tx, mut completed_rx) = mpsc::channel::<(WorkerId, FileRange, [u8; BLAKE3_LEN])>(64);
     let (done_tx, mut done_rx) = mpsc::channel::<(WorkerId, Result<(), TransferError>)>(32);
     let (metrics_tx, mut metrics_rx) = mpsc::channel::<StreamReport>(256);
@@ -1814,7 +1813,6 @@ pub async fn send_file_over_transport(
     // Step 4: Send metadata using negotiated config.max_streams (must be after step 2 capability negotiation).
     // Server uses this value for its range split; sender uses same config.max_streams for step 5.
     // Wire order: filename_len (8 LE) | filename | file_size (8 LE) | max_streams (8 LE)
-    eprintln!("SENDER: sending metadata file_size={} max_streams={}", file_size, config.max_streams);
     let metadata_bytes = {
         let filename_bytes = filename.as_bytes();
         let mut m = Vec::new();
@@ -1857,10 +1855,6 @@ pub async fn send_file_over_transport(
 
     // Step 5: Build ranges using negotiated config.max_streams (same value as step 4 metadata).
     // Sequence is: connect → negotiate (step 2) → RTT → send metadata (step 4) → ACK → build ranges (step 5).
-    eprintln!(
-        "COORDINATOR: building ranges with negotiated max_streams={}",
-        config.max_streams
-    );
     let all_ranges = split_file_ranges(file_size, transfer_num_ranges(config.max_streams));
     tracing::debug!(
         num_ranges = all_ranges.len(),
@@ -1950,7 +1944,6 @@ pub async fn send_file_over_transport(
     // Unified queue + coordinator (same as send_file_tcp). Opener held here so connection stays alive until workers complete.
     let num_pending = missing_ranges.len();
     let queue = Arc::new(RangeQueue::new(missing_ranges));
-    eprintln!("COORDINATOR: queue created with {} ranges", queue.pending_count());
     let (completed_tx, mut completed_rx) = mpsc::channel::<(WorkerId, FileRange, [u8; BLAKE3_LEN])>(64);
     let (done_tx, mut done_rx) = mpsc::channel::<(WorkerId, Result<(), TransferError>)>(32);
     let (metrics_tx, mut metrics_rx) = mpsc::channel::<StreamReport>(256);

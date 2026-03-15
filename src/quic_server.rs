@@ -187,7 +187,6 @@ impl QuicServer {
 
         let num_ranges = crate::base::transfer_num_ranges(num_streams);
         let ranges = crate::base::split_file_ranges(file_size, num_ranges);
-        eprintln!("SERVER: split into {} ranges (num_streams={})", ranges.len(), num_streams);
         let (range_hash_tx, mut range_hash_rx) = mpsc::channel::<(FileRange, [u8; BLAKE3_LEN])>(64);
 
         meta_stream.write_all(&[msg::READY]).await

@@ -301,18 +301,12 @@ impl TcpServer {
             stream.read_exact(&mut hash_buf).await
                 .map_err(|e| TransferError::NetworkError(format!("Failed to read CHECK_HASH hash: {}", e)))?;
             let path = output_dir.join(&check_filename);
-            let (cache_has_entry, cached_matches) = {
-                let guard = completed_hashes.lock().unwrap();
-                let entry = guard.get(&path);
-                (
-                    entry.is_some(),
-                    entry.map(|h| *h == hash_buf).unwrap_or(false),
-                )
-            };
-            eprintln!(
-                "SERVER: CHECK_HASH path={:?} cache_has_entry={} cached_matches={}",
-                path, cache_has_entry, cached_matches
-            );
+            let cached_matches = completed_hashes
+                .lock()
+                .unwrap()
+                .get(&path)
+                .map(|h| *h == hash_buf)
+                .unwrap_or(false);
             let have = if cached_matches {
                 if path.exists() {
                     match std::fs::metadata(&path) {
@@ -384,16 +378,8 @@ impl TcpServer {
             (filename, file_size, num_streams)
         };
 
-        eprintln!("SERVER: read num_streams from wire = {}", num_streams);
-        eprintln!(
-            "SERVER: transfer_num_ranges({}) = {}",
-            num_streams,
-            crate::base::transfer_num_ranges(num_streams)
-        );
-
         // Minimal logging - just the filename
         eprintln!("Receiving: {}", filename);
-        eprintln!("SERVER: handle_connection got metadata file_size={} num_streams={}", file_size, num_streams);
 
         // Ensure output directory exists
         std::fs::create_dir_all(&output_dir)?;
@@ -407,7 +393,6 @@ impl TcpServer {
         // Use num_streams from metadata (same value sender used for its range split after negotiation).
         let num_ranges = crate::base::transfer_num_ranges(num_streams);
         let ranges = crate::base::split_file_ranges(file_size, num_ranges);
-        eprintln!("SERVER: split into {} ranges (num_streams={})", ranges.len(), num_streams);
         tracing::debug!(
             num_ranges = ranges.len(),
             max_streams = num_streams,
@@ -617,7 +602,6 @@ impl TcpServer {
         let mut expected_hash = [0u8; BLAKE3_LEN];
         stream.read_exact(&mut expected_hash).await
             .map_err(|e| TransferError::NetworkError(format!("Failed to read file hash: {}", e)))?;
-        eprintln!("SERVER: expected hash (from client) {:?}", &expected_hash[..4]);
 
         drop(range_hash_tx);
         let mut received_ranges: Vec<(FileRange, [u8; BLAKE3_LEN])> = Vec::new();
@@ -633,9 +617,7 @@ impl TcpServer {
             first_bytes = ?verify_buf,
             "server file first 4 bytes after write"
         );
-        eprintln!("SERVER: about to hash file at {:?}", output_path);
         let server_hash = hash_file(&output_path, file_size)?;
-        eprintln!("SERVER: computed hash {:?}", &server_hash[..4]);
         tracing::debug!(
             output_path = %output_path.display(),
             file_size,
