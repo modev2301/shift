@@ -114,6 +114,25 @@ impl QuicServer {
                 .map_err(|e| TransferError::NetworkError(format!("Failed to read first byte: {}", e)))?;
         }
 
+        const MAX_PROBE_SIZE: usize = 8 * 1024 * 1024;
+        while first_byte[0] == msg::PROBE {
+            let mut size_buf = [0u8; 8];
+            meta_stream.read_exact(&mut size_buf).await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to read PROBE size: {}", e)))?;
+            let probe_size = u64::from_le_bytes(size_buf) as usize;
+            let to_read = probe_size.min(MAX_PROBE_SIZE);
+            let mut buf = vec![0u8; to_read.min(64 * 1024)];
+            let mut remaining = to_read;
+            while remaining > 0 {
+                let n = buf.len().min(remaining);
+                meta_stream.read_exact(&mut buf[..n]).await
+                    .map_err(|e| TransferError::NetworkError(format!("Failed to read PROBE data: {}", e)))?;
+                remaining -= n;
+            }
+            meta_stream.read_exact(&mut first_byte).await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to read after PROBE: {}", e)))?;
+        }
+
         let (filename, file_size, num_streams) = if first_byte[0] == msg::CHECK_HASH {
             let mut len_buf = [0u8; 8];
             meta_stream.read_exact(&mut len_buf).await

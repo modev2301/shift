@@ -38,6 +38,8 @@ pub mod msg {
     pub const HAVE_HASH: u8 = 0x0B;
     /// Server → Client: need file (proceed with metadata).
     pub const NEED_FILE: u8 = 0x0C;
+    /// Client → Server: bandwidth probe. Wire: 0x0D (1) + size (8 LE) + size bytes of data. Server reads and discards.
+    pub const PROBE: u8 = 0x0D;
 }
 /// Wire size of Ping/Pong: 1 byte type + 8 bytes timestamp_us LE.
 pub const PING_PONG_WIRE_LEN: usize = 9;

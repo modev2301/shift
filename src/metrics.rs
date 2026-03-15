@@ -45,6 +45,15 @@ impl BandwidthEstimator {
         self.peak_mbps > 0.0 && self.estimate_mbps() < self.peak_mbps * 0.80
     }
 
+    /// True if throughput dropped >20% from recent peak without recovery (possible loss → FEC candidate).
+    pub fn sudden_drop(&self) -> bool {
+        if self.samples.len() < 2 || self.peak_mbps <= 0.0 {
+            return false;
+        }
+        let current = self.estimate_mbps();
+        current < self.peak_mbps * 0.80
+    }
+
     fn evict(&mut self) {
         let cutoff = Instant::now() - self.window;
         while self.samples.front().map_or(false, |(t, _)| *t < cutoff) {

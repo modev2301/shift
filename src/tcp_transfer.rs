@@ -16,7 +16,7 @@ use crate::file_io::{open_file_optimized, FileReader};
 use crate::integrity::{hash_file, hash_file_range_path, BLAKE3_LEN};
 use crate::progress::{ProgressHandle, TransferProgress};
 use crate::resume::{delete_checkpoint, get_checkpoint_path, TransferCheckpoint};
-use crate::utils::is_file_compressible;
+use crate::utils::{is_file_compressible, optimal_streams_from_bdp, BANDWIDTH_PROBE_SIZE};
 use std::collections::HashSet;
 
 /// Data channel frame type: payload is a FEC-encoded block (RaptorQ). Inner payload starts with fec::FEC_PACKET_TYPE.
@@ -26,10 +26,36 @@ const DATA_FRAME_FEC: u8 = 0x02;
 /// Maximum chunk size we accept from the wire to avoid capacity overflow from corrupted or malicious data.
 const MAX_RECEIVE_CHUNK_SIZE: usize = 64 * 1024 * 1024;
 
-/// RTT above which we cap streams to avoid WAN stalls (high latency = fewer parallel connections work well).
-const RTT_WAN_THRESHOLD_MS: u64 = 50;
-/// Max streams when RTT exceeds threshold; avoids over-scaling and worker stalls on WAN.
-const MAX_STREAMS_WAN: usize = 12;
+/// Fallback max streams when bandwidth probe fails or we have no BDP (avoid over-scaling on WAN).
+const FALLBACK_MAX_STREAMS: usize = 12;
+
+/// Run bandwidth probe: send PROBE + size + data, measure time. Returns bandwidth in bytes/sec or None on failure.
+pub(crate) async fn run_bandwidth_probe<W>(writer: &mut W) -> Option<u64>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let start = Instant::now();
+    writer.write_all(&[msg::PROBE]).await.ok()?;
+    writer
+        .write_all(&(BANDWIDTH_PROBE_SIZE as u64).to_le_bytes())
+        .await
+        .ok()?;
+    const CHUNK: usize = 64 * 1024;
+    let zeros = [0u8; CHUNK];
+    let mut remaining = BANDWIDTH_PROBE_SIZE;
+    while remaining > 0 {
+        let n = remaining.min(CHUNK);
+        writer.write_all(&zeros[..n]).await.ok()?;
+        remaining -= n;
+    }
+    writer.flush().await.ok()?;
+    let elapsed_secs = start.elapsed().as_secs_f64();
+    if elapsed_secs < 0.02 {
+        return None;
+    }
+    Some((BANDWIDTH_PROBE_SIZE as f64 / elapsed_secs) as u64)
+}
+
 use std::fs::File;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -1266,11 +1292,12 @@ pub async fn send_file_tcp(
         100u64
     };
 
-    // Cap max streams on high RTT (WAN) so we don't over-scale and stall; low RTT keeps full ceiling.
-    let effective_max_streams = if rtt_ms > RTT_WAN_THRESHOLD_MS {
-        config.max_streams.min(MAX_STREAMS_WAN)
+    // Measurement-driven stream count: bandwidth probe then BDP-based optimal streams.
+    let bandwidth_bps = run_bandwidth_probe(&mut writer).await;
+    let effective_max_streams = if let Some(bw) = bandwidth_bps {
+        optimal_streams_from_bdp(bw, rtt_ms, config.buffer_size, config.max_streams)
     } else {
-        config.max_streams
+        config.max_streams.min(FALLBACK_MAX_STREAMS)
     };
 
     // Step 4: Send metadata using effective_max_streams (same value server uses for listeners and ranges).
@@ -1419,6 +1446,8 @@ pub async fn send_file_tcp(
     let mut stale_completions: HashSet<(WorkerId, u64, u64)> = HashSet::new();
     let mut estimator = BandwidthEstimator::new(10);
     let mut last_change = Instant::now();
+    let mut last_scale_up: Option<(Instant, f64)> = None;
+    let mut scale_up_disabled = false;
 
     #[cfg(feature = "fec")]
     let enable_fec_auto: Option<Arc<AtomicBool>> = if config.fec_negotiated {
@@ -1576,7 +1605,27 @@ pub async fn send_file_tcp(
                     tracing::warn!(worker_id = id, "worker stalled, requeuing range");
                 }
 
-                let can_scale = active_workers.len() < effective_max_streams
+                #[cfg(feature = "fec")]
+                if stalled.is_empty() && estimator.sudden_drop() {
+                    if let Some(ref auto) = enable_fec_auto {
+                        if !auto.load(Ordering::Relaxed) {
+                            auto.store(true, Ordering::Relaxed);
+                            tracing::info!("throughput sudden drop, enabling FEC");
+                        }
+                    }
+                }
+
+                if let Some((t, mbps_at_scale)) = last_scale_up {
+                    if t.elapsed() > Duration::from_millis((rtt_ms * 4).max(4000)) {
+                        if estimator.estimate_mbps() < mbps_at_scale * 1.05 {
+                            scale_up_disabled = true;
+                        }
+                        last_scale_up = None;
+                    }
+                }
+
+                let can_scale = !scale_up_disabled
+                    && active_workers.len() < effective_max_streams
                     && next_worker_id < effective_max_streams
                     && !queue.is_done();
                 let should_scale = estimator.is_underperforming() || estimator.peak_mbps == 0.0;
@@ -1589,6 +1638,7 @@ pub async fn send_file_tcp(
                     let handle = spawn_worker(id_new, &queue, &file, &file_path_buf, &config, &progress_handle, &metrics_tx, &completed_tx, &done_tx, &enable_fec_auto, cancel_child);
                     active_workers.insert(id_new, WorkerState { last_active: Instant::now(), handle, cancel, consecutive_zero_intervals: 0 });
                     last_change = Instant::now();
+                    last_scale_up = Some((Instant::now(), estimator.estimate_mbps()));
                 }
 
                 if queue.is_done() && active_workers.is_empty() {
@@ -1801,11 +1851,14 @@ pub async fn send_file_over_transport(
         100u64
     };
 
-    // Cap max streams on high RTT (WAN) so we don't over-scale and stall; low RTT keeps full ceiling.
-    let effective_max_streams = if rtt_ms > RTT_WAN_THRESHOLD_MS {
-        config.max_streams.min(MAX_STREAMS_WAN)
+    // Measurement-driven stream count: bandwidth probe then BDP-based optimal streams.
+    let bandwidth_bps = run_bandwidth_probe(&mut writer).await;
+    let effective_max_streams = if let Some(bw) = bandwidth_bps {
+        let streams = optimal_streams_from_bdp(bw, rtt_ms, config.buffer_size, config.max_streams);
+        tracing::debug!(bandwidth_bps = bw, rtt_ms, bdp_streams = streams, "probe BDP stream count");
+        streams
     } else {
-        config.max_streams
+        config.max_streams.min(FALLBACK_MAX_STREAMS)
     };
 
     // --update: optional skip check (CHECK_HASH). If server has same hash, skip transfer.
@@ -1991,6 +2044,8 @@ pub async fn send_file_over_transport(
     let mut streams_stalled: usize = 0;
     let mut estimator = BandwidthEstimator::new(10);
     let mut last_change = Instant::now();
+    let mut last_scale_up: Option<(Instant, f64)> = None;
+    let mut scale_up_disabled = false;
     #[cfg(feature = "fec")]
     let enable_fec_auto: Option<Arc<AtomicBool>> = if config.fec_negotiated {
         Some(Arc::new(AtomicBool::new(false)))
@@ -2141,7 +2196,27 @@ pub async fn send_file_over_transport(
                     tracing::warn!(worker_id = id, "worker stalled, requeuing range");
                 }
 
-                let can_scale = active_workers.len() < effective_max_streams
+                #[cfg(feature = "fec")]
+                if stalled.is_empty() && estimator.sudden_drop() {
+                    if let Some(ref auto) = enable_fec_auto {
+                        if !auto.load(Ordering::Relaxed) {
+                            auto.store(true, Ordering::Relaxed);
+                            tracing::info!("throughput sudden drop, enabling FEC");
+                        }
+                    }
+                }
+
+                if let Some((t, mbps_at_scale)) = last_scale_up {
+                    if t.elapsed() > Duration::from_millis((rtt_ms * 4).max(4000)) {
+                        if estimator.estimate_mbps() < mbps_at_scale * 1.05 {
+                            scale_up_disabled = true;
+                        }
+                        last_scale_up = None;
+                    }
+                }
+
+                let can_scale = !scale_up_disabled
+                    && active_workers.len() < effective_max_streams
                     && next_worker_id < effective_max_streams
                     && !queue.is_done();
                 let should_scale = estimator.is_underperforming() || estimator.peak_mbps == 0.0;
@@ -2154,10 +2229,22 @@ pub async fn send_file_over_transport(
                     let handle = spawn_transport_worker(id_new, &opener, &queue, &file, &file_path_buf, &config, &progress_handle, &metrics_tx, &completed_tx, &done_tx, &enable_fec_auto, cancel_child);
                     active_workers.insert(id_new, WorkerState { last_active: Instant::now(), handle, cancel, consecutive_zero_intervals: 0 });
                     last_change = Instant::now();
+                    last_scale_up = Some((Instant::now(), estimator.estimate_mbps()));
                 }
 
                 streams_peak = streams_peak.max(active_workers.len());
-                progress_handle.set_message(format!("{}  {}→{}", transport_label, num_workers_initial, streams_peak));
+                let msg = match bandwidth_bps {
+                    Some(bw) => format!(
+                        "{}  {}→{}  ({}ms RTT, {:.1} MB/s)",
+                        transport_label,
+                        num_workers_initial,
+                        streams_peak,
+                        rtt_ms,
+                        bw as f64 / 1_000_000.0
+                    ),
+                    None => format!("{}  {}→{}", transport_label, num_workers_initial, streams_peak),
+                };
+                progress_handle.set_message(msg);
 
                 if queue.is_done() && active_workers.is_empty() {
                     break;

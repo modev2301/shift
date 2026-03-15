@@ -286,6 +286,26 @@ impl TcpServer {
                 .map_err(|e| TransferError::NetworkError(format!("Failed to read filename length: {}", e)))?;
         }
 
+        // Drain optional bandwidth probe(s): PROBE (1) + size (8) + data. Server discards; client measures time.
+        const MAX_PROBE_SIZE: usize = 8 * 1024 * 1024;
+        while first_byte[0] == msg::PROBE {
+            let mut size_buf = [0u8; 8];
+            stream.read_exact(&mut size_buf).await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to read PROBE size: {}", e)))?;
+            let probe_size = u64::from_le_bytes(size_buf) as usize;
+            let to_read = probe_size.min(MAX_PROBE_SIZE);
+            let mut buf = vec![0u8; to_read.min(64 * 1024)];
+            let mut remaining = to_read;
+            while remaining > 0 {
+                let n = buf.len().min(remaining);
+                stream.read_exact(&mut buf[..n]).await
+                    .map_err(|e| TransferError::NetworkError(format!("Failed to read PROBE data: {}", e)))?;
+                remaining -= n;
+            }
+            stream.read_exact(&mut first_byte).await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to read after PROBE: {}", e)))?;
+        }
+
         let (filename, file_size, num_streams) = if first_byte[0] == msg::CHECK_HASH {
             // --update skip check: read filename_len (8) + filename + hash (32)
             let mut len_buf = [0u8; 8];
