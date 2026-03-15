@@ -284,9 +284,9 @@ async fn transfer_range_tcp(
         None
     };
 
-    // Read and send file data
+    // Read and send file data. Cap read size to avoid EINVAL on some kernels (pread) or stacks (large writes).
     let mut offset = range.start;
-    let buffer_size = config.buffer_size.min(16 * 1024 * 1024);
+    let buffer_size = config.buffer_size.min(16 * 1024 * 1024).min(MAX_STREAM_CHUNK);
     let mut buffer = vec![0u8; buffer_size];
     let mut total_sent = 0u64;
 
@@ -358,20 +358,23 @@ async fn transfer_range_tcp(
         packet.extend_from_slice(&(data_to_send.len() as u64).to_le_bytes());
         packet.extend_from_slice(&data_to_send);
         
-        // Write all data; retry on ENOBUFS (55) / WouldBlock so kernel can drain (e.g. macOS over many streams)
+        // Write in chunks to avoid EINVAL on some kernels/stacks; retry on ENOBUFS / WouldBlock / EINVAL.
+        const SEND_WRITE_CHUNK: usize = 64 * 1024;
         const SEND_RETRY_DELAY_MS: u64 = 50;
         const SEND_RETRY_MAX: u32 = 120; // ~6s of retries then fail
         let mut written = 0usize;
         let mut retries = 0u32;
         while written < packet.len() {
-            match writer.write(&packet[written..]).await {
+            let chunk = (packet.len() - written).min(SEND_WRITE_CHUNK);
+            match writer.write(&packet[written..written + chunk]).await {
                 Ok(0) => return Err(TransferError::NetworkError("Connection closed during send".to_string())),
                 Ok(n) => {
                     written += n;
                     retries = 0;
                 }
                 Err(e) => {
-                    let retryable = e.raw_os_error() == Some(55) // ENOBUFS on macOS/Darwin
+                    let retryable = e.raw_os_error() == Some(55) // ENOBUFS
+                        || e.raw_os_error() == Some(22) // EINVAL on some kernels
                         || e.kind() == std::io::ErrorKind::WouldBlock;
                     if retryable && retries < SEND_RETRY_MAX {
                         retries += 1;
@@ -534,10 +537,12 @@ async fn transfer_range_stream(
         packet.extend_from_slice(&(data_to_send.len() as u64).to_le_bytes());
         packet.extend_from_slice(&data_to_send);
 
+        const SEND_WRITE_CHUNK: usize = 64 * 1024;
         let mut written = 0usize;
         let mut retries = 0u32;
         while written < packet.len() {
-            match stream.write(&packet[written..]).await {
+            let chunk = (packet.len() - written).min(SEND_WRITE_CHUNK);
+            match stream.write(&packet[written..written + chunk]).await {
                 Ok(0) => return Err(TransferError::NetworkError("Connection closed during send".to_string())),
                 Ok(n) => {
                     written += n;
@@ -545,6 +550,7 @@ async fn transfer_range_stream(
                 }
                 Err(e) => {
                     let retryable = e.raw_os_error() == Some(55)
+                        || e.raw_os_error() == Some(22) // EINVAL on some kernels/stacks
                         || e.kind() == std::io::ErrorKind::WouldBlock;
                     if retryable && retries < SEND_RETRY_MAX {
                         retries += 1;
