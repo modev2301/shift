@@ -22,6 +22,9 @@ use std::collections::HashSet;
 /// Data channel frame type: payload is a FEC-encoded block (RaptorQ). Inner payload starts with fec::FEC_PACKET_TYPE.
 /// 0x00 = raw, 0x01 = compressed, 0x02 = FEC block.
 const DATA_FRAME_FEC: u8 = 0x02;
+
+/// Maximum chunk size we accept from the wire to avoid capacity overflow from corrupted or malicious data.
+const MAX_RECEIVE_CHUNK_SIZE: usize = 64 * 1024 * 1024;
 use std::fs::File;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -784,6 +787,12 @@ where
         if data_size == 0 {
             break;
         }
+        if data_size > MAX_RECEIVE_CHUNK_SIZE {
+            return Err(TransferError::ProtocolError(format!(
+                "Chunk size {} exceeds maximum {}",
+                data_size, MAX_RECEIVE_CHUNK_SIZE
+            )));
+        }
         
         // Read encrypted/compressed data
         let mut data_buf = vec![0u8; data_size];
@@ -987,6 +996,12 @@ pub(crate) async fn receive_range_stream(
 
         if data_size == 0 {
             break;
+        }
+        if data_size > MAX_RECEIVE_CHUNK_SIZE {
+            return Err(TransferError::ProtocolError(format!(
+                "Chunk size {} exceeds maximum {}",
+                data_size, MAX_RECEIVE_CHUNK_SIZE
+            )));
         }
 
         let mut data_buf = vec![0u8; data_size];
