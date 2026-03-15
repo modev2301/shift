@@ -25,6 +25,11 @@ const DATA_FRAME_FEC: u8 = 0x02;
 
 /// Maximum chunk size we accept from the wire to avoid capacity overflow from corrupted or malicious data.
 const MAX_RECEIVE_CHUNK_SIZE: usize = 64 * 1024 * 1024;
+
+/// RTT above which we cap streams to avoid WAN stalls (high latency = fewer parallel connections work well).
+const RTT_WAN_THRESHOLD_MS: u64 = 50;
+/// Max streams when RTT exceeds threshold; avoids over-scaling and worker stalls on WAN.
+const MAX_STREAMS_WAN: usize = 12;
 use std::fs::File;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -1261,14 +1266,21 @@ pub async fn send_file_tcp(
         100u64
     };
 
-    // Step 4: Send metadata using negotiated config.max_streams (must be after step 2 capability negotiation).
+    // Cap max streams on high RTT (WAN) so we don't over-scale and stall; low RTT keeps full ceiling.
+    let effective_max_streams = if rtt_ms > RTT_WAN_THRESHOLD_MS {
+        config.max_streams.min(MAX_STREAMS_WAN)
+    } else {
+        config.max_streams
+    };
+
+    // Step 4: Send metadata using effective_max_streams (same value server uses for listeners and ranges).
     let metadata = {
         let filename_bytes = filename.as_bytes();
         let mut m = Vec::new();
         m.extend_from_slice(&(filename_bytes.len() as u64).to_le_bytes());
         m.extend_from_slice(filename_bytes);
         m.extend_from_slice(&file_size.to_le_bytes());
-        m.extend_from_slice(&(config.max_streams as u64).to_le_bytes());
+        m.extend_from_slice(&(effective_max_streams as u64).to_le_bytes());
         m
     };
     writer.write_all(&metadata).await
@@ -1304,8 +1316,8 @@ pub async fn send_file_tcp(
         TransferCheckpoint::new(file_size)
     };
 
-    // Step 5: Build ranges using negotiated config.max_streams (same value as step 4 metadata).
-    let all_ranges = split_file_ranges(file_size, transfer_num_ranges(config.max_streams));
+    // Step 5: Build ranges using effective_max_streams (same value as step 4 metadata).
+    let all_ranges = split_file_ranges(file_size, transfer_num_ranges(effective_max_streams));
 
     // Per-range verification (before opening data streams): send 0x06 if we have completed ranges with hashes.
     let completed_ordered = checkpoint.completed_ranges_ordered(&all_ranges);
@@ -1399,7 +1411,7 @@ pub async fn send_file_tcp(
     let base_port = server_addr.port();
     let server_ip = server_addr.ip();
     let file_path_buf = file_path.to_path_buf();
-    let num_workers_initial = config.num_streams.min(num_pending).max(1);
+    let num_workers_initial = config.num_streams.min(num_pending).min(effective_max_streams).max(1);
     let mut next_worker_id = num_workers_initial;
     let mut active_workers: std::collections::HashMap<WorkerId, WorkerState> = std::collections::HashMap::new();
     let mut completed_worker_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
@@ -1564,8 +1576,8 @@ pub async fn send_file_tcp(
                     tracing::warn!(worker_id = id, "worker stalled, requeuing range");
                 }
 
-                let can_scale = active_workers.len() < config.max_streams
-                    && next_worker_id < config.max_streams
+                let can_scale = active_workers.len() < effective_max_streams
+                    && next_worker_id < effective_max_streams
                     && !queue.is_done();
                 let should_scale = estimator.is_underperforming() || estimator.peak_mbps == 0.0;
                 let cooldown_ok = last_change.elapsed() > Duration::from_millis(rtt_ms * 2);
@@ -1789,6 +1801,13 @@ pub async fn send_file_over_transport(
         100u64
     };
 
+    // Cap max streams on high RTT (WAN) so we don't over-scale and stall; low RTT keeps full ceiling.
+    let effective_max_streams = if rtt_ms > RTT_WAN_THRESHOLD_MS {
+        config.max_streams.min(MAX_STREAMS_WAN)
+    } else {
+        config.max_streams
+    };
+
     // --update: optional skip check (CHECK_HASH). If server has same hash, skip transfer.
     if skip_unchanged {
         let skip_start = std::time::Instant::now();
@@ -1826,8 +1845,7 @@ pub async fn send_file_over_transport(
         }
     }
 
-    // Step 4: Send metadata using negotiated config.max_streams (must be after step 2 capability negotiation).
-    // Server uses this value for its range split; sender uses same config.max_streams for step 5.
+    // Step 4: Send metadata using effective_max_streams (same value server uses for listeners and ranges).
     // Wire order: filename_len (8 LE) | filename | file_size (8 LE) | max_streams (8 LE)
     let metadata_bytes = {
         let filename_bytes = filename.as_bytes();
@@ -1835,7 +1853,7 @@ pub async fn send_file_over_transport(
         m.extend_from_slice(&(filename_bytes.len() as u64).to_le_bytes());
         m.extend_from_slice(filename_bytes);
         m.extend_from_slice(&file_size.to_le_bytes());
-        m.extend_from_slice(&(config.max_streams as u64).to_le_bytes());
+        m.extend_from_slice(&(effective_max_streams as u64).to_le_bytes());
         m
     };
     writer.write_all(&metadata_bytes).await
@@ -1869,12 +1887,11 @@ pub async fn send_file_over_transport(
         TransferCheckpoint::new(file_size)
     };
 
-    // Step 5: Build ranges using negotiated config.max_streams (same value as step 4 metadata).
-    // Sequence is: connect → negotiate (step 2) → RTT → send metadata (step 4) → ACK → build ranges (step 5).
-    let all_ranges = split_file_ranges(file_size, transfer_num_ranges(config.max_streams));
+    // Step 5: Build ranges using effective_max_streams (same value as step 4 metadata).
+    let all_ranges = split_file_ranges(file_size, transfer_num_ranges(effective_max_streams));
     tracing::debug!(
         num_ranges = all_ranges.len(),
-        max_streams = config.max_streams,
+        max_streams = effective_max_streams,
         file_size,
         "sender split file into ranges"
     );
@@ -1964,7 +1981,7 @@ pub async fn send_file_over_transport(
     let (done_tx, mut done_rx) = mpsc::channel::<(WorkerId, Result<(), TransferError>)>(32);
     let (metrics_tx, mut metrics_rx) = mpsc::channel::<StreamReport>(256);
     let file_path_buf = file_path.to_path_buf();
-    let num_workers_initial = config.num_streams.min(num_pending).max(1);
+    let num_workers_initial = config.num_streams.min(num_pending).min(effective_max_streams).max(1);
     let mut next_worker_id = num_workers_initial;
     let mut active_workers: std::collections::HashMap<WorkerId, WorkerState> = std::collections::HashMap::new();
     let mut completed_worker_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
@@ -2124,8 +2141,8 @@ pub async fn send_file_over_transport(
                     tracing::warn!(worker_id = id, "worker stalled, requeuing range");
                 }
 
-                let can_scale = active_workers.len() < config.max_streams
-                    && next_worker_id < config.max_streams
+                let can_scale = active_workers.len() < effective_max_streams
+                    && next_worker_id < effective_max_streams
                     && !queue.is_done();
                 let should_scale = estimator.is_underperforming() || estimator.peak_mbps == 0.0;
                 let cooldown_ok = last_change.elapsed() > Duration::from_millis(rtt_ms * 2);

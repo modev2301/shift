@@ -8,7 +8,7 @@ Shift is a high-performance file transfer system for reliable, efficient data mo
 ## Features
 
 - **Dual transport** — QUIC (default) with TCP fallback; force TCP with `--tcp`. Same protocol on both.
-- **Adaptive streams** — Range queue + coordinator: scale streams up on stall, requeue failed ranges, RTT probe for thresholds.
+- **Adaptive streams** — RTT probe caps streams on high-latency (WAN) to avoid stalls; scale-up and requeue on low RTT. No manual `--streams` needed for typical use.
 - **Parallel connections** — Multiple streams per transfer; finer range granularity (max_streams×4) for load balance and resume.
 - **End-to-end integrity** — BLAKE3 of bytes sent; server verifies and replies HASH_OK or HASH_MISMATCH (client keeps checkpoint on mismatch).
 - **Resume with per-range verification** — SQLite checkpoint (WAL) stores completed ranges and per-range BLAKE3; server re-verifies before accepting data.
