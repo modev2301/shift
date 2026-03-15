@@ -66,6 +66,10 @@ async fn test_loopback_tcp_transfer_end_to_end() {
     std::fs::write(&src_path, &content).expect("write");
     let expected_hash = hash_file(&src_path, size).expect("hash source");
 
+    // Hash source before transfer
+    let pre_hash = hash_file(&src_path, size).expect("pre hash");
+    eprintln!("pre-transfer source hash: {:?}", &pre_hash[..4]);
+
     let (port_tx, port_rx) = tokio::sync::oneshot::channel();
     let server = TcpServer::new(0, out_path.clone(), transfer_config(0));
     let server_handle = tokio::spawn(async move {
@@ -77,6 +81,8 @@ async fn test_loopback_tcp_transfer_end_to_end() {
     let config = transfer_config(port);
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().expect("parse addr");
     let transport = create_transport(&config, true).await;
+    // Clear any existing checkpoint so we don't resume from a previous failed run
+    let _ = shift::resume::delete_checkpoint(&src_path);
     let result = send_file_over_transport(
         transport.as_ref(),
         &src_path,
@@ -88,6 +94,10 @@ async fn test_loopback_tcp_transfer_end_to_end() {
     )
     .await;
 
+    // Hash source after transfer
+    let post_hash = hash_file(&src_path, size).expect("post hash");
+    eprintln!("post-transfer source hash: {:?}", &post_hash[..4]);
+
     let sent = result.expect("transfer should succeed");
     assert_eq!(sent, size, "bytes sent should match file size");
 
@@ -95,8 +105,12 @@ async fn test_loopback_tcp_transfer_end_to_end() {
     assert!(received_path.exists(), "received file should exist");
     let received_meta = std::fs::metadata(&received_path).expect("metadata");
     assert_eq!(received_meta.len(), size, "received size should match");
-    let received_hash = hash_file(&received_path, size).expect("hash received");
-    assert_eq!(received_hash[..], expected_hash[..], "BLAKE3 of received file should match source");
+    // content = (0..size).map(|i| (i % 251) as u8) => bytes 0..4 are [0, 1, 2, 3]
+    eprintln!("expected first bytes: [0, 1, 2, 3]");
+    let recv_hash = hash_file(&received_path, size).expect("recv hash");
+    eprintln!("received file hash: {:?}", &recv_hash[..4]);
+    eprintln!("expected: {:?}", &expected_hash[..4]);
+    assert_eq!(recv_hash[..], expected_hash[..], "BLAKE3 of received file should match source");
 
     let _ = server_handle.await;
 }

@@ -20,6 +20,7 @@ use std::sync::mpsc as std_mpsc;
 use socket2::{Domain, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tracing::error;
@@ -349,6 +350,8 @@ impl TcpServer {
             let num_streams = u64::from_le_bytes(num_streams_buf) as usize;
             (filename, file_size, num_streams)
         } else {
+            // Normal metadata: wire order = filename_len (8 LE) | filename | file_size (8 LE) | max_streams (8 LE)
+            // first_byte is already the first byte of filename_len
             let mut filename_len_buf = [0u8; 8];
             filename_len_buf[0] = first_byte[0];
             stream.read_exact(&mut filename_len_buf[1..8]).await
@@ -370,8 +373,16 @@ impl TcpServer {
             (filename, file_size, num_streams)
         };
 
+        eprintln!("SERVER: read num_streams from wire = {}", num_streams);
+        eprintln!(
+            "SERVER: transfer_num_ranges({}) = {}",
+            num_streams,
+            crate::base::transfer_num_ranges(num_streams)
+        );
+
         // Minimal logging - just the filename
         eprintln!("Receiving: {}", filename);
+        eprintln!("SERVER: handle_connection got metadata file_size={} num_streams={}", file_size, num_streams);
 
         // Ensure output directory exists
         std::fs::create_dir_all(&output_dir)?;
@@ -382,19 +393,37 @@ impl TcpServer {
         file.set_len(file_size)?;
         let file = Arc::new(file);
 
+        // Use num_streams from metadata (same value sender used for its range split after negotiation).
         let num_ranges = crate::base::transfer_num_ranges(num_streams);
         let ranges = crate::base::split_file_ranges(file_size, num_ranges);
+        eprintln!("SERVER: split into {} ranges (num_streams={})", ranges.len(), num_streams);
+        tracing::debug!(
+            num_ranges = ranges.len(),
+            max_streams = num_streams,
+            file_size,
+            "server split file into ranges"
+        );
+        tracing::debug!(
+            num_connections_expected = ranges.len(),
+            "server waiting for data connections"
+        );
         let mut data_handles = Vec::new();
 
         let (range_hash_tx, mut range_hash_rx) = mpsc::channel::<(FileRange, [u8; BLAKE3_LEN])>(64);
+        // Extra listeners so requeued ranges (retries) can connect; collector signals shutdown when num_ranges received
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+        let (done_tx, mut done_rx) = mpsc::channel::<()>(64);
+        let num_listeners = 2 * num_ranges;
 
         #[cfg(feature = "tls")]
         let tls_acceptor = tls_acceptor.clone();
-        for (thread_id, _range) in ranges.into_iter().enumerate() {
+        for thread_id in 0..num_listeners {
             let file = Arc::clone(&file);
             let config = config.clone();
             let data_port = base_port + 1 + thread_id as u16;
             let range_hash_tx = range_hash_tx.clone();
+            let mut shutdown_rx = shutdown_tx.subscribe();
+            let done_tx = done_tx.clone();
             #[cfg(feature = "tls")]
             let tls_acceptor = tls_acceptor.clone();
 
@@ -424,24 +453,37 @@ impl TcpServer {
                 let listener = TcpListener::from_std(std_listener)
                     .map_err(|e| TransferError::NetworkError(format!("Failed to convert to tokio listener: {}", e)))?;
 
-                // Accept connection
-                let (data_stream, _) = listener.accept().await
-                    .map_err(|e| TransferError::NetworkError(format!("Accept failed: {}", e)))?;
+                loop {
+                    tokio::select! {
+                        biased;
+                        conn = listener.accept() => {
+                            let (data_stream, _) = conn
+                                .map_err(|e| TransferError::NetworkError(format!("Accept failed: {}", e)))?;
+                            tracing::debug!(
+                                connection_count = thread_id,
+                                "server accepted data connection"
+                            );
 
-                #[cfg(feature = "tls")]
-                let data_stream = {
-                    if let Some(acceptor) = tls_acceptor {
-                        let tls_stream = acceptor
-                            .accept(data_stream)
-                            .await
-                            .map_err(|e| TransferError::NetworkError(format!("TLS accept data: {}", e)))?;
-                        MetaStream::Tls(tls_stream)
-                    } else {
-                        MetaStream::Plain(data_stream)
+                            #[cfg(feature = "tls")]
+                            let data_stream = {
+                                if let Some(acceptor) = tls_acceptor {
+                                    let tls_stream = acceptor
+                                        .accept(data_stream)
+                                        .await
+                                        .map_err(|e| TransferError::NetworkError(format!("TLS accept data: {}", e)))?;
+                                    MetaStream::Tls(tls_stream)
+                                } else {
+                                    MetaStream::Plain(data_stream)
+                                }
+                            };
+
+                            let r = receive_range_tcp(thread_id, file, data_stream, config, None, Some(range_hash_tx)).await;
+                            let _ = done_tx.send(()).await;
+                            return r;
+                        }
+                        _ = shutdown_rx.recv() => return Ok(0u64),
                     }
-                };
-
-                receive_range_tcp(thread_id, file, data_stream, config, None, Some(range_hash_tx)).await
+                }
             });
 
             data_handles.push(handle);
@@ -449,6 +491,14 @@ impl TcpServer {
 
         stream.write_all(&[msg::READY]).await
             .map_err(|e| TransferError::NetworkError(format!("Failed to send initial ack: {}", e)))?;
+
+        // When num_ranges have been received, signal extra listeners to stop accepting so join completes
+        let collector = tokio::spawn(async move {
+            for _ in 0..num_ranges {
+                let _ = done_rx.recv().await;
+            }
+            let _ = shutdown_tx.send(());
+        });
 
         // Optional per-range verification (0x06) before data streams. Client sends 0x00 or 0x06.
         let mut range_verify_byte = [0u8; 1];
@@ -490,12 +540,22 @@ impl TcpServer {
         }
         // else 0x00: no range verify, proceed to data listeners
 
-        // Wait for all data connections to complete. Defer returning error so we can do hash
-        // exchange and send HASH_OK/HASH_MISMATCH before closing (avoids client "early eof").
+        // Wait for all data connections to complete (and for collector to signal shutdown to extra listeners).
+        // Defer returning error so we can do hash exchange and send HASH_OK/HASH_MISMATCH before closing (avoids client "early eof").
+        let join_all_handles = async {
+            let mut out = Vec::with_capacity(data_handles.len());
+            for h in data_handles {
+                out.push(h.await);
+            }
+            out
+        };
+        let (_collector_result, handle_results) = tokio::join!(collector, join_all_handles);
+        let _ = _collector_result;
+
         let mut total_received = 0u64;
         let mut data_error: Option<TransferError> = None;
-        for (thread_id, handle) in data_handles.into_iter().enumerate() {
-            match handle.await {
+        for (thread_id, result) in handle_results.into_iter().enumerate() {
+            match result {
                 Ok(Ok(bytes)) => {
                     total_received += bytes;
                     tracing::debug!(
@@ -546,13 +606,35 @@ impl TcpServer {
         let mut expected_hash = [0u8; BLAKE3_LEN];
         stream.read_exact(&mut expected_hash).await
             .map_err(|e| TransferError::NetworkError(format!("Failed to read file hash: {}", e)))?;
+        eprintln!("SERVER: expected hash (from client) {:?}", &expected_hash[..4]);
 
         drop(range_hash_tx);
         let mut received_ranges: Vec<(FileRange, [u8; BLAKE3_LEN])> = Vec::new();
         while let Some(rh) = range_hash_rx.recv().await {
             received_ranges.push(rh);
         }
-        let actual_hash = hash_file(&output_path, file_size)?;
+        // Read back the first 4 bytes of what was written
+        let mut verify_buf = [0u8; 4];
+        let mut verify_file = std::fs::File::open(&output_path)?;
+        use std::io::Read;
+        verify_file.read_exact(&mut verify_buf)?;
+        tracing::debug!(
+            first_bytes = ?verify_buf,
+            "server file first 4 bytes after write"
+        );
+        eprintln!("SERVER: about to hash file at {:?}", output_path);
+        let server_hash = hash_file(&output_path, file_size)?;
+        eprintln!("SERVER: computed hash {:?}", &server_hash[..4]);
+        tracing::debug!(
+            output_path = %output_path.display(),
+            file_size,
+            "server about to hash file"
+        );
+        tracing::debug!(
+            server_hash_first4 = ?&server_hash[..4],
+            "server computed hash"
+        );
+        let actual_hash = server_hash;
         if actual_hash != expected_hash {
             // Tell client to keep checkpoint for retry (0x05), then return error.
             let _ = stream.write_all(&[msg::HASH_MISMATCH]).await;

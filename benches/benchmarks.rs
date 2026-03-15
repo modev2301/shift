@@ -154,8 +154,7 @@ fn range_queue_contention(c: &mut Criterion) {
                             let q = Arc::clone(&queue);
                             handles.push(thread::spawn(move || {
                                 let mut count = 0u64;
-                                while let Some(range) = q.pop() {
-                                    q.mark_in_flight(id, range);
+                                while let Some(range) = q.pop_and_mark(id) {
                                     count += range.end - range.start;
                                     q.complete(id);
                                 }

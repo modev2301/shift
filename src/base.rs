@@ -174,11 +174,12 @@ pub fn capabilities_from_config(config: &TransferConfig) -> Capabilities {
 }
 
 /// Apply negotiated capabilities to config. num_streams = initial (starting count), max_streams = ceiling.
+/// Never increase max_streams above the client's original config so range split matches what the client intended (and what we send in metadata).
 pub fn apply_capabilities_to_config(config: &TransferConfig, cap: Capabilities) -> TransferConfig {
     use cap_flags::{COMPRESSION, ENCRYPTION};
     let mut c = config.clone();
     c.num_streams = cap.initial_streams as usize;
-    c.max_streams = cap.max_streams as usize;
+    c.max_streams = config.max_streams.min(cap.max_streams as usize);
     c.buffer_size = cap.max_buffer as usize;
     c.enable_compression = (cap.flags & COMPRESSION) != 0;
     c.enable_encryption = (cap.flags & ENCRYPTION) != 0;

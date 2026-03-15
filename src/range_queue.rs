@@ -1,5 +1,6 @@
 //! Range queue for adaptive stream transfer. Coordinator owns the queue; workers pop ranges
-//! and report completion or requeue on failure. Enables many ranges with fewer streams and scale-up.
+//! and report completion or requeue on failure. Single mutex guards both pending and in_flight
+//! so pop_and_mark is atomic and no two workers can get the same range.
 
 use crate::base::FileRange;
 use std::collections::{HashMap, VecDeque};
@@ -16,62 +17,62 @@ pub struct StreamReport {
     pub elapsed_ms: u64,
 }
 
-/// Shared queue of file ranges. Workers pop from pending, mark in_flight, then complete or requeue.
-pub struct RangeQueue {
-    pending: Mutex<VecDeque<FileRange>>,
-    in_flight: Mutex<HashMap<WorkerId, FileRange>>,
+struct Inner {
+    pending: VecDeque<FileRange>,
+    in_flight: HashMap<WorkerId, FileRange>,
 }
 
+pub struct RangeQueue(Mutex<Inner>);
+
 impl RangeQueue {
-    /// Build queue from the list of ranges still to transfer (e.g. checkpoint.get_missing_ranges).
     pub fn new(ranges: Vec<FileRange>) -> Self {
-        let pending = Mutex::new(ranges.into_iter().collect());
-        let in_flight = Mutex::new(HashMap::new());
-        Self { pending, in_flight }
+        Self(Mutex::new(Inner {
+            pending: ranges.into_iter().collect(),
+            in_flight: HashMap::new(),
+        }))
     }
 
-    /// Take the next range to transfer. Returns None when pending is empty.
-    pub fn pop(&self) -> Option<FileRange> {
-        self.pending.lock().unwrap().pop_front()
+    /// Atomically pop the next range and mark it in-flight for worker `id`. Single lock.
+    pub fn pop_and_mark(&self, id: WorkerId) -> Option<FileRange> {
+        let mut inner = self.0.lock().unwrap();
+        let range = inner.pending.pop_front()?;
+        inner.in_flight.insert(id, range);
+        Some(range)
     }
 
-    /// Record that worker `id` is now transferring `range`. Call after pop().
-    pub fn mark_in_flight(&self, id: WorkerId, range: FileRange) {
-        self.in_flight.lock().unwrap().insert(id, range);
-    }
-
-    /// Worker finished the range successfully. Removes from in_flight.
     pub fn complete(&self, id: WorkerId) {
-        self.in_flight.lock().unwrap().remove(&id);
+        self.0.lock().unwrap().in_flight.remove(&id);
     }
 
-    /// Worker failed or stalled: put this worker's range back on pending and remove from in_flight.
     pub fn requeue(&self, id: WorkerId) {
-        let _ = self.requeue_returning_range(id);
+        let mut inner = self.0.lock().unwrap();
+        if let Some(range) = inner.in_flight.remove(&id) {
+            inner.pending.push_front(range);
+        }
     }
 
-    /// Like requeue but returns the range that was requeued (for coordinator to mark stale completions).
+    /// Returns the range that was requeued (for coordinator to mark stale completions).
     pub fn requeue_returning_range(&self, id: WorkerId) -> Option<FileRange> {
-        let mut in_flight = self.in_flight.lock().unwrap();
-        let range = in_flight.remove(&id);
-        drop(in_flight);
+        let mut inner = self.0.lock().unwrap();
+        let range = inner.in_flight.remove(&id);
         if let Some(r) = range {
-            self.pending.lock().unwrap().push_front(r);
+            inner.pending.push_front(r);
             Some(r)
         } else {
             None
         }
     }
 
-    /// True when there is no work left: pending empty and no in-flight ranges.
     pub fn is_done(&self) -> bool {
-        let pending = self.pending.lock().unwrap();
-        let in_flight = self.in_flight.lock().unwrap();
-        pending.is_empty() && in_flight.is_empty()
+        let inner = self.0.lock().unwrap();
+        inner.pending.is_empty() && inner.in_flight.is_empty()
     }
 
-    /// Number of workers that have a range in flight (for coordinator scale-up / reaping).
+    pub fn pending_count(&self) -> usize {
+        self.0.lock().unwrap().pending.len()
+    }
+
     pub fn in_flight_count(&self) -> usize {
-        self.in_flight.lock().unwrap().len()
+        self.0.lock().unwrap().in_flight.len()
     }
 }

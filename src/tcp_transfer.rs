@@ -514,11 +514,13 @@ async fn transfer_range_stream(
     Ok(total_sent)
 }
 
-/// Coordinator state for one active worker: last activity time (for stall detection), join handle, and cancellation token (cancel on stall so worker stops sending to hasher).
+/// Coordinator state for one active worker: last activity time, join handle, cancellation token, and consecutive zero-byte intervals (stall only when no progress for N intervals).
 struct WorkerState {
     last_active: Instant,
     handle: tokio::task::JoinHandle<()>,
     cancel: CancellationToken,
+    /// Number of consecutive 2s intervals with no bytes from this worker. Stall only when this >= threshold.
+    consecutive_zero_intervals: u32,
 }
 
 /// One TCP stream worker: pulls ranges from queue, connects to pre-assigned port, sends range, reports completion or requeues on error.
@@ -539,11 +541,18 @@ async fn tcp_stream_worker(
 ) {
     let target_port = base_port + 1 + id as u16;
     loop {
-        let range = match queue.pop() {
-            Some(r) => r,
-            None => break,
-        };
-        queue.mark_in_flight(id, range);
+        // Check BEFORE popping — a cancelled worker must not take a range (avoids duplicate pop when respawned).
+        if cancel.is_cancelled() {
+            let _ = done_tx.send((id, Ok(()))).await;
+            return;
+        }
+        let Some(range) = queue.pop_and_mark(id) else { break };
+        // Check cancel before any network I/O; if we were just cancelled/requeued, put range back and exit.
+        if cancel.is_cancelled() {
+            queue.requeue(id);
+            let _ = done_tx.send((id, Ok(()))).await;
+            return;
+        }
         let result = async {
             let socket = Socket::new(Domain::IPV4, Type::STREAM, None)
                 .map_err(|e| TransferError::NetworkError(format!("Failed to create socket: {}", e)))?;
@@ -579,7 +588,7 @@ async fn tcp_stream_worker(
                 };
                 let _ = completed_tx.send((id, range, range_hash)).await;
                 queue.complete(id);
-                // If we were marked stalled, exit without popping again (avoid re-sending same range).
+                // Check after completing — before looping back; if cancelled, exit without popping again.
                 if cancel.is_cancelled() {
                     let _ = done_tx.send((id, Ok(()))).await;
                     return;
@@ -599,7 +608,7 @@ async fn tcp_stream_worker(
     let _ = done_tx.send((id, Ok(()))).await;
 }
 
-/// One transport stream worker (TCP or QUIC via opener): pulls ranges from queue, opens stream per range, sends, reports completion or requeues.
+/// One transport stream worker (TCP or QUIC via opener): pulls ranges from queue, opens a new stream per range, sends, reports completion or requeues.
 async fn transport_stream_worker(
     id: WorkerId,
     opener: Arc<dyn StreamOpener>,
@@ -614,12 +623,24 @@ async fn transport_stream_worker(
     enable_fec_auto: Option<Arc<AtomicBool>>,
     cancel: CancellationToken,
 ) {
+    let mut ranges_handled = 0u32;
     loop {
-        let range = match queue.pop() {
-            Some(r) => r,
-            None => break,
+        // Check BEFORE popping — a cancelled worker must not take a range (avoids duplicate pop when respawned).
+        if cancel.is_cancelled() {
+            let _ = done_tx.send((id, Ok(()))).await;
+            return;
+        }
+        let Some(range) = queue.pop_and_mark(id) else {
+            tracing::debug!(worker_id = id, ranges_handled, "queue empty, exiting");
+            break;
         };
-        queue.mark_in_flight(id, range);
+        tracing::debug!(worker_id = id, range = ?range, remaining = queue.pending_count(), "popped range");
+        // Check cancel before any network I/O; if we were just cancelled/requeued, put range back and exit.
+        if cancel.is_cancelled() {
+            queue.requeue(id);
+            let _ = done_tx.send((id, Ok(()))).await;
+            return;
+        }
         let stream = match opener.open_stream().await {
             Ok(s) => s,
             Err(e) => {
@@ -657,6 +678,8 @@ async fn transport_stream_worker(
                 };
                 let _ = completed_tx.send((id, range, range_hash)).await;
                 queue.complete(id);
+                ranges_handled += 1;
+                // Check after completing — before looping back; if cancelled, exit without popping again.
                 if cancel.is_cancelled() {
                     let _ = done_tx.send((id, Ok(()))).await;
                     return;
@@ -673,6 +696,7 @@ async fn transport_stream_worker(
             }
         }
     }
+    tracing::debug!(worker_id = id, ranges_handled, "worker finished");
     let _ = done_tx.send((id, Ok(()))).await;
 }
 
@@ -1222,8 +1246,7 @@ pub async fn send_file_tcp(
         100u64
     };
 
-    // Send metadata: filename_len (8) + filename + file_size (8) + 8-byte slot (max_streams ceiling).
-    // Receiver uses this value to split ranges and pre-spawn listeners; it is NOT the count we open now (that is config.num_streams).
+    // Step 4: Send metadata using negotiated config.max_streams (must be after step 2 capability negotiation).
     let metadata = {
         let filename_bytes = filename.as_bytes();
         let mut m = Vec::new();
@@ -1266,6 +1289,7 @@ pub async fn send_file_tcp(
         TransferCheckpoint::new(file_size)
     };
 
+    // Step 5: Build ranges using negotiated config.max_streams (same value as step 4 metadata).
     let all_ranges = split_file_ranges(file_size, transfer_num_ranges(config.max_streams));
 
     // Per-range verification (before opening data streams): send 0x06 if we have completed ranges with hashes.
@@ -1354,6 +1378,7 @@ pub async fn send_file_tcp(
     // Range queue: workers pull from pending, report completion or requeue on error. Coordinator updates checkpoint, stall detection, and smart scale-up.
     let num_pending = missing_ranges.len();
     let queue = Arc::new(RangeQueue::new(missing_ranges));
+    eprintln!("COORDINATOR: queue created with {} ranges", queue.pending_count());
     let (completed_tx, mut completed_rx) = mpsc::channel::<(WorkerId, FileRange, [u8; BLAKE3_LEN])>(64);
     let (done_tx, mut done_rx) = mpsc::channel::<(WorkerId, Result<(), TransferError>)>(32);
     let (metrics_tx, mut metrics_rx) = mpsc::channel::<StreamReport>(256);
@@ -1435,7 +1460,7 @@ pub async fn send_file_tcp(
             &enable_fec_auto,
             cancel_child,
         );
-        active_workers.insert(id, WorkerState { last_active: Instant::now(), handle, cancel });
+        active_workers.insert(id, WorkerState { last_active: Instant::now(), handle, cancel, consecutive_zero_intervals: 0 });
     }
 
     let mut interval = interval(Duration::from_secs(2));
@@ -1476,7 +1501,7 @@ pub async fn send_file_tcp(
                                 let cancel = CancellationToken::new();
                                 let cancel_child = cancel.child_token();
                                 let handle = spawn_worker(id, &queue, &file, &file_path_buf, &config, &progress_handle, &metrics_tx, &completed_tx, &done_tx, &enable_fec_auto, cancel_child);
-                                active_workers.insert(id, WorkerState { last_active: Instant::now(), handle, cancel });
+                                active_workers.insert(id, WorkerState { last_active: Instant::now(), handle, cancel, consecutive_zero_intervals: 0 });
                             }
                         }
                     }
@@ -1484,14 +1509,18 @@ pub async fn send_file_tcp(
                 }
             }
             _ = interval.tick() => {
-                let stall_threshold = if cfg!(debug_assertions) {
-                    Duration::from_secs(60)
-                } else {
-                    Duration::from_millis((rtt_ms * 2).max(15_000))
-                };
+                const INTERVAL_DURATION: Duration = Duration::from_secs(2);
+                let stall_threshold_intervals = if cfg!(debug_assertions) { 30 } else { 3 };
+                for state in active_workers.values_mut() {
+                    if state.last_active.elapsed() > INTERVAL_DURATION {
+                        state.consecutive_zero_intervals = state.consecutive_zero_intervals.saturating_add(1);
+                    } else {
+                        state.consecutive_zero_intervals = 0;
+                    }
+                }
                 let stalled: Vec<WorkerId> = active_workers
                     .iter()
-                    .filter(|(_, s)| s.last_active.elapsed() > stall_threshold)
+                    .filter(|(_, s)| s.consecutive_zero_intervals >= stall_threshold_intervals)
                     .map(|(id, _)| *id)
                     .collect();
                 #[cfg(feature = "fec")]
@@ -1515,7 +1544,7 @@ pub async fn send_file_tcp(
                         let cancel = CancellationToken::new();
                         let cancel_child = cancel.child_token();
                         let handle = spawn_worker(id, &queue, &file, &file_path_buf, &config, &progress_handle, &metrics_tx, &completed_tx, &done_tx, &enable_fec_auto, cancel_child);
-                        active_workers.insert(id, WorkerState { last_active: Instant::now(), handle, cancel });
+                        active_workers.insert(id, WorkerState { last_active: Instant::now(), handle, cancel, consecutive_zero_intervals: 0 });
                     }
                     tracing::warn!(worker_id = id, "worker stalled, requeuing range");
                 }
@@ -1531,7 +1560,7 @@ pub async fn send_file_tcp(
                     let cancel = CancellationToken::new();
                     let cancel_child = cancel.child_token();
                     let handle = spawn_worker(id_new, &queue, &file, &file_path_buf, &config, &progress_handle, &metrics_tx, &completed_tx, &done_tx, &enable_fec_auto, cancel_child);
-                    active_workers.insert(id_new, WorkerState { last_active: Instant::now(), handle, cancel });
+                    active_workers.insert(id_new, WorkerState { last_active: Instant::now(), handle, cancel, consecutive_zero_intervals: 0 });
                     last_change = Instant::now();
                 }
 
@@ -1691,6 +1720,15 @@ pub async fn send_file_over_transport(
         }
     });
 
+    // Hash the source file BEFORE opening any connections (unchanged by transfer).
+    let file_hash = tokio::task::spawn_blocking({
+        let path = file_path.to_path_buf();
+        move || hash_file(&path, file_size)
+    })
+    .await
+    .map_err(|e| TransferError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e))))?
+    ?;
+
     let (meta, opener) = transport
         .connect_for_transfer(server_addr, config.num_streams, config.max_streams)
         .await?;
@@ -1773,7 +1811,10 @@ pub async fn send_file_over_transport(
         }
     }
 
-    // 8-byte slot carries max_streams (ceiling for range split and listener count), not current stream count.
+    // Step 4: Send metadata using negotiated config.max_streams (must be after step 2 capability negotiation).
+    // Server uses this value for its range split; sender uses same config.max_streams for step 5.
+    // Wire order: filename_len (8 LE) | filename | file_size (8 LE) | max_streams (8 LE)
+    eprintln!("SENDER: sending metadata file_size={} max_streams={}", file_size, config.max_streams);
     let metadata_bytes = {
         let filename_bytes = filename.as_bytes();
         let mut m = Vec::new();
@@ -1814,7 +1855,19 @@ pub async fn send_file_over_transport(
         TransferCheckpoint::new(file_size)
     };
 
+    // Step 5: Build ranges using negotiated config.max_streams (same value as step 4 metadata).
+    // Sequence is: connect → negotiate (step 2) → RTT → send metadata (step 4) → ACK → build ranges (step 5).
+    eprintln!(
+        "COORDINATOR: building ranges with negotiated max_streams={}",
+        config.max_streams
+    );
     let all_ranges = split_file_ranges(file_size, transfer_num_ranges(config.max_streams));
+    tracing::debug!(
+        num_ranges = all_ranges.len(),
+        max_streams = config.max_streams,
+        file_size,
+        "sender split file into ranges"
+    );
     let completed_ordered = checkpoint.completed_ranges_ordered(&all_ranges);
 
     if !completed_ordered.is_empty() {
@@ -1894,15 +1947,10 @@ pub async fn send_file_over_transport(
         None => FileReader::std(open_file_optimized(file_path, file_size)?),
     };
 
-    let resume_hash = if is_resume {
-        Some(hash_file(file_path, file_size)?)
-    } else {
-        None
-    };
-
     // Unified queue + coordinator (same as send_file_tcp). Opener held here so connection stays alive until workers complete.
     let num_pending = missing_ranges.len();
     let queue = Arc::new(RangeQueue::new(missing_ranges));
+    eprintln!("COORDINATOR: queue created with {} ranges", queue.pending_count());
     let (completed_tx, mut completed_rx) = mpsc::channel::<(WorkerId, FileRange, [u8; BLAKE3_LEN])>(64);
     let (done_tx, mut done_rx) = mpsc::channel::<(WorkerId, Result<(), TransferError>)>(32);
     let (metrics_tx, mut metrics_rx) = mpsc::channel::<StreamReport>(256);
@@ -1975,7 +2023,7 @@ pub async fn send_file_over_transport(
             &enable_fec_auto,
             cancel_child,
         );
-        active_workers.insert(id, WorkerState { last_active: Instant::now(), handle, cancel });
+        active_workers.insert(id, WorkerState { last_active: Instant::now(), handle, cancel, consecutive_zero_intervals: 0 });
     }
     progress_handle.set_message(format!("{}  {}→{}", transport_label, num_workers_initial, streams_peak));
 
@@ -2017,7 +2065,7 @@ pub async fn send_file_over_transport(
                                 let cancel = CancellationToken::new();
                                 let cancel_child = cancel.child_token();
                                 let handle = spawn_transport_worker(id, &opener, &queue, &file, &file_path_buf, &config, &progress_handle, &metrics_tx, &completed_tx, &done_tx, &enable_fec_auto, cancel_child);
-                                active_workers.insert(id, WorkerState { last_active: Instant::now(), handle, cancel });
+                                active_workers.insert(id, WorkerState { last_active: Instant::now(), handle, cancel, consecutive_zero_intervals: 0 });
                             }
                         }
                     }
@@ -2025,14 +2073,18 @@ pub async fn send_file_over_transport(
                 }
             }
             _ = interval.tick() => {
-                let stall_threshold = if cfg!(debug_assertions) {
-                    Duration::from_secs(60)
-                } else {
-                    Duration::from_millis((rtt_ms * 2).max(15_000))
-                };
+                const INTERVAL_DURATION: Duration = Duration::from_secs(2);
+                let stall_threshold_intervals = if cfg!(debug_assertions) { 30 } else { 3 };
+                for state in active_workers.values_mut() {
+                    if state.last_active.elapsed() > INTERVAL_DURATION {
+                        state.consecutive_zero_intervals = state.consecutive_zero_intervals.saturating_add(1);
+                    } else {
+                        state.consecutive_zero_intervals = 0;
+                    }
+                }
                 let stalled: Vec<WorkerId> = active_workers
                     .iter()
-                    .filter(|(_, s)| s.last_active.elapsed() > stall_threshold)
+                    .filter(|(_, s)| s.consecutive_zero_intervals >= stall_threshold_intervals)
                     .map(|(id, _)| *id)
                     .collect();
                 #[cfg(feature = "fec")]
@@ -2057,7 +2109,7 @@ pub async fn send_file_over_transport(
                         let cancel = CancellationToken::new();
                         let cancel_child = cancel.child_token();
                         let handle = spawn_transport_worker(id, &opener, &queue, &file, &file_path_buf, &config, &progress_handle, &metrics_tx, &completed_tx, &done_tx, &enable_fec_auto, cancel_child);
-                        active_workers.insert(id, WorkerState { last_active: Instant::now(), handle, cancel });
+                        active_workers.insert(id, WorkerState { last_active: Instant::now(), handle, cancel, consecutive_zero_intervals: 0 });
                     }
                     tracing::warn!(worker_id = id, "worker stalled, requeuing range");
                 }
@@ -2073,7 +2125,7 @@ pub async fn send_file_over_transport(
                     let cancel = CancellationToken::new();
                     let cancel_child = cancel.child_token();
                     let handle = spawn_transport_worker(id_new, &opener, &queue, &file, &file_path_buf, &config, &progress_handle, &metrics_tx, &completed_tx, &done_tx, &enable_fec_auto, cancel_child);
-                    active_workers.insert(id_new, WorkerState { last_active: Instant::now(), handle, cancel });
+                    active_workers.insert(id_new, WorkerState { last_active: Instant::now(), handle, cancel, consecutive_zero_intervals: 0 });
                     last_change = Instant::now();
                 }
 
@@ -2104,17 +2156,7 @@ pub async fn send_file_over_transport(
 
     let total_sent = progress_handle.transferred.load(Ordering::Relaxed);
 
-    let file_hash = match resume_hash {
-        Some(h) => h,
-        None => {
-            let path = file_path.to_path_buf();
-            tokio::task::spawn_blocking(move || hash_file(&path, file_size))
-                .await
-                .map_err(|e| TransferError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e))))?
-                ?
-        }
-    };
-
+    // file_hash was computed before opening connections; use it for verification
     writer.write_all(&[msg::HASH]).await.map_err(|e| {
         TransferError::NetworkError(format!("Failed to send hash message type: {}", e))
     })?;
@@ -2210,6 +2252,12 @@ pub async fn receive_file_tcp(
 
     // Split file into ranges (finer granularity for load balance)
     let ranges = split_file_ranges(file_size, transfer_num_ranges(num_connections));
+    tracing::debug!(
+        num_ranges = ranges.len(),
+        num_connections,
+        file_size,
+        "receive_file_tcp split into ranges"
+    );
 
     let (range_hash_tx, range_hash_rx) = if expected_hash.is_some() {
         let (tx, rx) = mpsc::channel::<(FileRange, [u8; BLAKE3_LEN])>(64);
