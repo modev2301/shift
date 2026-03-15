@@ -26,6 +26,10 @@ struct Cli {
     #[arg(long = "tcp")]
     force_tcp: bool,
 
+    /// Number of parallel streams (default: auto from file size). Use 4 to limit to 5 server ports (8080–8084).
+    #[arg(long = "streams", value_name = "N")]
+    streams: Option<usize>,
+
     /// Use mutual TLS for TCP (metadata + data). Cert dir from --tls-dir or env TLS_CERT_DIR or ./tls-certs. Requires build with --features tls.
     #[arg(long = "tls")]
     tls: bool,
@@ -315,21 +319,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         use shift::utils::calculate_optimal_parallel_streams;
         use std::net::ToSocketAddrs;
         
-        // Calculate optimal parallel streams automatically if not specified
-        let num_streams = if let Some(streams) = config.client.parallel_streams {
-            streams
-        } else {
-            // Auto-calculate based on total file size
-            let total_size: u64 = files_to_transfer.iter()
-                .filter_map(|path| std::fs::metadata(path).ok().map(|m| m.len()))
-                .sum();
-            
-            if total_size > 0 {
-                calculate_optimal_parallel_streams(total_size, None)
-            } else {
-                DEFAULT_PARALLEL_STREAMS
-            }
-        };
+        // Stream count: CLI --streams overrides config, else auto from file size (fewer streams = fewer server ports)
+        let num_streams = cli.streams
+            .or(config.client.parallel_streams)
+            .unwrap_or_else(|| {
+                let total_size: u64 = files_to_transfer.iter()
+                    .filter_map(|path| std::fs::metadata(path).ok().map(|m| m.len()))
+                    .sum();
+                if total_size > 0 {
+                    calculate_optimal_parallel_streams(total_size, None)
+                } else {
+                    DEFAULT_PARALLEL_STREAMS
+                }
+            });
         
         // Auto-calculate buffer sizes based on file size if not specified
         use shift::utils::calculate_optimal_buffer_size;

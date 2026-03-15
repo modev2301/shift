@@ -18,9 +18,10 @@ impl TransferProgress {
     pub fn new(total_bytes: u64, show_bar: bool) -> Self {
         let progress_bar = if show_bar {
             let pb = ProgressBar::new(total_bytes);
+            // Use {elapsed} instead of {eta} so we never show absurd "1800y" when throughput drops to 0 (e.g. WAN stall).
             pb.set_style(
                 ProgressStyle::default_bar()
-                    .template("{msg:32.32} {bytes:>10}/{total_bytes:>10} {percent:>5}% {bytes_per_sec:>12} {eta:>8}")
+                    .template("{msg:32.32} {bytes:>10}/{total_bytes:>10} {percent:>5}% {bytes_per_sec:>12} {elapsed:>6}")
                     .unwrap()
                     .progress_chars("█▉▊▋▌▍▎▏ "),
             );

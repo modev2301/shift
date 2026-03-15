@@ -51,6 +51,12 @@ Binary: `target/release/shift`. TCP and QUIC are both built-in.
 ./target/release/shift --tcp ./file user@host:8080:/
 ```
 
+**TCP server ports:** The server listens on the base port (e.g. 8080) for metadata and on **base_port+1, base_port+2, …** for data streams. Open that range in your firewall (e.g. **8080–8096** for 16 streams). If you can only open a few ports, use **`--streams 4`** so only 5 ports (8080–8084) are needed:
+
+```bash
+./target/release/shift --tcp --streams 4 ./file.bin user@host:8080:/
+```
+
 ### Usage
 
 **Transfer files (SCP-like):**
@@ -81,6 +87,7 @@ Binary: `target/release/shift`. TCP and QUIC are both built-in.
 | `--stats` | Print per-file transfer stats (throughput, streams, RTT, ranges). |
 | `--json` | Print per-file report as JSON (for scripting/benchmarks). |
 | `--tcp` | Force TCP (no QUIC probe). |
+| `--streams N` | Use N parallel streams (default: auto). Use 4 when only 5 server ports (8080–8084) are open. |
 | `--tls` | Use mutual TLS for TCP (requires `--features tls` and cert dir). |
 | `-r`, `--recursive` | Recursive directory transfer. |
 | `-d`, `--dedup` | Flag only; deduplication not implemented. |
