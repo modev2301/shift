@@ -18,64 +18,21 @@ const DISK_BLOCK_SIZE: usize = 4096;
 
 /// Opens a file for reading with optimized settings.
 ///
-/// For large files (>100MB), this will attempt to use O_DIRECT on Linux
-/// to bypass the page cache. On other platforms or if O_DIRECT fails,
-/// it falls back to standard file opening.
+/// Uses standard file opening. O_DIRECT is not used because the transfer path
+/// uses read_at() from multiple workers with arbitrary offsets; O_DIRECT
+/// requires buffer pointer, size, and offset to be block-aligned (e.g. 4096),
+/// which would require an aligned buffer and aligned read sizes per call.
 ///
 /// # Arguments
 ///
 /// * `path` - Path to the file to open
-/// * `_file_size` - Size of the file in bytes (used to determine if O_DIRECT should be used)
+/// * `_file_size` - Size of the file in bytes (unused; kept for API compatibility)
 ///
 /// # Returns
 ///
-/// Returns a `File` handle optimized for high-performance reads, or an error
-/// if the file cannot be opened.
+/// Returns a `File` handle for reading, or an error if the file cannot be opened.
 pub fn open_file_optimized(path: &Path, _file_size: u64) -> Result<File, TransferError> {
-    #[cfg(target_os = "linux")]
-    {
-        const DIRECT_IO_THRESHOLD: u64 = 100 * 1024 * 1024; // 100MB
-        if _file_size >= DIRECT_IO_THRESHOLD {
-        match open_with_odirect(path) {
-            Ok(file) => {
-                return Ok(file);
-            }
-            Err(_e) => {
-                // Fall back to standard open
-            }
-        }
-        }
-    }
-
-    // Fallback to standard file opening
     File::open(path).map_err(|e| TransferError::Io(e))
-}
-
-#[cfg(target_os = "linux")]
-fn open_with_odirect(path: &Path) -> Result<File, TransferError> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::io::FromRawFd;
-
-    let path_cstr = CString::new(path.as_os_str().as_bytes())
-        .map_err(|e| TransferError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("Invalid path: {}", e),
-        )))?;
-
-    let fd = unsafe {
-        libc::open(
-            path_cstr.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECT,
-        )
-    };
-
-    if fd < 0 {
-        return Err(TransferError::Io(std::io::Error::last_os_error()));
-    }
-
-    // Safety: We own the file descriptor and will close it when File is dropped
-    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 /// Abstraction for reading at offset: either std `File` (pread/spawn_blocking) or
