@@ -1330,7 +1330,8 @@ pub async fn send_file_tcp(
         None
     };
     let effective_max_streams = if let Some(bw) = bandwidth_bps {
-        optimal_streams_from_bdp(bw, rtt_ms, config.buffer_size, config.max_streams)
+        let bdp_streams = optimal_streams_from_bdp(bw, rtt_ms, config.buffer_size, config.max_streams);
+        bdp_streams.max(FALLBACK_MAX_STREAMS).min(config.max_streams)
     } else {
         config.max_streams.min(FALLBACK_MAX_STREAMS)
     };
@@ -1893,8 +1894,9 @@ pub async fn send_file_over_transport(
         None
     };
     let effective_max_streams = if let Some(bw) = bandwidth_bps {
-        let streams = optimal_streams_from_bdp(bw, rtt_ms, config.buffer_size, config.max_streams);
-        tracing::debug!(bandwidth_bps = bw, rtt_ms, bdp_streams = streams, "probe BDP stream count");
+        let bdp_streams = optimal_streams_from_bdp(bw, rtt_ms, config.buffer_size, config.max_streams);
+        let streams = bdp_streams.max(FALLBACK_MAX_STREAMS).min(config.max_streams);
+        tracing::debug!(bandwidth_bps = bw, rtt_ms, bdp_streams = bdp_streams, effective_streams = streams, "probe BDP stream count");
         streams
     } else {
         config.max_streams.min(FALLBACK_MAX_STREAMS)
@@ -2147,7 +2149,7 @@ pub async fn send_file_over_transport(
     }
     let initial_msg = match bandwidth_bps {
         Some(bw) => format!(
-            "{}  {}→{}  ({}ms RTT, {:.1} MB/s)",
+            "{}  {}→{}  ({}ms RTT, {:.1} MB/s probe)",
             transport_label,
             num_workers_initial,
             streams_peak,
@@ -2289,22 +2291,34 @@ pub async fn send_file_over_transport(
                 }
 
                 streams_peak = streams_peak.max(active_workers.len());
-                let msg = match bandwidth_bps {
-                    Some(bw) => format!(
+                let live_mbps = estimator.estimate_mbps();
+                let msg = if live_mbps > 0.0 {
+                    format!(
                         "{}  {}→{}  ({}ms RTT, {:.1} MB/s)",
                         transport_label,
                         num_workers_initial,
                         streams_peak,
                         rtt_ms,
-                        bw as f64 / 1_000_000.0
-                    ),
-                    None => format!(
-                        "{}  {}→{}  ({}ms RTT)",
-                        transport_label,
-                        num_workers_initial,
-                        streams_peak,
-                        rtt_ms
-                    ),
+                        live_mbps
+                    )
+                } else {
+                    match bandwidth_bps {
+                        Some(bw) => format!(
+                            "{}  {}→{}  ({}ms RTT, {:.1} MB/s probe)",
+                            transport_label,
+                            num_workers_initial,
+                            streams_peak,
+                            rtt_ms,
+                            bw as f64 / 1_000_000.0
+                        ),
+                        None => format!(
+                            "{}  {}→{}  ({}ms RTT)",
+                            transport_label,
+                            num_workers_initial,
+                            streams_peak,
+                            rtt_ms
+                        ),
+                    }
                 };
                 progress_handle.set_message(msg);
 
