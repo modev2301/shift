@@ -1586,7 +1586,8 @@ pub async fn send_file_tcp(
                         if let Some(state) = active_workers.remove(&id) {
                             completed_worker_handles.push(state.handle);
                         }
-                        if result.is_err() {
+                        if let Err(ref e) = result {
+                            tracing::warn!(worker_id = id, error = %e, "transfer failed, range requeued (check firewall allows data ports)");
                             queue.requeue(id);
                             if !queue.is_done() {
                                 let cancel = CancellationToken::new();
@@ -2198,7 +2199,8 @@ pub async fn send_file_over_transport(
                         if let Some(state) = active_workers.remove(&id) {
                             completed_worker_handles.push(state.handle);
                         }
-                        if result.is_err() {
+                        if let Err(ref e) = result {
+                            tracing::warn!(worker_id = id, error = %e, "transfer failed, range requeued (check firewall allows data ports)");
                             queue.requeue(id);
                             if !queue.is_done() {
                                 let cancel = CancellationToken::new();
