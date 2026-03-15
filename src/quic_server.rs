@@ -148,7 +148,33 @@ impl QuicServer {
             meta_stream.read_exact(&mut hash_buf).await
                 .map_err(|e| TransferError::NetworkError(format!("Failed to read CHECK_HASH hash: {}", e)))?;
             let path = output_dir.join(&check_filename);
-            let have = completed_hashes.lock().unwrap().get(&path).map(|h| h == &hash_buf).unwrap_or(false);
+            let cached_matches = completed_hashes
+                .lock()
+                .unwrap()
+                .get(&path)
+                .map(|h| *h == hash_buf)
+                .unwrap_or(false);
+            let have = if cached_matches {
+                if path.exists() {
+                    match std::fs::metadata(&path) {
+                        Ok(meta) if meta.len() > 0 => {
+                            match hash_file(&path, meta.len()) {
+                                Ok(disk_hash) if disk_hash == hash_buf => true,
+                                _ => {
+                                    completed_hashes.lock().unwrap().remove(&path);
+                                    false
+                                }
+                            }
+                        }
+                        _ => false,
+                    }
+                } else {
+                    completed_hashes.lock().unwrap().remove(&path);
+                    false
+                }
+            } else {
+                false
+            };
             if have {
                 meta_stream.write_all(&[msg::HAVE_HASH]).await
                     .map_err(|e| TransferError::NetworkError(format!("Failed to send HAVE_HASH: {}", e)))?;
