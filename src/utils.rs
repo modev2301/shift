@@ -123,9 +123,14 @@ pub fn calculate_optimal_parallel_streams(file_size: u64, estimated_latency_ms: 
     std::cmp::max(4, std::cmp::min(32, latency_adjusted))
 }
 
+/// RTT above which we cap streams (WAN): more streams often cause stalls, so cap at 8.
+const RTT_WAN_CAP_MS: u64 = 60;
+/// Max streams when RTT is high (WAN); avoids tail stalls.
+const MAX_STREAMS_WAN: usize = 8;
+
 /// BDP-based stream count: how many streams (each with ~buffer_size in flight) fill the pipe.
 /// bandwidth_bps = measured or estimated bytes/sec; rtt_sec = rtt_ms/1000; BDP = bandwidth * RTT.
-/// Returns streams needed to keep BDP filled, clamped to [1, max_streams].
+/// On high RTT (WAN) we cap at MAX_STREAMS_WAN to avoid stalls.
 pub fn optimal_streams_from_bdp(
     bandwidth_bps: u64,
     rtt_ms: u64,
@@ -133,13 +138,18 @@ pub fn optimal_streams_from_bdp(
     max_streams: usize,
 ) -> usize {
     if bandwidth_bps == 0 || buffer_size == 0 {
-        return 1.max(max_streams.min(8));
+        return 1.max(max_streams.min(MAX_STREAMS_WAN));
     }
     let bdp_bytes = bandwidth_bps.saturating_mul(rtt_ms) / 1000;
     let streams = (bdp_bytes as usize)
         .saturating_add(buffer_size - 1)
         / buffer_size;
-    streams.max(1).min(max_streams)
+    let streams = streams.max(1).min(max_streams);
+    if rtt_ms > RTT_WAN_CAP_MS {
+        streams.min(MAX_STREAMS_WAN)
+    } else {
+        streams
+    }
 }
 
 /// Default probe size for bandwidth measurement (4 MiB); ~120ms at 34 MB/s.

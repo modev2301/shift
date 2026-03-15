@@ -27,7 +27,7 @@ const DATA_FRAME_FEC: u8 = 0x02;
 const MAX_RECEIVE_CHUNK_SIZE: usize = 64 * 1024 * 1024;
 
 /// Fallback max streams when bandwidth probe fails or we have no BDP (avoid over-scaling on WAN).
-const FALLBACK_MAX_STREAMS: usize = 12;
+const FALLBACK_MAX_STREAMS: usize = 8;
 
 /// Run bandwidth probe: send PROBE + size + data, measure time. Returns bandwidth in bytes/sec or None on failure.
 pub(crate) async fn run_bandwidth_probe<W>(writer: &mut W) -> Option<u64>
@@ -2114,7 +2114,24 @@ pub async fn send_file_over_transport(
         );
         active_workers.insert(id, WorkerState { last_active: Instant::now(), handle, cancel, consecutive_zero_intervals: 0 });
     }
-    progress_handle.set_message(format!("{}  {}→{}", transport_label, num_workers_initial, streams_peak));
+    let initial_msg = match bandwidth_bps {
+        Some(bw) => format!(
+            "{}  {}→{}  ({}ms RTT, {:.1} MB/s)",
+            transport_label,
+            num_workers_initial,
+            streams_peak,
+            rtt_ms,
+            bw as f64 / 1_000_000.0
+        ),
+        None => format!(
+            "{}  {}→{}  ({}ms RTT)",
+            transport_label,
+            num_workers_initial,
+            streams_peak,
+            rtt_ms
+        ),
+    };
+    progress_handle.set_message(initial_msg);
 
     let mut interval = interval(Duration::from_secs(2));
     loop {
@@ -2250,7 +2267,13 @@ pub async fn send_file_over_transport(
                         rtt_ms,
                         bw as f64 / 1_000_000.0
                     ),
-                    None => format!("{}  {}→{}", transport_label, num_workers_initial, streams_peak),
+                    None => format!(
+                        "{}  {}→{}  ({}ms RTT)",
+                        transport_label,
+                        num_workers_initial,
+                        streams_peak,
+                        rtt_ms
+                    ),
                 };
                 progress_handle.set_message(msg);
 
