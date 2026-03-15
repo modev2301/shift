@@ -1509,7 +1509,8 @@ pub async fn send_file_tcp(
             }
             _ = interval.tick() => {
                 const INTERVAL_DURATION: Duration = Duration::from_secs(2);
-                let stall_threshold_intervals = if cfg!(debug_assertions) { 30 } else { 3 };
+                // Release: 15 intervals (30s) so WAN/slow links aren't falsely marked stalled. Debug: 30 for tests.
+                let stall_threshold_intervals = if cfg!(debug_assertions) { 30 } else { 15 };
                 for state in active_workers.values_mut() {
                     if state.last_active.elapsed() > INTERVAL_DURATION {
                         state.consecutive_zero_intervals = state.consecutive_zero_intervals.saturating_add(1);
@@ -2067,7 +2068,8 @@ pub async fn send_file_over_transport(
             }
             _ = interval.tick() => {
                 const INTERVAL_DURATION: Duration = Duration::from_secs(2);
-                let stall_threshold_intervals = if cfg!(debug_assertions) { 30 } else { 3 };
+                // Release: 15 intervals (30s) so WAN/slow links aren't falsely marked stalled. Debug: 30 for tests.
+                let stall_threshold_intervals = if cfg!(debug_assertions) { 30 } else { 15 };
                 for state in active_workers.values_mut() {
                     if state.last_active.elapsed() > INTERVAL_DURATION {
                         state.consecutive_zero_intervals = state.consecutive_zero_intervals.saturating_add(1);
