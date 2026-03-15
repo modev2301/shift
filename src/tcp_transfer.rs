@@ -34,26 +34,33 @@ pub(crate) async fn run_bandwidth_probe<W>(writer: &mut W) -> Option<u64>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let start = Instant::now();
-    writer.write_all(&[msg::PROBE]).await.ok()?;
-    writer
-        .write_all(&(BANDWIDTH_PROBE_SIZE as u64).to_le_bytes())
-        .await
-        .ok()?;
-    const CHUNK: usize = 64 * 1024;
-    let zeros = [0u8; CHUNK];
-    let mut remaining = BANDWIDTH_PROBE_SIZE;
-    while remaining > 0 {
-        let n = remaining.min(CHUNK);
-        writer.write_all(&zeros[..n]).await.ok()?;
-        remaining -= n;
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+    let probe = async {
+        let start = Instant::now();
+        writer.write_all(&[msg::PROBE]).await.ok()?;
+        writer
+            .write_all(&(BANDWIDTH_PROBE_SIZE as u64).to_le_bytes())
+            .await
+            .ok()?;
+        const CHUNK: usize = 64 * 1024;
+        let zeros = [0u8; CHUNK];
+        let mut remaining = BANDWIDTH_PROBE_SIZE;
+        while remaining > 0 {
+            let n = remaining.min(CHUNK);
+            writer.write_all(&zeros[..n]).await.ok()?;
+            remaining -= n;
+        }
+        writer.flush().await.ok()?;
+        let elapsed_secs = start.elapsed().as_secs_f64();
+        if elapsed_secs < 0.01 {
+            return None;
+        }
+        Some((BANDWIDTH_PROBE_SIZE as f64 / elapsed_secs) as u64)
+    };
+    match tokio::time::timeout(PROBE_TIMEOUT, probe).await {
+        Ok(Some(bps)) => Some(bps),
+        Ok(None) | Err(_) => None,
     }
-    writer.flush().await.ok()?;
-    let elapsed_secs = start.elapsed().as_secs_f64();
-    if elapsed_secs < 0.02 {
-        return None;
-    }
-    Some((BANDWIDTH_PROBE_SIZE as f64 / elapsed_secs) as u64)
 }
 
 use std::fs::File;

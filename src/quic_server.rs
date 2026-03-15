@@ -51,7 +51,6 @@ impl QuicServer {
         let listener = transport.listen(addr).await?;
 
         eprintln!("Shift QUIC server listening on UDP port {}", self.port);
-        eprintln!("Output directory: {}", self.output_dir.display());
 
         loop {
             match listener.accept().await {

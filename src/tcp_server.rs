@@ -137,7 +137,6 @@ impl TcpServer {
             let _ = tx.send(base_port);
         }
         eprintln!("Shift server listening on port {}", base_port);
-        eprintln!("Output directory: {}", self.output_dir.display());
         #[cfg(feature = "tls")]
         if self.tls_acceptor.is_some() {
             eprintln!("TLS: mutual TLS enabled (cert dir from config)");

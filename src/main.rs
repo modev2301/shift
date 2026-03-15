@@ -64,12 +64,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the transfer server (TCP or QUIC; use --quic for QUIC)
-    Server {
-        /// Listen with QUIC (UDP) instead of TCP
-        #[arg(long)]
-        quic: bool,
-    },
+    /// Start the transfer server (listens for both TCP and QUIC on the same port)
+    Server,
     /// Generate TLS certs for mutual auth (ca.pem, server.pem, client.pem, etc.) into DIR. Requires build with --features tls.
     TlsKeygen {
         /// Output directory for PEM files [default: ./tls-certs]
@@ -162,7 +158,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("TLS certs written to {}", dir.display());
                 return Ok(());
             }
-            Commands::Server { quic } => {
+            Commands::Server => {
                 let config = Config::load_or_create(&cli.config)?;
                 use shift::TransferConfig;
                 let num_streams = config.server.parallel_streams.unwrap_or(DEFAULT_PARALLEL_STREAMS);
@@ -194,29 +190,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("Shift Transfer Server");
                 eprintln!("Port: {}", transfer_config.start_port);
                 eprintln!("Output directory: {}", config.server.output_directory);
+                eprintln!("Transport: TCP + QUIC");
                 if transfer_config.tls_cert_dir.is_some() {
                     eprintln!("TLS: mutual auth enabled (cert dir: {:?})", transfer_config.tls_cert_dir);
                 }
                 let rt = tokio::runtime::Runtime::new()?;
-                if *quic {
-                    use shift::quic_server::QuicServer;
-                    eprintln!("Transport: QUIC (UDP)");
-                    let server = QuicServer::new(
-                        transfer_config.start_port,
-                        PathBuf::from(&config.server.output_directory),
-                        transfer_config,
-                    );
-                    rt.block_on(server.run_forever())?;
-                } else {
-                    use shift::tcp_server::TcpServer;
-                    eprintln!("Transport: TCP");
-                    let server = TcpServer::new(
-                        transfer_config.start_port,
-                        PathBuf::from(&config.server.output_directory),
-                        transfer_config,
-                    );
-                    rt.block_on(server.run_forever(None))?;
-                }
+                let tcp_server = shift::tcp_server::TcpServer::new(
+                    transfer_config.start_port,
+                    PathBuf::from(&config.server.output_directory),
+                    transfer_config.clone(),
+                );
+                let quic_server = shift::quic_server::QuicServer::new(
+                    transfer_config.start_port,
+                    PathBuf::from(&config.server.output_directory),
+                    transfer_config,
+                );
+                rt.block_on(async {
+                    tokio::select! {
+                        res = tcp_server.run_forever(None) => res,
+                        res = quic_server.run_forever() => res,
+                    }
+                })?;
                 return Ok(());
             }
         }
