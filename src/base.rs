@@ -71,6 +71,8 @@ pub mod cap_flags {
     pub const RTT_PROBE: u8 = 1 << 5;
     /// Both sides support FEC (RaptorQ) on data channel; frame type 0x02 = FEC block.
     pub const FEC: u8 = 1 << 6;
+    /// Both sides support bandwidth probe (PROBE) before metadata; client sends, server drains.
+    pub const BANDWIDTH_PROBE: u8 = 1 << 7;
 }
 
 /// Wire size of Capabilities (LE: version, flags, max_streams, initial_streams, max_buffer, platform, reserved).
@@ -139,7 +141,7 @@ impl Capabilities {
 
 /// Build client capabilities from config. Used by sender. max_streams = ceiling, initial_streams = starting count.
 pub fn capabilities_from_config(config: &TransferConfig) -> Capabilities {
-    use cap_flags::{BLAKE3, COMPRESSION, ENCRYPTION, RANGE_HASHES, RTT_PROBE};
+    use cap_flags::{BANDWIDTH_PROBE, BLAKE3, COMPRESSION, ENCRYPTION, RANGE_HASHES, RTT_PROBE};
     let mut flags = 0u8;
     if config.enable_compression {
         flags |= COMPRESSION;
@@ -150,6 +152,7 @@ pub fn capabilities_from_config(config: &TransferConfig) -> Capabilities {
     flags |= BLAKE3;
     flags |= RANGE_HASHES;
     flags |= RTT_PROBE;
+    flags |= BANDWIDTH_PROBE;
     // Advertise FEC support when built with fec so receiver is ready; enable_fec can be turned on mid-transfer (auto-trigger).
     #[cfg(feature = "fec")]
     {

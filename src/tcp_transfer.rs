@@ -1292,8 +1292,12 @@ pub async fn send_file_tcp(
         100u64
     };
 
-    // Measurement-driven stream count: bandwidth probe then BDP-based optimal streams.
-    let bandwidth_bps = run_bandwidth_probe(&mut writer).await;
+    // Measurement-driven stream count: bandwidth probe only when server supports BANDWIDTH_PROBE.
+    let bandwidth_bps = if (negotiated.flags & crate::base::cap_flags::BANDWIDTH_PROBE) != 0 {
+        run_bandwidth_probe(&mut writer).await
+    } else {
+        None
+    };
     let effective_max_streams = if let Some(bw) = bandwidth_bps {
         optimal_streams_from_bdp(bw, rtt_ms, config.buffer_size, config.max_streams)
     } else {
@@ -1851,8 +1855,12 @@ pub async fn send_file_over_transport(
         100u64
     };
 
-    // Measurement-driven stream count: bandwidth probe then BDP-based optimal streams.
-    let bandwidth_bps = run_bandwidth_probe(&mut writer).await;
+    // Measurement-driven stream count: bandwidth probe (only when server supports it) then BDP-based optimal streams.
+    let bandwidth_bps = if (negotiated.flags & crate::base::cap_flags::BANDWIDTH_PROBE) != 0 {
+        run_bandwidth_probe(&mut writer).await
+    } else {
+        None
+    };
     let effective_max_streams = if let Some(bw) = bandwidth_bps {
         let streams = optimal_streams_from_bdp(bw, rtt_ms, config.buffer_size, config.max_streams);
         tracing::debug!(bandwidth_bps = bw, rtt_ms, bdp_streams = streams, "probe BDP stream count");
