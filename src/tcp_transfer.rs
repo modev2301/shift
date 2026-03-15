@@ -413,6 +413,10 @@ async fn transfer_range_tcp(
     Ok(total_sent)
 }
 
+/// Max chunk size for transport streams (QUIC/TCP via opener). QUIC flow control and some kernels
+/// (GSO) can hit EINVAL on very large single writes; smaller chunks avoid that.
+const MAX_STREAM_CHUNK: usize = 256 * 1024;
+
 /// Transfer a file range over a transport stream (TCP or QUIC). Same protocol as transfer_range_tcp.
 async fn transfer_range_stream(
     thread_id: usize,
@@ -456,7 +460,7 @@ async fn transfer_range_stream(
     };
 
     let mut offset = range.start;
-    let buffer_size = config.buffer_size.min(16 * 1024 * 1024);
+    let buffer_size = config.buffer_size.min(16 * 1024 * 1024).min(MAX_STREAM_CHUNK);
     let mut buffer = vec![0u8; buffer_size];
     let mut total_sent = 0u64;
 
