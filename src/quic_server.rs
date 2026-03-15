@@ -113,7 +113,7 @@ impl QuicServer {
                 .map_err(|e| TransferError::NetworkError(format!("Failed to read first byte: {}", e)))?;
         }
 
-        const MAX_PROBE_SIZE: usize = 8 * 1024 * 1024;
+        const MAX_PROBE_SIZE: usize = 16 * 1024 * 1024;
         while first_byte[0] == msg::PROBE {
             let mut size_buf = [0u8; 8];
             meta_stream.read_exact(&mut size_buf).await
@@ -130,8 +130,15 @@ impl QuicServer {
             }
             meta_stream.write_all(&[msg::PROBE_ACK]).await
                 .map_err(|e| TransferError::NetworkError(format!("Failed to send PROBE_ACK: {}", e)))?;
-            meta_stream.read_exact(&mut first_byte).await
-                .map_err(|e| TransferError::NetworkError(format!("Failed to read after PROBE: {}", e)))?;
+            meta_stream.flush().await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to flush PROBE_ACK: {}", e)))?;
+            if let Err(e) = meta_stream.read_exact(&mut first_byte).await {
+                let msg = e.to_string();
+                if msg.contains("connection lost") || msg.contains("early eof") || msg.contains("Connection reset") {
+                    return Ok(());
+                }
+                return Err(TransferError::NetworkError(format!("Failed to read after PROBE: {}", e)));
+            }
         }
 
         if first_byte[0] == msg::MANIFEST && crate::base::manifest_supported(&negotiated) {

@@ -152,8 +152,8 @@ pub fn optimal_streams_from_bdp(
     }
 }
 
-/// Default probe size for bandwidth measurement (4 MiB); ~120ms at 34 MB/s.
-pub const BANDWIDTH_PROBE_SIZE: usize = 4 * 1024 * 1024;
+/// Default probe size for bandwidth measurement (16 MiB) for accurate TCP/QUIC measurement.
+pub const BANDWIDTH_PROBE_SIZE: usize = 16 * 1024 * 1024;
 
 /// Calculate optimal buffer size based on file size and number of streams.
 ///

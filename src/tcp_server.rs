@@ -286,7 +286,7 @@ impl TcpServer {
         }
 
         // Drain optional bandwidth probe(s): PROBE (1) + size (8) + data. Server drains then sends PROBE_ACK so client can measure end-to-end.
-        const MAX_PROBE_SIZE: usize = 8 * 1024 * 1024;
+        const MAX_PROBE_SIZE: usize = 16 * 1024 * 1024;
         while first_byte[0] == msg::PROBE {
             let mut size_buf = [0u8; 8];
             stream.read_exact(&mut size_buf).await
@@ -303,8 +303,16 @@ impl TcpServer {
             }
             stream.write_all(&[msg::PROBE_ACK]).await
                 .map_err(|e| TransferError::NetworkError(format!("Failed to send PROBE_ACK: {}", e)))?;
-            stream.read_exact(&mut first_byte).await
-                .map_err(|e| TransferError::NetworkError(format!("Failed to read after PROBE: {}", e)))?;
+            stream.flush().await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to flush PROBE_ACK: {}", e)))?;
+            if let Err(e) = stream.read_exact(&mut first_byte).await {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof
+                    || e.kind() == std::io::ErrorKind::ConnectionReset
+                {
+                    return Ok(());
+                }
+                return Err(TransferError::NetworkError(format!("Failed to read after PROBE: {}", e)));
+            }
         }
 
         if first_byte[0] == msg::MANIFEST && crate::base::manifest_supported(&negotiated) {
