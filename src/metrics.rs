@@ -46,6 +46,7 @@ impl BandwidthEstimator {
     }
 
     /// True if throughput dropped >20% from recent peak without recovery (possible loss -> FEC candidate).
+    /// Used as loss-detection signal for FEC auto-trigger when explicit loss (e.g. QUIC path_stats) is not available.
     pub fn sudden_drop(&self) -> bool {
         if self.samples.len() < 2 || self.peak_mbps <= 0.0 {
             return false;

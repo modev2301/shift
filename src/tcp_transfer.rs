@@ -2275,6 +2275,7 @@ pub async fn send_file_over_transport(
                     .filter(|(_, s)| s.consecutive_zero_intervals >= stall_threshold_intervals)
                     .map(|(id, _)| *id)
                     .collect();
+                // FEC auto-trigger: stall/sudden_drop are loss-detection proxies; QUIC path_stats could be used when connection is available.
                 #[cfg(feature = "fec")]
                 if !stalled.is_empty() {
                     if let Some(ref auto) = enable_fec_auto {

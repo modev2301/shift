@@ -645,11 +645,28 @@ pub async fn create_transport(
         if let Ok(quic_transport) = crate::quinn_transport::QuicTransport::probe().await {
             let quic_bw =
                 crate::tcp_transfer::probe_bandwidth_for_transport(&quic_transport as &dyn Transport, addr, config).await;
-            if let (Some(tb), Some(qb)) = (tcp_bw, quic_bw) {
-                if qb * 10 >= tb * 9 {
+            match (tcp_bw, quic_bw) {
+                (Some(tb), Some(qb)) if qb * 10 >= tb * 9 => {
+                    tracing::info!(
+                        tcp_bps = tb,
+                        quic_bps = qb,
+                        "Transport: QUIC (within 10% of TCP, preferred for migration/flaky links)"
+                    );
                     return Box::new(quic_transport);
                 }
+                (Some(tb), Some(qb)) => {
+                    tracing::info!(
+                        tcp_bps = tb,
+                        quic_bps = qb,
+                        "Transport: TCP (default; not slower than scp baseline)"
+                    );
+                }
+                _ => {
+                    tracing::info!("Transport: TCP (probe failed or inconclusive)")
+                }
             }
+        } else {
+            tracing::info!("Transport: TCP (QUIC probe unavailable)")
         }
         return Box::new(tcp_transport);
     }
