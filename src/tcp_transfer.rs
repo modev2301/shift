@@ -29,10 +29,11 @@ const MAX_RECEIVE_CHUNK_SIZE: usize = 64 * 1024 * 1024;
 /// Fallback max streams when bandwidth probe fails or we have no BDP (avoid over-scaling on WAN).
 const FALLBACK_MAX_STREAMS: usize = 8;
 
-/// Run bandwidth probe: send PROBE + size + data, measure time. Returns bandwidth in bytes/sec or None on failure.
-pub(crate) async fn run_bandwidth_probe<W>(writer: &mut W) -> Option<u64>
+/// Run bandwidth probe: send PROBE + size + data, then wait for PROBE_ACK. Measures end-to-end time so result reflects real link bandwidth.
+pub(crate) async fn run_bandwidth_probe<W, R>(writer: &mut W, reader: &mut R) -> Option<u64>
 where
     W: tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
 {
     const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
     let probe = async {
@@ -58,6 +59,15 @@ where
         }
         if let Err(e) = writer.flush().await {
             tracing::debug!(error = %e, "bandwidth probe: flush failed");
+            return None;
+        }
+        let mut ack = [0u8; 1];
+        if let Err(e) = reader.read_exact(&mut ack).await {
+            tracing::debug!(error = %e, "bandwidth probe: read PROBE_ACK failed");
+            return None;
+        }
+        if ack[0] != msg::PROBE_ACK {
+            tracing::debug!(got = ack[0], "bandwidth probe: expected PROBE_ACK");
             return None;
         }
         let elapsed_secs = start.elapsed().as_secs_f64();
@@ -1315,7 +1325,7 @@ pub async fn send_file_tcp(
 
     // Measurement-driven stream count: bandwidth probe only when server supports BANDWIDTH_PROBE.
     let bandwidth_bps = if (negotiated.flags & crate::base::cap_flags::BANDWIDTH_PROBE) != 0 {
-        run_bandwidth_probe(&mut writer).await
+        run_bandwidth_probe(&mut writer, &mut reader).await
     } else {
         None
     };
@@ -1878,7 +1888,7 @@ pub async fn send_file_over_transport(
 
     // Measurement-driven stream count: bandwidth probe (only when server supports it) then BDP-based optimal streams.
     let bandwidth_bps = if (negotiated.flags & crate::base::cap_flags::BANDWIDTH_PROBE) != 0 {
-        run_bandwidth_probe(&mut writer).await
+        run_bandwidth_probe(&mut writer, &mut reader).await
     } else {
         None
     };

@@ -128,6 +128,8 @@ impl QuicServer {
                     .map_err(|e| TransferError::NetworkError(format!("Failed to read PROBE data: {}", e)))?;
                 remaining -= n;
             }
+            meta_stream.write_all(&[msg::PROBE_ACK]).await
+                .map_err(|e| TransferError::NetworkError(format!("Failed to send PROBE_ACK: {}", e)))?;
             meta_stream.read_exact(&mut first_byte).await
                 .map_err(|e| TransferError::NetworkError(format!("Failed to read after PROBE: {}", e)))?;
         }
