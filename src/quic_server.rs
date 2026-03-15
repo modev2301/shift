@@ -132,6 +132,8 @@ impl QuicServer {
             if have {
                 meta_stream.write_all(&[msg::HAVE_HASH]).await
                     .map_err(|e| TransferError::NetworkError(format!("Failed to send HAVE_HASH: {}", e)))?;
+                meta_stream.flush().await
+                    .map_err(|e| TransferError::NetworkError(format!("Failed to flush HAVE_HASH: {}", e)))?;
                 eprintln!("Skipped (unchanged): {}", check_filename);
                 return Ok(());
             }
