@@ -121,7 +121,7 @@ impl TransferCheckpoint {
         conn.execute("DELETE FROM range_state WHERE transfer_id = ?1", [id.as_ref()])
             .map_err(|e| TransferError::ProtocolError(format!("SQLite delete ranges: {}", e)))?;
         let mut insert_range = conn.prepare(
-            "INSERT INTO range_state (transfer_id, range_start, range_end, blake3_hash, verified) VALUES (?1, ?2, ?3, ?4, 1)",
+            "INSERT OR REPLACE INTO range_state (transfer_id, range_start, range_end, blake3_hash, verified) VALUES (?1, ?2, ?3, ?4, 1)",
         )
         .map_err(|e| TransferError::ProtocolError(format!("SQLite prepare: {}", e)))?;
         for (key, hash) in &self.range_hashes {

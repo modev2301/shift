@@ -390,7 +390,8 @@ impl TcpServer {
         file.set_len(file_size)?;
         let file = Arc::new(file);
 
-        // Use num_streams from metadata (same value sender used for its range split after negotiation).
+        // Single source of truth: num_streams from metadata (negotiated max_streams; sender sent this after capability negotiation).
+        // Both sides use transfer_num_ranges(num_streams) for range split so they stay aligned.
         let num_ranges = crate::base::transfer_num_ranges(num_streams);
         let ranges = crate::base::split_file_ranges(file_size, num_ranges);
         tracing::debug!(
@@ -406,10 +407,10 @@ impl TcpServer {
         let mut data_handles = Vec::new();
 
         let (range_hash_tx, mut range_hash_rx) = mpsc::channel::<(FileRange, [u8; BLAKE3_LEN])>(64);
-        // Extra listeners so requeued ranges (retries) can connect; collector signals shutdown when num_ranges received
+        // Listeners: at least num_streams (one per concurrent worker), plus extra for requeued ranges; collector signals shutdown when num_ranges received
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         let (done_tx, mut done_rx) = mpsc::channel::<()>(64);
-        let num_listeners = 2 * num_ranges;
+        let num_listeners = (2 * num_ranges).max(num_streams);
 
         #[cfg(feature = "tls")]
         let tls_acceptor = tls_acceptor.clone();

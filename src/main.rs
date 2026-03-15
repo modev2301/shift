@@ -14,9 +14,13 @@ struct Cli {
     #[arg(short = 'r', long)]
     recursive: bool,
     
-    /// Skip files that haven't changed (hash comparison)
-    #[arg(short = 'u', long = "update")]
+    /// Skip files that haven't changed (hash comparison). Default: on; use --force to transfer anyway.
+    #[arg(short = 'u', long = "update", default_value_t = true)]
     skip_unchanged: bool,
+
+    /// Transfer even if file is unchanged on receiver
+    #[arg(long = "force")]
+    force: bool,
     
     /// Enable block deduplication (rsync-style)
     #[arg(short = 'd', long = "dedup")]
@@ -357,7 +361,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             });
         
-        let max_streams = (num_streams * 2).max(32).min(256);
+        // When user passed --streams, do not scale up (keeps server port range small). Otherwise allow scale-up.
+        let max_streams = if cli.streams.is_some() {
+            num_streams
+        } else {
+            (num_streams * 2).max(32).min(256)
+        };
         let transfer_config = TransferConfig {
             start_port: remote.port.unwrap_or(8080),
             num_streams,
@@ -404,13 +413,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .ok_or_else(|| "Failed to resolve server address")?;
 
             let stats_out = if output_stats { Some(&mut report) } else { None };
+            let skip_unchanged = cli.skip_unchanged && !cli.force;
             match rt.block_on(send_file_over_transport(
                 transport.as_ref(),
                 local_file,
                 server_addr,
                 transfer_config.clone(),
                 stats_out,
-                cli.skip_unchanged,
+                skip_unchanged,
                 None,
             )) {
                 Ok(_) => {

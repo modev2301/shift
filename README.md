@@ -12,7 +12,7 @@ Shift is a high-performance file transfer system for reliable, efficient data mo
 - **Parallel connections** — Multiple streams per transfer; finer range granularity (max_streams×4) for load balance and resume.
 - **End-to-end integrity** — BLAKE3 of bytes sent; server verifies and replies HASH_OK or HASH_MISMATCH (client keeps checkpoint on mismatch).
 - **Resume with per-range verification** — SQLite checkpoint (WAL) stores completed ranges and per-range BLAKE3; server re-verifies before accepting data.
-- **`--update`** — Skip files unchanged by BLAKE3: sender sends CHECK_HASH; server replies HAVE_HASH (skip) or NEED_FILE. Server persists hashes in `~/.shift/server_cache.db`.
+- **Skip unchanged (default)** — Sender sends CHECK_HASH; server replies HAVE_HASH (skip) or NEED_FILE. Use `--force` to transfer anyway. Server persists hashes in `~/.shift/server_cache.db`.
 - **`--stats` / `--json`** — Per-file transfer report (throughput, streams, RTT, ranges); JSON for scripting/benchmarks.
 - **Capability negotiation** — Client and server negotiate compression, encryption, streams, RTT probe, FEC.
 - **LZ4 compression** — Optional; auto-disabled for already-compressed types (zip, gz, mp4, jpg, etc.).
@@ -71,8 +71,9 @@ Binary: `target/release/shift`. TCP and QUIC are both built-in.
 # Recursive directory
 ./target/release/shift -r ./local_dir/ user@host:/remote/path/
 
-# Skip unchanged (BLAKE3 check)
-./target/release/shift -u ./backup.tar host:/backup/
+# Skip unchanged is default; use --force to transfer anyway
+./target/release/shift ./backup.tar host:/backup/
+./target/release/shift --force ./backup.tar host:/backup/
 
 # Force TCP, print stats, JSON output
 ./target/release/shift --tcp --stats file.bin host:/
@@ -83,7 +84,8 @@ Binary: `target/release/shift`. TCP and QUIC are both built-in.
 
 | Flag | Description |
 |------|-------------|
-| `-u`, `--update` | Skip files server already has (same BLAKE3). Server cache: `~/.shift/server_cache.db`. |
+| `-u`, `--update` | Skip unchanged files (default: on). Server cache: `~/.shift/server_cache.db`. |
+| `--force` | Transfer even if file is unchanged on receiver. |
 | `--stats` | Print per-file transfer stats (throughput, streams, RTT, ranges). |
 | `--json` | Print per-file report as JSON (for scripting/benchmarks). |
 | `--tcp` | Force TCP (no QUIC probe). |
