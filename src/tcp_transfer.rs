@@ -2096,8 +2096,8 @@ pub async fn send_file_over_transport(
     #[cfg(not(feature = "fec"))]
     let enable_fec_auto: Option<Arc<AtomicBool>> = None;
     let transport_label = match transport.name() {
-        "quic" => "⚡ QUIC",
-        _ => "🔌 TCP",
+        "quic" => "QUIC",
+        _ => "TCP",
     };
 
     let spawn_transport_worker = |id: WorkerId,
@@ -2149,7 +2149,7 @@ pub async fn send_file_over_transport(
     }
     let initial_msg = match bandwidth_bps {
         Some(bw) => format!(
-            "{}  {}→{}  ({}ms RTT, {:.1} MB/s probe)",
+            "{}  {}->{}  ({}ms RTT, {:.1} MB/s probe)",
             transport_label,
             num_workers_initial,
             streams_peak,
@@ -2157,7 +2157,7 @@ pub async fn send_file_over_transport(
             bw as f64 / 1_000_000.0
         ),
         None => format!(
-            "{}  {}→{}  ({}ms RTT)",
+            "{}  {}->{}  ({}ms RTT)",
             transport_label,
             num_workers_initial,
             streams_peak,
@@ -2294,7 +2294,7 @@ pub async fn send_file_over_transport(
                 let live_mbps = estimator.estimate_mbps();
                 let msg = if live_mbps > 0.0 {
                     format!(
-                        "{}  {}→{}  ({}ms RTT, {:.1} MB/s)",
+                        "{}  {}->{}  ({}ms RTT, {:.1} MB/s)",
                         transport_label,
                         num_workers_initial,
                         streams_peak,
@@ -2304,7 +2304,7 @@ pub async fn send_file_over_transport(
                 } else {
                     match bandwidth_bps {
                         Some(bw) => format!(
-                            "{}  {}→{}  ({}ms RTT, {:.1} MB/s probe)",
+                            "{}  {}->{}  ({}ms RTT, {:.1} MB/s probe)",
                             transport_label,
                             num_workers_initial,
                             streams_peak,
@@ -2312,7 +2312,7 @@ pub async fn send_file_over_transport(
                             bw as f64 / 1_000_000.0
                         ),
                         None => format!(
-                            "{}  {}→{}  ({}ms RTT)",
+                            "{}  {}->{}  ({}ms RTT)",
                             transport_label,
                             num_workers_initial,
                             streams_peak,

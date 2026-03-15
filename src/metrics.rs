@@ -45,7 +45,7 @@ impl BandwidthEstimator {
         self.peak_mbps > 0.0 && self.estimate_mbps() < self.peak_mbps * 0.80
     }
 
-    /// True if throughput dropped >20% from recent peak without recovery (possible loss → FEC candidate).
+    /// True if throughput dropped >20% from recent peak without recovery (possible loss -> FEC candidate).
     pub fn sudden_drop(&self) -> bool {
         if self.samples.len() < 2 || self.peak_mbps <= 0.0 {
             return false;

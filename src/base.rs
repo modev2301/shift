@@ -15,32 +15,32 @@ pub mod msg {
     /// Legacy final ACK (replaced by HASH_OK / HASH_MISMATCH for integrity).
     #[allow(dead_code)]
     pub const COMPLETE_LEGACY: u8 = 0x02;
-    /// Client → Server: hash message follows (1 + 32 bytes).
+    /// Client -> Server: hash message follows (1 + 32 bytes).
     pub const HASH: u8 = 0x03;
-    /// Server → Client: hash verified OK.
+    /// Server -> Client: hash verified OK.
     pub const HASH_OK: u8 = 0x04;
-    /// Server → Client: hash mismatch; client should keep checkpoint.
+    /// Server -> Client: hash mismatch; client should keep checkpoint.
     pub const HASH_MISMATCH: u8 = 0x05;
-    /// Client → Server: per-range hashes for resume verification (sent before data streams).
+    /// Client -> Server: per-range hashes for resume verification (sent before data streams).
     /// Wire: 0x06 (1) + num_ranges (8 LE) + for each range in file order: start (8 LE), end (8 LE), blake3 (32).
     pub const RANGE_HASHES: u8 = 0x06;
-    /// Server → Client: range verification result. Wire: 0x07 (1) + num_failed (8 LE) + for each failed: start (8 LE), end (8 LE).
+    /// Server -> Client: range verification result. Wire: 0x07 (1) + num_failed (8 LE) + for each failed: start (8 LE), end (8 LE).
     pub const RANGE_VERIFY_RESULT: u8 = 0x07;
-    /// Client → Server: no range verify (proceed to data). Sent when no completed ranges to verify.
+    /// Client -> Server: no range verify (proceed to data). Sent when no completed ranges to verify.
     pub const NO_RANGE_VERIFY: u8 = 0x00;
-    /// RTT probe: client → server. Wire: 0x08 (1) + timestamp_us (8 LE).
+    /// RTT probe: client -> server. Wire: 0x08 (1) + timestamp_us (8 LE).
     pub const PING: u8 = 0x08;
-    /// RTT probe: server → client. Wire: 0x09 (1) + timestamp_us (8 LE).
+    /// RTT probe: server -> client. Wire: 0x09 (1) + timestamp_us (8 LE).
     pub const PONG: u8 = 0x09;
-    /// Client → Server: skip check (--update). Wire: 0x0A (1) + filename_len (8 LE) + filename + hash (32).
+    /// Client -> Server: skip check (--update). Wire: 0x0A (1) + filename_len (8 LE) + filename + hash (32).
     pub const CHECK_HASH: u8 = 0x0A;
-    /// Server → Client: file already present with this hash, skip transfer.
+    /// Server -> Client: file already present with this hash, skip transfer.
     pub const HAVE_HASH: u8 = 0x0B;
-    /// Server → Client: need file (proceed with metadata).
+    /// Server -> Client: need file (proceed with metadata).
     pub const NEED_FILE: u8 = 0x0C;
-    /// Client → Server: bandwidth probe. Wire: 0x0D (1) + size (8 LE) + size bytes of data. Server drains then sends PROBE_ACK.
+    /// Client -> Server: bandwidth probe. Wire: 0x0D (1) + size (8 LE) + size bytes of data. Server drains then sends PROBE_ACK.
     pub const PROBE: u8 = 0x0D;
-    /// Server → Client: sent after draining PROBE so client can measure end-to-end bandwidth.
+    /// Server -> Client: sent after draining PROBE so client can measure end-to-end bandwidth.
     pub const PROBE_ACK: u8 = 0x0E;
 }
 /// Wire size of Ping/Pong: 1 byte type + 8 bytes timestamp_us LE.

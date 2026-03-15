@@ -436,7 +436,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             );
                         } else {
                             eprintln!(
-                                "transport: {}  bytes: {}  duration_ms: {}  throughput_mbps: {:.2}  streams: {}→{}  stalled: {}  rtt_ms: {}  ranges: {} total, {} resumed",
+                                "transport: {}  bytes: {}  duration_ms: {}  throughput_mbps: {:.2}  streams: {}->{}  stalled: {}  rtt_ms: {}  ranges: {} total, {} resumed",
                                 report.transport,
                                 report.bytes,
                                 report.duration_ms,

@@ -101,7 +101,7 @@ impl ProgressHandle {
         }
     }
 
-    /// Set the progress bar status line (e.g. "⚡ QUIC  6→8" or "🔌 TCP  4→6").
+    /// Set the progress bar status line (e.g. "QUIC  6->8" or "TCP  4->6").
     pub fn set_message(&self, msg: impl AsRef<str>) {
         if let Some(ref pb) = self.progress_bar {
             pb.set_message(msg.as_ref().to_string());
