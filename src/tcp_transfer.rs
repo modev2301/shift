@@ -789,7 +789,7 @@ where
         }
         if data_size > MAX_RECEIVE_CHUNK_SIZE {
             return Err(TransferError::ProtocolError(format!(
-                "Chunk size {} exceeds maximum {}",
+                "Chunk size {} exceeds maximum {} (possible protocol desync or client/server version mismatch)",
                 data_size, MAX_RECEIVE_CHUNK_SIZE
             )));
         }
@@ -999,7 +999,7 @@ pub(crate) async fn receive_range_stream(
         }
         if data_size > MAX_RECEIVE_CHUNK_SIZE {
             return Err(TransferError::ProtocolError(format!(
-                "Chunk size {} exceeds maximum {}",
+                "Chunk size {} exceeds maximum {} (possible protocol desync or client/server version mismatch)",
                 data_size, MAX_RECEIVE_CHUNK_SIZE
             )));
         }
