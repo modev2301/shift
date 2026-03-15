@@ -301,7 +301,18 @@ impl TcpServer {
             stream.read_exact(&mut hash_buf).await
                 .map_err(|e| TransferError::NetworkError(format!("Failed to read CHECK_HASH hash: {}", e)))?;
             let path = output_dir.join(&check_filename);
-            let cached_matches = completed_hashes.lock().unwrap().get(&path).map(|h| *h == hash_buf).unwrap_or(false);
+            let (cache_has_entry, cached_matches) = {
+                let guard = completed_hashes.lock().unwrap();
+                let entry = guard.get(&path);
+                (
+                    entry.is_some(),
+                    entry.map(|h| *h == hash_buf).unwrap_or(false),
+                )
+            };
+            eprintln!(
+                "SERVER: CHECK_HASH path={:?} cache_has_entry={} cached_matches={}",
+                path, cache_has_entry, cached_matches
+            );
             let have = if cached_matches {
                 if path.exists() {
                     match std::fs::metadata(&path) {
@@ -648,6 +659,16 @@ impl TcpServer {
             .map_err(|e| TransferError::NetworkError(format!("Failed to send hash OK: {}", e)))?;
         stream.flush().await
             .map_err(|e| TransferError::NetworkError(format!("Failed to flush hash OK: {}", e)))?;
+
+        // Store hash for CHECK_HASH (--update skip) as soon as we've verified. Do not gate on data_error:
+        // if we sent HASH_OK the client considers the transfer successful; a later data_error (e.g. join)
+        // should not prevent the next transfer from skipping.
+        completed_hashes.lock().unwrap().insert(output_path.clone(), expected_hash);
+        if let Some(ref tx) = persist_tx {
+            let _ = tx.send((output_path.clone(), expected_hash));
+        }
+        eprintln!("Received: {} ({} bytes)", filename, total_received);
+
         // Drain read until client closes (close handshake: client reads HASH_OK then drops connection, we see EOF).
         let mut buf = [0u8; 256];
         loop {
@@ -656,14 +677,6 @@ impl TcpServer {
                 Ok(_) => {}
                 Err(_) => break,
             }
-        }
-
-        if data_error.is_none() {
-            completed_hashes.lock().unwrap().insert(output_path.clone(), expected_hash);
-            if let Some(ref tx) = persist_tx {
-                let _ = tx.send((output_path.clone(), expected_hash));
-            }
-            eprintln!("Received: {} ({} bytes)", filename, total_received);
         }
 
         if let Some(e) = data_error {
