@@ -26,8 +26,8 @@ const DATA_FRAME_FEC: u8 = 0x02;
 /// Maximum chunk size we accept from the wire to avoid capacity overflow from corrupted or malicious data.
 const MAX_RECEIVE_CHUNK_SIZE: usize = 64 * 1024 * 1024;
 
-/// Fallback max streams when bandwidth probe fails or we have no BDP (avoid over-scaling on WAN).
-const FALLBACK_MAX_STREAMS: usize = 8;
+/// Minimum streams when using BDP from bandwidth probe (ensures we don't under-scale).
+const FALLBACK_MIN_STREAMS: usize = 8;
 
 /// Run bandwidth probe: send PROBE + size + data, then wait for PROBE_ACK. Measures end-to-end time so result reflects real link bandwidth.
 pub(crate) async fn run_bandwidth_probe<W, R>(writer: &mut W, reader: &mut R) -> Option<u64>
@@ -1337,9 +1337,10 @@ pub async fn send_file_tcp(
     };
     let effective_max_streams = if let Some(bw) = bandwidth_bps {
         let bdp_streams = optimal_streams_from_bdp(bw, rtt_ms, config.buffer_size, config.max_streams);
-        bdp_streams.max(FALLBACK_MAX_STREAMS).min(config.max_streams)
+        bdp_streams.max(FALLBACK_MIN_STREAMS).min(config.max_streams)
     } else {
-        config.max_streams.min(FALLBACK_MAX_STREAMS)
+        // No probe: respect config (e.g. --streams) so user override works.
+        config.max_streams.max(1)
     };
 
     // Step 4: Send metadata using effective_max_streams (same value server uses for listeners and ranges).
@@ -2012,11 +2013,12 @@ pub async fn send_file_over_transport(
         1
     } else if let Some(bw) = bandwidth_bps {
         let bdp_streams = optimal_streams_from_bdp(bw, rtt_ms, config.buffer_size, config.max_streams);
-        let streams = bdp_streams.max(FALLBACK_MAX_STREAMS).min(config.max_streams);
+        let streams = bdp_streams.max(FALLBACK_MIN_STREAMS).min(config.max_streams);
         tracing::debug!(bandwidth_bps = bw, rtt_ms, bdp_streams = bdp_streams, effective_streams = streams, "probe BDP stream count");
         streams
     } else {
-        config.max_streams.min(FALLBACK_MAX_STREAMS)
+        // No probe: respect config (e.g. --streams) so user override works.
+        config.max_streams.max(1)
     };
 
     // --update: optional skip check (CHECK_HASH). If server has same hash, skip transfer.

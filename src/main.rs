@@ -161,6 +161,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Commands::Server => {
                 let config = Config::load_or_create(&cli.config)?;
                 use shift::TransferConfig;
+                use shift::config::MAX_SERVER_STREAMS;
                 let num_streams = config.server.parallel_streams.unwrap_or(DEFAULT_PARALLEL_STREAMS);
                 use shift::utils::calculate_optimal_buffer_size;
                 let buffer_size = config.server.buffer_size.unwrap_or_else(|| {
@@ -169,10 +170,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let socket_buffer = config.server.socket_send_buffer_size
                     .or(config.server.socket_recv_buffer_size)
                     .unwrap_or_else(|| calculate_optimal_buffer_size(1024 * 1024 * 1024, num_streams));
+                // Advertise high max_streams so client --streams (e.g. 16, 32, 64) is never reduced by negotiation.
                 let transfer_config = TransferConfig {
                     start_port: config.server.port,
-                    num_streams,
-                    max_streams: num_streams,
+                    num_streams: MAX_SERVER_STREAMS,
+                    max_streams: MAX_SERVER_STREAMS,
                     buffer_size,
                     socket_send_buffer_size: Some(socket_buffer),
                     socket_recv_buffer_size: Some(socket_buffer),

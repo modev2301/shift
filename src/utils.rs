@@ -79,10 +79,14 @@ pub fn get_optimal_chunk_size_for_file(file_size: u64) -> usize {
     }
 }
 
+/// Default ceiling for auto-calculated streams (enterprise and high-BDP links benefit from more).
+const AUTO_STREAMS_CAP: usize = 64;
+
 /// Calculate optimal number of parallel streams based on file size.
 ///
 /// Automatically determines the best number of parallel connections to maximize
-/// throughput. Uses file size as the primary factor, with reasonable bounds.
+/// throughput. Uses file size as the primary factor. Enterprise and high-bandwidth
+/// links often benefit from 16+ streams; use `--streams N` to override.
 ///
 /// # Arguments
 ///
@@ -91,25 +95,23 @@ pub fn get_optimal_chunk_size_for_file(file_size: u64) -> usize {
 ///
 /// # Returns
 ///
-/// Returns the optimal number of parallel streams, bounded between 4 and 32.
+/// Returns the optimal number of parallel streams, bounded between 4 and AUTO_STREAMS_CAP (64).
 pub fn calculate_optimal_parallel_streams(file_size: u64, estimated_latency_ms: Option<u64>) -> usize {
-    // Base calculation: 1 stream per 200MB for large files
-    // For small files (< 100MB), use fewer streams to avoid overhead
+    // Base calculation: more streams for larger files; enterprise often benefits from 16+
     let size_based_streams = if file_size < 100 * 1024 * 1024 {
         // Small files: 4-8 streams
         std::cmp::max(4, (file_size / (25 * 1024 * 1024)).max(1) as usize)
     } else if file_size < 1024 * 1024 * 1024 {
-        // Medium files (100MB - 1GB): 8-16 streams
-        std::cmp::max(8, std::cmp::min(16, (file_size / (100 * 1024 * 1024)).max(1) as usize))
+        // Medium files (100MB - 1GB): 8-24 streams
+        std::cmp::max(8, std::cmp::min(24, (file_size / (80 * 1024 * 1024)).max(1) as usize))
     } else {
-        // Large files (> 1GB): 16-32 streams
-        std::cmp::max(16, std::cmp::min(32, (file_size / (200 * 1024 * 1024)).max(1) as usize))
+        // Large files (> 1GB): 16-64 streams (1 per ~150MB; more headroom for enterprise)
+        std::cmp::max(16, std::cmp::min(AUTO_STREAMS_CAP, (file_size / (150 * 1024 * 1024)).max(1) as usize))
     };
     
     // Adjust for high latency: more streams help fill the pipe
     let latency_adjusted = if let Some(latency_ms) = estimated_latency_ms {
         if latency_ms > 50 {
-            // High latency (>50ms): increase streams to fill bandwidth-delay product
             let bdp_multiplier = (latency_ms as f64 / 50.0).min(2.0);
             ((size_based_streams as f64) * bdp_multiplier).ceil() as usize
         } else {
@@ -119,8 +121,7 @@ pub fn calculate_optimal_parallel_streams(file_size: u64, estimated_latency_ms: 
         size_based_streams
     };
     
-    // Bound between 4 and 32 streams
-    std::cmp::max(4, std::cmp::min(32, latency_adjusted))
+    std::cmp::max(4, std::cmp::min(AUTO_STREAMS_CAP, latency_adjusted))
 }
 
 /// RTT above which we cap streams (WAN): more streams often cause stalls, so cap at 8.

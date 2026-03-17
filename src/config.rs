@@ -14,6 +14,8 @@ use std::path::PathBuf;
 // Larger chunks reduce protocol overhead but increase memory requirements.
 pub const BASE_CHUNK_SIZE: usize = 1024 * 1024; // 1MB
 pub const DEFAULT_PARALLEL_STREAMS: usize = 16;
+/// Max streams the server will accept per transfer (capability negotiation). Client --streams up to this is honored.
+pub const MAX_SERVER_STREAMS: usize = 256;
 pub const MEMORY_POOL_SIZE: usize = 2000;
 pub const SIMD_CHUNK_SIZE: usize = 1024 * 1024; // 1MB for SIMD operations
 pub const ZERO_COPY_ENABLED: bool = true;
