@@ -131,7 +131,7 @@ const MAX_STREAMS_WAN: usize = 8;
 
 /// BDP-based stream count: how many streams (each with ~buffer_size in flight) fill the pipe.
 /// bandwidth_bps = measured or estimated bytes/sec; rtt_sec = rtt_ms/1000; BDP = bandwidth * RTT.
-/// On high RTT (WAN) we cap at MAX_STREAMS_WAN to avoid stalls.
+/// On high RTT (WAN) we cap at MAX_STREAMS_WAN for auto-scaling only; explicit --streams N is always respected.
 pub fn optimal_streams_from_bdp(
     bandwidth_bps: u64,
     rtt_ms: u64,
@@ -139,16 +139,18 @@ pub fn optimal_streams_from_bdp(
     max_streams: usize,
 ) -> usize {
     if bandwidth_bps == 0 || buffer_size == 0 {
-        return 1.max(max_streams.min(MAX_STREAMS_WAN));
+        return 1.max(max_streams);
     }
     let bdp_bytes = bandwidth_bps.saturating_mul(rtt_ms) / 1000;
     let streams = (bdp_bytes as usize)
         .saturating_add(buffer_size - 1)
         / buffer_size;
     let streams = streams.max(1).min(max_streams);
-    if rtt_ms > RTT_WAN_CAP_MS {
+    if rtt_ms > RTT_WAN_CAP_MS && max_streams <= MAX_STREAMS_WAN {
+        // Auto mode on WAN: cap at 8 to avoid stalls
         streams.min(MAX_STREAMS_WAN)
     } else {
+        // User passed --streams N (N > 8) or low RTT: respect max_streams
         streams
     }
 }
