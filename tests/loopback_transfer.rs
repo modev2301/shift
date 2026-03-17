@@ -38,6 +38,7 @@ fn transfer_config(port: u16) -> TransferConfig {
         start_port: port,
         num_streams: 4,
         max_streams: 8,
+        streams_explicit: false,
         buffer_size: 256 * 1024,
         socket_send_buffer_size: Some(256 * 1024),
         socket_recv_buffer_size: Some(256 * 1024),

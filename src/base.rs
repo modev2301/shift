@@ -200,12 +200,13 @@ pub fn tcp_multiplexed_supported(cap: &Capabilities) -> bool {
 }
 
 /// Apply negotiated capabilities to config. num_streams = initial (starting count), max_streams = ceiling.
-/// Never increase max_streams above the client's original config so range split matches what the client intended (and what we send in metadata).
+/// Preserves streams_explicit so user --streams is never overridden by BDP later.
 pub fn apply_capabilities_to_config(config: &TransferConfig, cap: Capabilities) -> TransferConfig {
     use cap_flags::{COMPRESSION, ENCRYPTION};
     let mut c = config.clone();
     c.num_streams = cap.initial_streams as usize;
     c.max_streams = config.max_streams.min(cap.max_streams as usize);
+    // streams_explicit is preserved from clone; do not overwrite
     c.buffer_size = cap.max_buffer as usize;
     c.enable_compression = (cap.flags & COMPRESSION) != 0;
     c.enable_encryption = (cap.flags & ENCRYPTION) != 0;
@@ -258,6 +259,8 @@ pub struct TransferConfig {
     pub fec_negotiated: bool,
     /// True when both sides use TCP multiplexed data (one data connection; fewer ports for enterprise).
     pub use_tcp_multiplexed: bool,
+    /// True when user set stream count explicitly (--streams or config parallel_streams). BDP/auto must not override.
+    pub streams_explicit: bool,
 }
 
 impl Default for TransferConfig {
@@ -280,6 +283,7 @@ impl Default for TransferConfig {
             #[cfg(feature = "fec")]
             fec_negotiated: false,
             use_tcp_multiplexed: false,
+            streams_explicit: false,
         }
     }
 }

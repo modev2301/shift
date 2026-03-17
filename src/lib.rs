@@ -23,6 +23,7 @@
 //!         start_port: config.server.port,
 //!         num_streams: 16,
 //!         max_streams: 16,
+//!         streams_explicit: false,
 //!         buffer_size: 16 * 1024 * 1024,
 //!         socket_send_buffer_size: Some(16 * 1024 * 1024),
 //!         socket_recv_buffer_size: Some(16 * 1024 * 1024),

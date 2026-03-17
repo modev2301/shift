@@ -1329,17 +1329,18 @@ pub async fn send_file_tcp(
         100u64
     };
 
-    // Measurement-driven stream count: bandwidth probe only when server supports BANDWIDTH_PROBE.
+    // Stream count: explicit --streams is never overridden; otherwise use BDP from probe or config.
     let bandwidth_bps = if (negotiated.flags & crate::base::cap_flags::BANDWIDTH_PROBE) != 0 {
         run_bandwidth_probe(&mut writer, &mut reader).await
     } else {
         None
     };
-    let effective_max_streams = if let Some(bw) = bandwidth_bps {
+    let effective_max_streams = if config.streams_explicit {
+        config.max_streams.max(1)
+    } else if let Some(bw) = bandwidth_bps {
         let bdp_streams = optimal_streams_from_bdp(bw, rtt_ms, config.buffer_size, config.max_streams);
         bdp_streams.max(FALLBACK_MIN_STREAMS).min(config.max_streams)
     } else {
-        // No probe: respect config (e.g. --streams) so user override works.
         config.max_streams.max(1)
     };
 
@@ -2003,7 +2004,7 @@ pub async fn send_file_over_transport(
         100u64
     };
 
-    // Measurement-driven stream count: bandwidth probe (only when server supports it) then BDP-based optimal streams.
+    // Stream count: explicit --streams is never overridden; multiplexed uses 1; else BDP from probe or config.
     let bandwidth_bps = if (negotiated.flags & crate::base::cap_flags::BANDWIDTH_PROBE) != 0 {
         run_bandwidth_probe(&mut writer, &mut reader).await
     } else {
@@ -2011,13 +2012,14 @@ pub async fn send_file_over_transport(
     };
     let effective_max_streams = if config.use_tcp_multiplexed {
         1
+    } else if config.streams_explicit {
+        config.max_streams.max(1)
     } else if let Some(bw) = bandwidth_bps {
         let bdp_streams = optimal_streams_from_bdp(bw, rtt_ms, config.buffer_size, config.max_streams);
         let streams = bdp_streams.max(FALLBACK_MIN_STREAMS).min(config.max_streams);
         tracing::debug!(bandwidth_bps = bw, rtt_ms, bdp_streams = bdp_streams, effective_streams = streams, "probe BDP stream count");
         streams
     } else {
-        // No probe: respect config (e.g. --streams) so user override works.
         config.max_streams.max(1)
     };
 

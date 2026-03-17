@@ -175,6 +175,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     start_port: config.server.port,
                     num_streams: MAX_SERVER_STREAMS,
                     max_streams: MAX_SERVER_STREAMS,
+                    streams_explicit: false,
                     buffer_size,
                     socket_send_buffer_size: Some(socket_buffer),
                     socket_recv_buffer_size: Some(socket_buffer),
@@ -359,8 +360,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             });
         
-        // When user passed --streams, do not scale up (keeps server port range small). Otherwise allow scale-up.
-        let max_streams = if cli.streams.is_some() {
+        // When user passed --streams (or config parallel_streams), use that exactly; otherwise allow scale-up for auto.
+        let streams_explicit = cli.streams.is_some() || config.client.parallel_streams.is_some();
+        let max_streams = if streams_explicit {
             num_streams
         } else {
             (num_streams * 2).max(32).min(256)
@@ -369,6 +371,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             start_port: remote.port.unwrap_or(8080),
             num_streams,
             max_streams,
+            streams_explicit,
             buffer_size,
             socket_send_buffer_size: Some(socket_buffer),
             socket_recv_buffer_size: Some(socket_buffer),
