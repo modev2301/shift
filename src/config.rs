@@ -41,6 +41,7 @@ pub const DETAILED_LOGGING: bool = true;
 
 /// Main configuration structure containing all subsystem configurations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct Config {
     /// Server-specific configuration (optional, only needed on server).
     #[serde(default)]
@@ -124,8 +125,8 @@ impl Config {
     /// the file exists but cannot be read or parsed.
     pub fn load_or_create(path: &PathBuf) -> Result<Self, TransferError> {
         if path.exists() {
-            let content = fs::read_to_string(path).map_err(|e| TransferError::Io(e))?;
-            toml::from_str(&content).map_err(|e| TransferError::TomlDeserialization(e))
+            let content = fs::read_to_string(path).map_err(TransferError::Io)?;
+            toml::from_str(&content).map_err(TransferError::TomlDeserialization)
         } else {
             let config = Self::default();
             config.save(path)?;
@@ -144,22 +145,12 @@ impl Config {
     /// Returns an error if serialization fails or the file cannot be written.
     pub fn save(&self, path: &PathBuf) -> Result<(), TransferError> {
         let content =
-            toml::to_string_pretty(self).map_err(|e| TransferError::TomlSerialization(e))?;
-        fs::write(path, content).map_err(|e| TransferError::Io(e))?;
+            toml::to_string_pretty(self).map_err(TransferError::TomlSerialization)?;
+        fs::write(path, content).map_err(TransferError::Io)?;
         Ok(())
     }
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            client: ClientConfig::default(),
-            security: SecurityConfig::default(),
-            performance: PerformanceConfig::default(),
-        }
-    }
-}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -327,6 +318,10 @@ mod tests {
     }
 
     #[test]
+    // The bool constants below are intentionally pinned to their expected values;
+    // clippy flags them as constant-valued, but the assertions guard against
+    // accidental flips of the defaults.
+    #[allow(clippy::assertions_on_constants)]
     fn test_constants() {
         assert_eq!(BASE_CHUNK_SIZE, 1024 * 1024); // 1MB
         assert_eq!(DEFAULT_PARALLEL_STREAMS, 16);

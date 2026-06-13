@@ -35,7 +35,7 @@ pub fn hash_file_reader(
     size: u64,
 ) -> Result<[u8; BLAKE3_LEN], TransferError> {
     let mut hasher = blake3::Hasher::new();
-    let mut remaining = size as u64;
+    let mut remaining = size;
     let mut buf = vec![0u8; HASH_CHUNK_SIZE.min(remaining as usize).max(1)];
 
     while remaining > 0 {

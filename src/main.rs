@@ -154,7 +154,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref command) = cli.command {
         match command {
             Commands::TlsKeygen { dir } => {
-                shift::tls::keygen(&dir)?;
+                shift::tls::keygen(dir)?;
                 eprintln!("TLS certs written to {}", dir.display());
                 return Ok(());
             }
@@ -309,10 +309,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         
         if files_to_transfer.len() > 1 {
-            // Only show file count for multiple files
-        if files_to_transfer.len() > 1 {
             eprintln!("Transferring {} files", files_to_transfer.len());
-        }
         }
         
         use shift::integrity::{hash_file, BLAKE3_LEN};
@@ -365,7 +362,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let max_streams = if streams_explicit {
             num_streams
         } else {
-            (num_streams * 2).max(32).min(256)
+            (num_streams * 2).clamp(32, 256)
         };
         let transfer_config = TransferConfig {
             start_port: remote.port.unwrap_or(8080),
@@ -408,7 +405,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let server_addr = server_addr_str
             .to_socket_addrs()?
             .next()
-            .ok_or_else(|| "Failed to resolve server address")?;
+            .ok_or("Failed to resolve server address")?;
 
         let files_to_send: Vec<std::path::PathBuf> = if files_to_transfer.len() > 1 && (cli.skip_unchanged && !cli.force) {
             let transfer_root = files_to_transfer[0].parent().unwrap_or_else(|| std::path::Path::new("."));

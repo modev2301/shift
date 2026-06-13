@@ -441,7 +441,7 @@ impl FileRange {
 /// Number of ranges to use for transfer (finer granularity than stream count for better load balance and stall recovery).
 /// Used by both sender and receiver so they agree on listener count.
 pub fn transfer_num_ranges(max_streams: usize) -> usize {
-    (max_streams * 4).min(128).max(1)
+    (max_streams * 4).clamp(1, 128)
 }
 
 /// Split a file into ranges for parallel transfer.

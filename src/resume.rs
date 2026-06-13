@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS range_state (
 ";
 
 fn open_checkpoint_db(path: &Path) -> Result<Connection, TransferError> {
-    let conn = Connection::open(path).map_err(|e| TransferError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+    let conn = Connection::open(path).map_err(|e| TransferError::Io(std::io::Error::other(e)))?;
     conn.execute_batch(SCHEMA)
         .map_err(|e| TransferError::ProtocolError(format!("SQLite schema: {}", e)))?;
     Ok(conn)
@@ -144,7 +144,7 @@ impl TransferCheckpoint {
         if !checkpoint_path.exists() {
             return Err(TransferError::ProtocolError("Checkpoint file does not exist".to_string()));
         }
-        let bytes = std::fs::read(checkpoint_path).map_err(|e| TransferError::Io(e))?;
+        let bytes = std::fs::read(checkpoint_path).map_err(TransferError::Io)?;
         if bytes.first() == Some(&b'{') {
             let json = String::from_utf8(bytes).map_err(|e| TransferError::ProtocolError(format!("Invalid UTF-8: {}", e)))?;
             let mut checkpoint: Self = serde_json::from_str(&json)
@@ -157,7 +157,7 @@ impl TransferCheckpoint {
             return Ok(checkpoint);
         }
         let id = checkpoint_path.to_string_lossy();
-        let conn = Connection::open(checkpoint_path).map_err(|e| TransferError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        let conn = Connection::open(checkpoint_path).map_err(|e| TransferError::Io(std::io::Error::other(e)))?;
         let (file_size, checkpoint_version, file_hash): (i64, i64, Option<Vec<u8>>) = conn
             .query_row(
                 "SELECT file_size, checkpoint_version, file_hash FROM transfer WHERE id = ?1",
@@ -244,7 +244,7 @@ pub fn checkpoint_exists(file_path: &Path) -> bool {
 pub fn delete_checkpoint(file_path: &Path) -> Result<(), TransferError> {
     let checkpoint_path = get_checkpoint_path(file_path);
     if checkpoint_path.exists() {
-        std::fs::remove_file(&checkpoint_path).map_err(|e| TransferError::Io(e))?;
+        std::fs::remove_file(&checkpoint_path).map_err(TransferError::Io)?;
     }
     Ok(())
 }

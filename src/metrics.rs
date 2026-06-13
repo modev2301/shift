@@ -57,7 +57,7 @@ impl BandwidthEstimator {
 
     fn evict(&mut self) {
         let cutoff = Instant::now() - self.window;
-        while self.samples.front().map_or(false, |(t, _)| *t < cutoff) {
+        while self.samples.front().is_some_and(|(t, _)| *t < cutoff) {
             self.samples.pop_front();
         }
     }

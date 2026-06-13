@@ -28,7 +28,10 @@ use tracing::error;
 #[cfg(feature = "tls")]
 use tokio_rustls::TlsAcceptor;
 
+// One instance per connection; the TLS variant is larger but boxing it would add a
+// heap indirection on every poll of the hot I/O path for no practical benefit.
 #[cfg(feature = "tls")]
+#[allow(clippy::large_enum_variant)]
 enum MetaStream {
     Plain(tokio::net::TcpStream),
     Tls(tokio_rustls::server::TlsStream<tokio::net::TcpStream>),
@@ -84,7 +87,7 @@ impl TcpServer {
         #[cfg(feature = "tls")]
         let tls_acceptor = config.tls_cert_dir.as_ref().and_then(|dir| {
             crate::tls::server_config_from_dir(dir)
-                .map(|cfg| TlsAcceptor::from(cfg))
+                .map(TlsAcceptor::from)
                 .ok()
         });
         #[cfg(not(feature = "tls"))]
@@ -238,6 +241,7 @@ impl TcpServer {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_connection<S>(
         mut stream: S,
         _addr: SocketAddr,
@@ -613,36 +617,35 @@ impl TcpServer {
                 let listener = TcpListener::from_std(std_listener)
                     .map_err(|e| TransferError::NetworkError(format!("Failed to convert to tokio listener: {}", e)))?;
 
-                loop {
-                    tokio::select! {
-                        biased;
-                        conn = listener.accept() => {
-                            let (data_stream, _) = conn
-                                .map_err(|e| TransferError::NetworkError(format!("Accept failed: {}", e)))?;
-                            tracing::debug!(
-                                connection_count = thread_id,
-                                "server accepted data connection"
-                            );
+                // Each data listener handles exactly one range connection, then exits.
+                tokio::select! {
+                    biased;
+                    conn = listener.accept() => {
+                        let (data_stream, _) = conn
+                            .map_err(|e| TransferError::NetworkError(format!("Accept failed: {}", e)))?;
+                        tracing::debug!(
+                            connection_count = thread_id,
+                            "server accepted data connection"
+                        );
 
-                            #[cfg(feature = "tls")]
-                            let data_stream = {
-                                if let Some(acceptor) = tls_acceptor {
-                                    let tls_stream = acceptor
-                                        .accept(data_stream)
-                                        .await
-                                        .map_err(|e| TransferError::NetworkError(format!("TLS accept data: {}", e)))?;
-                                    MetaStream::Tls(tls_stream)
-                                } else {
-                                    MetaStream::Plain(data_stream)
-                                }
-                            };
+                        #[cfg(feature = "tls")]
+                        let data_stream = {
+                            if let Some(acceptor) = tls_acceptor {
+                                let tls_stream = acceptor
+                                    .accept(data_stream)
+                                    .await
+                                    .map_err(|e| TransferError::NetworkError(format!("TLS accept data: {}", e)))?;
+                                MetaStream::Tls(tls_stream)
+                            } else {
+                                MetaStream::Plain(data_stream)
+                            }
+                        };
 
-                            let r = receive_range_tcp(thread_id, file, data_stream, config, None, Some(range_hash_tx)).await;
-                            let _ = done_tx.send(()).await;
-                            return r;
-                        }
-                        _ = shutdown_rx.recv() => return Ok(0u64),
+                        let r = receive_range_tcp(thread_id, file, data_stream, config, None, Some(range_hash_tx)).await;
+                        let _ = done_tx.send(()).await;
+                        r
                     }
+                    _ = shutdown_rx.recv() => Ok(0u64),
                 }
             });
 

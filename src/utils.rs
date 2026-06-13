@@ -103,10 +103,10 @@ pub fn calculate_optimal_parallel_streams(file_size: u64, estimated_latency_ms: 
         std::cmp::max(4, (file_size / (25 * 1024 * 1024)).max(1) as usize)
     } else if file_size < 1024 * 1024 * 1024 {
         // Medium files (100MB - 1GB): 8-24 streams
-        std::cmp::max(8, std::cmp::min(24, (file_size / (80 * 1024 * 1024)).max(1) as usize))
+        ((file_size / (80 * 1024 * 1024)).max(1) as usize).clamp(8, 24)
     } else {
         // Large files (> 1GB): 16-64 streams (1 per ~150MB; more headroom for enterprise)
-        std::cmp::max(16, std::cmp::min(AUTO_STREAMS_CAP, (file_size / (150 * 1024 * 1024)).max(1) as usize))
+        ((file_size / (150 * 1024 * 1024)).max(1) as usize).clamp(16, AUTO_STREAMS_CAP)
     };
     
     // Adjust for high latency: more streams help fill the pipe
@@ -121,7 +121,7 @@ pub fn calculate_optimal_parallel_streams(file_size: u64, estimated_latency_ms: 
         size_based_streams
     };
     
-    std::cmp::max(4, std::cmp::min(AUTO_STREAMS_CAP, latency_adjusted))
+    latency_adjusted.clamp(4, AUTO_STREAMS_CAP)
 }
 
 /// RTT above which we cap streams (WAN): more streams often cause stalls, so cap at 8.
@@ -179,16 +179,13 @@ pub fn calculate_optimal_buffer_size(file_size: u64, num_streams: usize) -> usiz
     
     let base_buffer = if file_size < 100 * 1024 * 1024 {
         // Small files: 4-8MB
-        std::cmp::max(4 * 1024 * 1024, std::cmp::min(8 * 1024 * 1024, 
-            (file_size / 25).max(4 * 1024 * 1024) as usize))
+        ((file_size / 25).max(4 * 1024 * 1024) as usize).clamp(4 * 1024 * 1024, 8 * 1024 * 1024)
     } else if file_size < 1024 * 1024 * 1024 {
         // Medium files: 8-16MB
-        std::cmp::max(8 * 1024 * 1024, std::cmp::min(16 * 1024 * 1024,
-            (file_size / 12).max(8 * 1024 * 1024) as usize))
+        ((file_size / 12).max(8 * 1024 * 1024) as usize).clamp(8 * 1024 * 1024, 16 * 1024 * 1024)
     } else {
         // Large files: 16-32MB
-        std::cmp::max(16 * 1024 * 1024, std::cmp::min(32 * 1024 * 1024,
-            (file_size / 8).max(16 * 1024 * 1024) as usize))
+        ((file_size / 8).max(16 * 1024 * 1024) as usize).clamp(16 * 1024 * 1024, 32 * 1024 * 1024)
     };
     
     // Adjust for number of streams: more streams = slightly smaller buffers per stream
@@ -207,7 +204,7 @@ pub fn calculate_optimal_buffer_size(file_size: u64, num_streams: usize) -> usiz
     let mb_aligned = ((stream_adjusted + 512 * 1024) / (1024 * 1024)) * (1024 * 1024);
     
     // Bound between 1MB and 32MB
-    std::cmp::max(1024 * 1024, std::cmp::min(32 * 1024 * 1024, mb_aligned))
+    mb_aligned.clamp(1024 * 1024, 32 * 1024 * 1024)
 }
 
 /// Calculate optimal number of parallel streams (legacy function for compatibility).
@@ -278,12 +275,12 @@ mod tests {
         assert!(calculate_optimal_parallel_streams(500 * 1024 * 1024, None) >= 8);
         assert!(calculate_optimal_parallel_streams(500 * 1024 * 1024, None) <= 16);
         
-        // Large files should use 16-32 streams
+        // Large files (>1GB) scale up toward the auto cap.
         assert!(calculate_optimal_parallel_streams(3 * 1024 * 1024 * 1024, None) >= 16);
-        assert!(calculate_optimal_parallel_streams(3 * 1024 * 1024 * 1024, None) <= 32);
-        
-        // Very large files should cap at 32
-        assert_eq!(calculate_optimal_parallel_streams(100 * 1024 * 1024 * 1024, None), 32);
+        assert!(calculate_optimal_parallel_streams(3 * 1024 * 1024 * 1024, None) <= AUTO_STREAMS_CAP);
+
+        // Very large files should cap at AUTO_STREAMS_CAP.
+        assert_eq!(calculate_optimal_parallel_streams(100 * 1024 * 1024 * 1024, None), AUTO_STREAMS_CAP);
         
         // Very small files should have minimum of 4
         assert!(calculate_optimal_parallel_streams(1024, None) >= 4);

@@ -54,7 +54,7 @@ impl AsyncWrite for QuinnStream {
         };
         Pin::new(&mut *guard)
             .poll_write(cx, buf)
-            .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)))
+            .map(|r| r.map_err(std::io::Error::other))
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let mut guard = match self.send.try_lock() {
@@ -63,7 +63,7 @@ impl AsyncWrite for QuinnStream {
         };
         Pin::new(&mut *guard)
             .poll_flush(cx)
-            .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)))
+            .map(|r| r.map_err(std::io::Error::other))
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let mut guard = match self.send.try_lock() {
@@ -72,7 +72,7 @@ impl AsyncWrite for QuinnStream {
         };
         Pin::new(&mut *guard)
             .poll_shutdown(cx)
-            .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)))
+            .map(|r| r.map_err(std::io::Error::other))
     }
 }
 
@@ -178,6 +178,12 @@ fn platform() -> Platform {
         Platform::Windows
     } else {
         Platform::Unknown
+    }
+}
+
+impl Default for QuicTransport {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

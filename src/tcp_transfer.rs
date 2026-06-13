@@ -239,6 +239,7 @@ pub fn configure_tcp_socket(
 
 /// Transfer a file range over a single TCP connection.
 /// Final file hash is computed from per-range BLAKE3 hashes in the coordinator (no streaming hasher).
+#[allow(clippy::too_many_arguments)]
 async fn transfer_range_tcp(
     thread_id: usize,
     range: FileRange,
@@ -417,6 +418,7 @@ async fn transfer_range_tcp(
 }
 
 /// Transfer a file range over a transport stream (TCP or QUIC). Same protocol as transfer_range_tcp.
+#[allow(clippy::too_many_arguments)]
 async fn transfer_range_stream(
     thread_id: usize,
     range: FileRange,
@@ -595,6 +597,7 @@ struct WorkerState {
 }
 
 /// One TCP stream worker: pulls ranges from queue, connects to pre-assigned port, sends range, reports completion or requeues on error.
+#[allow(clippy::too_many_arguments)]
 async fn tcp_stream_worker(
     id: WorkerId,
     queue: Arc<RangeQueue>,
@@ -680,6 +683,7 @@ async fn tcp_stream_worker(
 }
 
 /// One transport stream worker (TCP or QUIC via opener): pulls ranges from queue, opens a new stream per range, sends, reports completion or requeues.
+#[allow(clippy::too_many_arguments)]
 async fn transport_stream_worker(
     id: WorkerId,
     opener: Arc<dyn StreamOpener>,
@@ -1233,7 +1237,7 @@ pub async fn send_file_tcp(
     // Create progress tracker with filename in message
     let progress = TransferProgress::new(file_size, true);
     if let Some(ref pb) = progress.progress_bar {
-        pb.set_message(format!("{}", filename));
+        pb.set_message(filename.to_string());
     }
     let progress_handle = progress.handle();
     
@@ -1452,7 +1456,7 @@ pub async fn send_file_tcp(
         return Ok(file_size);
     }
 
-    let is_resume = checkpoint.completed_ranges.len() > 0;
+    let is_resume = !checkpoint.completed_ranges.is_empty();
     if is_resume {
         tracing::debug!(
             completed = checkpoint.completed_ranges.len(),
@@ -1633,7 +1637,7 @@ pub async fn send_file_tcp(
                         }
                     }
                 }
-                for id in stalled {
+                for &id in &stalled {
                     if let Some(state) = active_workers.remove(&id) {
                         state.cancel.cancel();
                         state.handle.abort();
@@ -1716,7 +1720,7 @@ pub async fn send_file_tcp(
             let path = file_path.to_path_buf();
             tokio::task::spawn_blocking(move || hash_file(&path, file_size))
                 .await
-                .map_err(|e| TransferError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e))))?
+                .map_err(|e| TransferError::Io(std::io::Error::other(format!("{:?}", e))))?
                 ?
         }
     };
@@ -1924,7 +1928,7 @@ pub async fn send_file_over_transport(
 
     let progress = TransferProgress::new(file_size, true);
     if let Some(ref pb) = progress.progress_bar {
-        pb.set_message(format!("{}", filename));
+        pb.set_message(filename.to_string());
     }
     let progress_handle = progress.handle();
 
@@ -1956,7 +1960,7 @@ pub async fn send_file_over_transport(
         move || hash_file(&path, file_size)
     })
     .await
-    .map_err(|e| TransferError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e))))?
+    .map_err(|e| TransferError::Io(std::io::Error::other(format!("{:?}", e))))?
     ?;
 
     let (meta, opener) = transport
@@ -2029,7 +2033,7 @@ pub async fn send_file_over_transport(
         let path_buf = file_path.to_path_buf();
         let file_hash = tokio::task::spawn_blocking(move || hash_file(&path_buf, file_size))
             .await
-            .map_err(|e| TransferError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))??;
+            .map_err(|e| TransferError::Io(std::io::Error::other(e.to_string())))??;
         writer.write_all(&[msg::CHECK_HASH]).await
             .map_err(|e| TransferError::NetworkError(format!("Failed to send CHECK_HASH: {}", e)))?;
         writer.write_all(&(filename.len() as u64).to_le_bytes()).await
@@ -2175,7 +2179,7 @@ pub async fn send_file_over_transport(
         return Ok(file_size);
     }
 
-    let is_resume = checkpoint.completed_ranges.len() > 0;
+    let is_resume = !checkpoint.completed_ranges.is_empty();
     if is_resume {
         tracing::debug!(
             completed = checkpoint.completed_ranges.len(),
@@ -2285,7 +2289,7 @@ pub async fn send_file_over_transport(
                     .map_err(|_| TransferError::NetworkError("multiplexed channel closed".into()))?;
                 let _ = completed_tx_mux.send((0, range, range_hash)).await;
                 let _ = done_tx_mux.send((0, Ok(()))).await;
-                progress_mux.update((range.end - range.start) as u64);
+                progress_mux.update(range.end - range.start);
             }
             Ok::<(), TransferError>(())
         });
@@ -2426,7 +2430,7 @@ pub async fn send_file_over_transport(
                         }
                     }
                 }
-                for id in stalled {
+                for &id in &stalled {
                     streams_stalled += 1;
                     if let Some(state) = active_workers.remove(&id) {
                         state.cancel.cancel();
