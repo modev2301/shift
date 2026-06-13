@@ -139,13 +139,11 @@ async fn test_loopback_tcp_transfer_end_to_end() {
 /// Full protocol test using the shift CLI: start server subprocess, send file, verify.
 /// Requires the binary to be built (`cargo build` or `cargo build --bin shift`).
 ///
-/// `#[ignore]`: the push **adaptive** coordinator can deadlock the metadata hash-exchange under
-/// the timing of a constrained/loaded CI host (reproduces on pristine `main`, independent of the
-/// pull work). The in-process push test (`test_loopback_tcp_transfer_end_to_end`) covers the same
-/// protocol and runs by default; this full-binary variant is opt-in via `cargo test -- --ignored`.
-/// Uses `--streams 4` to keep the data-port footprint small when it is run.
+/// Uses auto stream selection (no `--streams`), which splits this file into 128 ranges — more
+/// than the receiver's old 64-deep range-hash channel. That mismatch used to deadlock the
+/// hash-exchange (half the receives blocked on the full channel and never acked); this test
+/// guards that regression.
 #[test]
-#[ignore = "pre-existing push-coordinator deadlock on constrained CI hosts; run with --ignored"]
 fn test_loopback_via_cli() {
     let _serial = serial_guard();
     let bin_path = std::env::var("CARGO_BIN_EXE_shift")
@@ -223,7 +221,7 @@ metrics_enabled = true
 
     let dest = format!("127.0.0.1:{}:/", port);
     let status = Command::new(&bin_path)
-        .args(["--tcp", "--streams", "4", "data.bin", &dest])
+        .args(["--tcp", "data.bin", &dest])
         .current_dir(dir_path)
         .status()
         .expect("run client");

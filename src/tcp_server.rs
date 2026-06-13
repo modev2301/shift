@@ -8,7 +8,6 @@ use crate::base::msg;
 use crate::base::{apply_capabilities_to_config, capabilities_from_config, Capabilities, CAPABILITIES_WIRE_LEN};
 use crate::error::TransferError;
 use crate::base::TransferConfig;
-use crate::base::FileRange;
 use crate::integrity::{hash_file, hash_file_range_path, BLAKE3_LEN};
 use crate::server_cache;
 use crate::tcp_transfer::{configure_tcp_socket, receive_range_tcp, transfer_range_tcp};
@@ -526,9 +525,8 @@ impl TcpServer {
             "server split file into ranges"
         );
 
-        let (range_hash_tx, mut range_hash_rx) = mpsc::channel::<(FileRange, [u8; BLAKE3_LEN])>(64);
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
-        let (done_tx, mut done_rx) = mpsc::channel::<()>(64);
+        let (done_tx, mut done_rx) = mpsc::channel::<()>(num_ranges.max(1));
         let mut data_handles = Vec::new();
         let mut total_received = 0u64;
         let mut data_error: Option<TransferError> = None;
@@ -618,7 +616,7 @@ impl TcpServer {
             total_received = writer_handle.join()
                 .map_err(|_| TransferError::NetworkError("Writer thread panicked".to_string()))??;
 
-            // Fall through to range verify read and hash exchange (range_hash_rx will be empty)
+            // Fall through to range verify read and hash exchange.
         } else {
         tracing::debug!(
             num_connections_expected = ranges.len(),
@@ -632,7 +630,6 @@ impl TcpServer {
             let file = Arc::clone(&file);
             let config = config.clone();
             let data_port = base_port + 1 + thread_id as u16;
-            let range_hash_tx = range_hash_tx.clone();
             let mut shutdown_rx = shutdown_tx.subscribe();
             let done_tx = done_tx.clone();
             #[cfg(feature = "tls")]
@@ -667,7 +664,7 @@ impl TcpServer {
                             }
                         };
 
-                        let r = receive_range_tcp(thread_id, file, data_stream, config, None, Some(range_hash_tx)).await;
+                        let r = receive_range_tcp(thread_id, file, data_stream, config, None, None).await;
                         let _ = done_tx.send(()).await;
                         r
                     }
@@ -795,11 +792,6 @@ impl TcpServer {
         stream.read_exact(&mut expected_hash).await
             .map_err(|e| TransferError::NetworkError(format!("Failed to read file hash: {}", e)))?;
 
-        drop(range_hash_tx);
-        let mut received_ranges: Vec<(FileRange, [u8; BLAKE3_LEN])> = Vec::new();
-        while let Some(rh) = range_hash_rx.recv().await {
-            received_ranges.push(rh);
-        }
         // Read back the first 4 bytes of what was written
         let mut verify_buf = [0u8; 4];
         let mut verify_file = std::fs::File::open(&output_path)?;

@@ -172,7 +172,7 @@ cargo test --features tls,fec
   - `test_loopback_detects_corruption` — corrupting the received file forces a re-transfer.
   - `test_loopback_pull_download` — in-process pull (download) over the reverse data plane.
   - `test_loopback_pull_via_cli` — full-binary pull via the `shift` CLI.
-  - `test_loopback_via_cli` — full-binary push via the CLI; `#[ignore]`d because the push adaptive coordinator can deadlock the hash-exchange under the timing of a constrained CI host (reproduces on pristine `main`). Run it explicitly with `cargo test -- --ignored`.
+  - `test_loopback_via_cli` — full-binary push via the CLI using auto stream selection (128 ranges), which guards the receiver's range-hash backpressure regression.
 
   The CLI tests build and run the `shift` binary, so run `cargo build --bin shift` first (or `cargo test`, which builds it).
 
