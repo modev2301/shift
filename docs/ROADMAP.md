@@ -2,6 +2,10 @@
 
 Four focus areas: persistent connection, directory + manifest, transport selection, and FEC auto-trigger.
 
+**Implemented:** Pull (download) mode — `shift user@host:/path ./` downloads a file by reusing the
+range/stream data plane in reverse (client connects to the server's data ports and receives each
+range; whole-file BLAKE3 is verified on receipt). Currently TCP only; pull over TLS/QUIC is future work.
+
 ---
 
 ## 1. Persistent connection (fixes enterprise parallel TCP detection)

@@ -21,11 +21,7 @@ struct Cli {
     /// Transfer even if file is unchanged on receiver
     #[arg(long = "force")]
     force: bool,
-    
-    /// Enable block deduplication (rsync-style)
-    #[arg(short = 'd', long = "dedup")]
-    deduplicate: bool,
-    
+
     /// Force TCP transport (use when comparing with QUIC or if QUIC is unavailable)
     #[arg(long = "tcp")]
     force_tcp: bool,
@@ -245,15 +241,89 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load_or_create(&cli.config)?;
     
     if source_is_remote {
-        // Pull mode: shift user@host:/file.txt ./
+        // Pull mode: shift user@host:/file.txt ./local/
+        use shift::tcp_transfer::pull_file_tcp;
+        use shift::TransferConfig;
+        use std::net::ToSocketAddrs;
+
         if sources.len() > 1 {
             return Err("Pull mode supports only one source file at a time".into());
         }
+        if cli.tls {
+            return Err("Pull mode runs over plain TCP; omit --tls (push supports --tls)".into());
+        }
         let remote = RemotePath::parse(&sources[0])?;
-        
-        info!("Pulling {} from {}:{}", remote.path.display(), remote.host, remote.port.unwrap_or(443));
-        
-        return Err("Pull mode requires server-side file listing and serving. Not yet implemented.".into());
+        let server_port = remote.port.unwrap_or(8080);
+
+        // Resolve the local destination: a trailing-slash or existing directory means
+        // "into this directory using the remote file name"; otherwise it is the target file.
+        let remote_name = remote.path.file_name()
+            .ok_or("Remote path has no file name to download")?;
+        let dest_path = PathBuf::from(&dest);
+        let local_path = if dest.ends_with('/') || dest.ends_with(std::path::MAIN_SEPARATOR) || dest_path.is_dir() {
+            dest_path.join(remote_name)
+        } else {
+            dest_path
+        };
+
+        let server_addr = format!("{}:{}", remote.host, server_port)
+            .to_socket_addrs()?
+            .next()
+            .ok_or("Failed to resolve server address")?;
+
+        let num_streams = cli.streams
+            .or(config.client.parallel_streams)
+            .unwrap_or(DEFAULT_PARALLEL_STREAMS);
+        let buffer_size = config.client.buffer_size.unwrap_or(16 * 1024 * 1024);
+        let socket_buffer = config.client.socket_send_buffer_size
+            .or(config.client.socket_recv_buffer_size)
+            .unwrap_or(16 * 1024 * 1024);
+        let transfer_config = TransferConfig {
+            start_port: server_port,
+            num_streams,
+            max_streams: num_streams,
+            streams_explicit: true,
+            buffer_size,
+            socket_send_buffer_size: Some(socket_buffer),
+            socket_recv_buffer_size: Some(socket_buffer),
+            enable_compression: config.client.enable_compression,
+            enable_encryption: false,
+            encryption_key: None,
+            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            tls_cert_dir: None,
+            enable_fec: false,
+            fec_block_size: 65536,
+            fec_repair_packets: 4,
+            #[cfg(feature = "fec")]
+            fec_negotiated: false,
+            use_tcp_multiplexed: false,
+        };
+
+        let remote_path_str = remote.path.to_string_lossy().to_string();
+        info!("Pulling {} from {}:{} -> {}", remote_path_str, remote.host, server_port, local_path.display());
+
+        let rt = tokio::runtime::Runtime::new()?;
+        let mut report = TransferReport::default();
+        let output_stats = cli.stats || cli.json;
+        let stats_out = if output_stats { Some(&mut report) } else { None };
+        let received = rt.block_on(pull_file_tcp(
+            &local_path,
+            &remote_path_str,
+            server_addr,
+            transfer_config,
+            stats_out,
+        ))?;
+
+        if cli.json {
+            println!("{}", serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()));
+        } else if cli.stats {
+            eprintln!(
+                "transport: {}  bytes: {}  duration_ms: {}  throughput_mbps: {:.2}",
+                report.transport, report.bytes, report.duration_ms, report.throughput_mbps,
+            );
+        }
+        eprintln!("Pulled {} ({} bytes)", local_path.display(), received);
+        return Ok(());
     } else if dest_is_remote {
         // Push mode: shift file1.txt file2.txt user@host:/path/ or shift *.log host:/backup/
         let remote = RemotePath::parse(&dest)?;

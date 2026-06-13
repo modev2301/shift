@@ -48,6 +48,14 @@ pub mod msg {
     pub const MANIFEST_ACK: u8 = 0x10;
     /// Client -> Server: start one file in directory session. Wire: 0x11 (1) + filename_len (8 LE) + filename + size (8 LE) + num_streams (8 LE).
     pub const FILE_START: u8 = 0x11;
+    /// Client -> Server: pull (download) request. Wire: 0x12 (1) + path_len (8 LE) + path (UTF-8) + num_streams (8 LE).
+    /// Sent in place of metadata after the capability handshake; server responds PULL_OK or PULL_NOT_FOUND.
+    pub const PULL_REQUEST: u8 = 0x12;
+    /// Server -> Client: file found, will be served. Wire: 0x13 (1) + file_size (8 LE) + blake3 (32).
+    /// Sent after the server has bound its data listeners; client then connects to the data ports to receive ranges.
+    pub const PULL_OK: u8 = 0x13;
+    /// Server -> Client: requested file not found or not readable. Wire: 0x14 (1).
+    pub const PULL_NOT_FOUND: u8 = 0x14;
 }
 /// Wire size of Ping/Pong: 1 byte type + 8 bytes timestamp_us LE.
 pub const PING_PONG_WIRE_LEN: usize = 9;

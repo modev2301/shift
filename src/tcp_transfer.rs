@@ -91,7 +91,7 @@ use std::fs::File;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use socket2::{Domain, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -237,20 +237,28 @@ pub fn configure_tcp_socket(
     Ok(())
 }
 
-/// Transfer a file range over a single TCP connection.
+/// Transfer (send) a file range over a single stream.
+///
+/// Writes the range header (start, end, flags) followed by the framed data, then
+/// shuts the write side. Generic over the stream type so it serves both the push
+/// sender (client connects to the server's data port) and the pull server (server
+/// accepts a connection and sends the requested range to the client).
 /// Final file hash is computed from per-range BLAKE3 hashes in the coordinator (no streaming hasher).
 #[allow(clippy::too_many_arguments)]
-async fn transfer_range_tcp(
+pub(crate) async fn transfer_range_tcp<S>(
     thread_id: usize,
     range: FileRange,
     file: FileReader,
-    mut stream: tokio::net::TcpStream,
+    stream: S,
     config: TransferConfig,
     progress: Option<ProgressHandle>,
     metrics_tx: Option<mpsc::Sender<StreamReport>>,
     enable_fec_auto: Option<&AtomicBool>,
     cancel: Option<&CancellationToken>,
-) -> Result<u64, TransferError> {
+) -> Result<u64, TransferError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
     tracing::debug!(
         thread_id,
         start = range.start,
@@ -259,7 +267,7 @@ async fn transfer_range_tcp(
         "Transferring file range over TCP"
     );
 
-    let (_reader, mut writer) = stream.split();
+    let (_reader, mut writer) = tokio::io::split(stream);
 
     // Send range header: start (8) + end (8) + flags (1 byte: bit 0=compression, bit 1=encryption)
     let mut header = Vec::with_capacity(17);
@@ -2756,5 +2764,234 @@ pub async fn receive_file_tcp(
     );
 
     Ok(total_received)
+}
+
+/// Connect to a server data port, retrying briefly while the listener is still binding.
+async fn connect_data_port(
+    ip: std::net::IpAddr,
+    port: u16,
+    config: &TransferConfig,
+) -> Result<TcpStream, TransferError> {
+    const MAX_ATTEMPTS: u32 = 50;
+    let mut attempt = 0u32;
+    loop {
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, None)
+            .map_err(|e| TransferError::NetworkError(format!("Socket: {}", e)))?;
+        configure_tcp_socket(&socket, config.socket_send_buffer_size, config.socket_recv_buffer_size)?;
+        match socket.connect(&SocketAddr::new(ip, port).into()) {
+            Ok(()) => {
+                socket.set_nonblocking(true)
+                    .map_err(|e| TransferError::NetworkError(format!("Nonblocking: {}", e)))?;
+                let std_stream = std::net::TcpStream::from(socket);
+                return TcpStream::from_std(std_stream)
+                    .map_err(|e| TransferError::NetworkError(format!("Tokio stream: {}", e)));
+            }
+            Err(e) if attempt < MAX_ATTEMPTS
+                && matches!(e.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut) =>
+            {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(e) => return Err(TransferError::NetworkError(format!("Connect data port {}: {}", port, e))),
+        }
+    }
+}
+
+/// Pull (download) a file from a server over TCP.
+///
+/// Mirrors the push data plane in reverse: after the capability handshake the client sends a
+/// `PULL_REQUEST`, the server replies `PULL_OK` with the file size and BLAKE3 hash, then the
+/// client opens one connection per range to the server's data ports (`base_port+1..`) and
+/// receives each range with `receive_range_tcp`. The whole received file is verified against the
+/// server-advertised BLAKE3 hash before returning. Returns the number of bytes received.
+pub async fn pull_file_tcp(
+    local_path: &std::path::Path,
+    remote_path: &str,
+    server_addr: SocketAddr,
+    config: TransferConfig,
+    mut stats: Option<&mut TransferReport>,
+) -> Result<u64, TransferError> {
+    let start_time = Instant::now();
+
+    // Metadata connection.
+    let metadata_socket = Socket::new(Domain::IPV4, Type::STREAM, None)
+        .map_err(|e| TransferError::NetworkError(format!("Failed to create socket: {}", e)))?;
+    if let Some(size) = config.socket_send_buffer_size {
+        metadata_socket.set_send_buffer_size(size)
+            .map_err(|e| TransferError::NetworkError(format!("Failed to set SO_SNDBUF: {}", e)))?;
+    }
+    if let Some(size) = config.socket_recv_buffer_size {
+        metadata_socket.set_recv_buffer_size(size)
+            .map_err(|e| TransferError::NetworkError(format!("Failed to set SO_RCVBUF: {}", e)))?;
+    }
+    metadata_socket.set_nodelay(true)
+        .map_err(|e| TransferError::NetworkError(format!("Failed to set TCP_NODELAY: {}", e)))?;
+    metadata_socket.connect(&server_addr.into())
+        .map_err(|e| TransferError::NetworkError(format!("Connection failed: {}", e)))?;
+    metadata_socket.set_nonblocking(true)
+        .map_err(|e| TransferError::NetworkError(format!("Failed to set nonblocking: {}", e)))?;
+    let std_stream = std::net::TcpStream::from(metadata_socket);
+    let mut metadata_stream = TcpStream::from_std(std_stream)
+        .map_err(|e| TransferError::NetworkError(format!("Failed to convert to tokio stream: {}", e)))?;
+    let (mut reader, mut writer) = metadata_stream.split();
+
+    // Capability handshake.
+    let client_caps = crate::base::capabilities_from_config(&config);
+    writer.write_all(&client_caps.to_bytes()).await
+        .map_err(|e| TransferError::NetworkError(format!("Failed to send capabilities: {}", e)))?;
+    let mut cap_buf = [0u8; crate::base::CAPABILITIES_WIRE_LEN];
+    reader.read_exact(&mut cap_buf).await
+        .map_err(|e| TransferError::NetworkError(format!("Failed to read negotiated capabilities: {}", e)))?;
+    let negotiated = crate::base::Capabilities::from_bytes(&cap_buf)
+        .ok_or_else(|| TransferError::ProtocolError("Invalid capabilities from server".to_string()))?;
+    let mut config = crate::base::apply_capabilities_to_config(&config, negotiated);
+    // Encryption requires a pre-shared key that is not plumbed for pull; keep it off so the
+    // server and client agree (matches the push path, where no key is configured).
+    config.enable_encryption = false;
+    let num_streams = config.max_streams.clamp(1, 256);
+
+    // PULL_REQUEST: 0x12 + path_len (8) + path + num_streams (8). Sent as the post-handshake
+    // first byte (no PING/PROBE), which the server routes to its pull handler.
+    let path_bytes = remote_path.as_bytes();
+    let mut req = Vec::with_capacity(1 + 8 + path_bytes.len() + 8);
+    req.push(msg::PULL_REQUEST);
+    req.extend_from_slice(&(path_bytes.len() as u64).to_le_bytes());
+    req.extend_from_slice(path_bytes);
+    req.extend_from_slice(&(num_streams as u64).to_le_bytes());
+    writer.write_all(&req).await
+        .map_err(|e| TransferError::NetworkError(format!("Failed to send PULL_REQUEST: {}", e)))?;
+    writer.flush().await
+        .map_err(|e| TransferError::NetworkError(format!("Failed to flush PULL_REQUEST: {}", e)))?;
+
+    // Response.
+    let mut resp = [0u8; 1];
+    reader.read_exact(&mut resp).await
+        .map_err(|e| TransferError::NetworkError(format!("Failed to read pull response: {}", e)))?;
+    match resp[0] {
+        msg::PULL_NOT_FOUND => {
+            return Err(TransferError::RemoteError(format!("Remote file not found: {}", remote_path)));
+        }
+        msg::PULL_OK => {}
+        other => {
+            return Err(TransferError::ProtocolError(format!("Unexpected pull response byte 0x{:02x}", other)));
+        }
+    }
+    let mut size_buf = [0u8; 8];
+    reader.read_exact(&mut size_buf).await
+        .map_err(|e| TransferError::NetworkError(format!("Failed to read pull size: {}", e)))?;
+    let file_size = u64::from_le_bytes(size_buf);
+    let mut hash_buf = [0u8; BLAKE3_LEN];
+    reader.read_exact(&mut hash_buf).await
+        .map_err(|e| TransferError::NetworkError(format!("Failed to read pull hash: {}", e)))?;
+    let expected_hash = hash_buf;
+
+    // Create the destination file.
+    if let Some(parent) = local_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let out_file = File::create(local_path)?;
+    out_file.set_len(file_size)?;
+    let out_file = Arc::new(out_file);
+
+    // Verify helper used for both the empty-file and the streamed case.
+    let finalize = |bytes: u64, stats: &mut Option<&mut TransferReport>| -> Result<u64, TransferError> {
+        let actual = hash_file(local_path, file_size)?;
+        if actual != expected_hash {
+            return Err(TransferError::IntegrityCheckFailed(format!(
+                "BLAKE3 mismatch on pulled file {}", local_path.display()
+            )));
+        }
+        if let Some(report) = stats.as_mut() {
+            let duration_ms = start_time.elapsed().as_millis() as u64;
+            report.status = TransferStatus::Completed;
+            report.bytes = bytes;
+            report.duration_ms = duration_ms;
+            report.throughput_mbps = if duration_ms > 0 {
+                (bytes as f64 / (1024.0 * 1024.0)) / (duration_ms as f64 / 1000.0)
+            } else {
+                0.0
+            };
+            report.transport = "tcp".to_string();
+        }
+        Ok(bytes)
+    };
+
+    if file_size == 0 {
+        return finalize(0, &mut stats);
+    }
+
+    // One connection per range; receive_range_tcp learns each range's offsets from its header.
+    let num_ranges = transfer_num_ranges(num_streams);
+    let server_ip = server_addr.ip();
+    let base_port = server_addr.port();
+
+    let progress = TransferProgress::new(file_size, true);
+    if let Some(ref pb) = progress.progress_bar {
+        pb.set_message(local_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+    }
+    let progress_handle = progress.handle();
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let config = Arc::new(config);
+    let mut workers = Vec::new();
+    for _ in 0..num_streams {
+        let counter = Arc::clone(&counter);
+        let config = Arc::clone(&config);
+        let out_file = Arc::clone(&out_file);
+        let progress_handle = progress_handle.clone();
+        workers.push(tokio::spawn(async move {
+            let mut bytes = 0u64;
+            loop {
+                let idx = counter.fetch_add(1, Ordering::SeqCst);
+                if idx >= num_ranges {
+                    break;
+                }
+                let port = base_port + 1 + idx as u16;
+                let stream = connect_data_port(server_ip, port, &config).await?;
+                let n = receive_range_tcp(
+                    idx,
+                    Arc::clone(&out_file),
+                    stream,
+                    (*config).clone(),
+                    Some(progress_handle.clone()),
+                    None,
+                )
+                .await?;
+                bytes += n;
+            }
+            Ok::<u64, TransferError>(bytes)
+        }));
+    }
+
+    let mut total = 0u64;
+    let mut first_err = None;
+    for w in workers {
+        match w.await {
+            Ok(Ok(n)) => total += n,
+            Ok(Err(e)) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(TransferError::NetworkError(format!("Pull worker join: {}", e)));
+                }
+            }
+        }
+    }
+    progress.finish();
+    if let Some(e) = first_err {
+        return Err(e);
+    }
+    if total != file_size {
+        return Err(TransferError::ProtocolError(format!(
+            "Pull size mismatch: received {} bytes, expected {}", total, file_size
+        )));
+    }
+
+    finalize(total, &mut stats)
 }
 
