@@ -111,6 +111,6 @@ mod tests {
         let encoded = encode_block(data, 1280, 2).unwrap();
         assert!(encoded.starts_with(&[FEC_PACKET_TYPE]));
         let decoded = decode_fec_block(&encoded).unwrap();
-        assert_eq!(decoded.as_ref().map(|v| v.as_slice()), Some(&data[..]));
+        assert_eq!(decoded.as_deref(), Some(&data[..]));
     }
 }

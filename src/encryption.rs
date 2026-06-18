@@ -86,7 +86,7 @@ impl Decryptor {
     }
 
     /// Decrypt data in-place.
-    pub fn decrypt_in_place(&mut self, data: &mut Vec<u8>) -> Result<usize, TransferError> {
+    pub fn decrypt_in_place(&mut self, data: &mut [u8]) -> Result<usize, TransferError> {
         let plaintext_len = self.opening_key.open_in_place(Aad::empty(), data)
             .map_err(|e| TransferError::ProtocolError(format!("Decryption failed: {:?}", e)))?
             .len();

@@ -136,9 +136,23 @@ mod tests {
 
     #[test]
     fn test_timeout_error_conversion() {
-        // Skip this test since we can't create Elapsed directly
-        // The conversion is tested indirectly through other error handling
-        assert!(true); // Placeholder test
+        // Produce a real `Elapsed` by timing out an always-pending future, then
+        // verify it converts into the `Timeout` variant via `From`.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let elapsed = rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_millis(1), std::future::pending::<()>())
+                .await
+                .unwrap_err()
+        });
+        let transfer_error: TransferError = elapsed.into();
+
+        match transfer_error {
+            TransferError::Timeout(_) => {}
+            _ => panic!("Expected Timeout error variant"),
+        }
     }
 
     #[test]

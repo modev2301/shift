@@ -12,6 +12,11 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Map of completed file path to its BLAKE3 hash.
+pub type HashCache = HashMap<PathBuf, [u8; BLAKE3_LEN]>;
+/// Sender used to persist (path, hash) pairs to the background writer thread.
+pub type PersistSender = mpsc::Sender<(PathBuf, [u8; BLAKE3_LEN])>;
+
 const FILE_HASHES_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS file_hashes (
     path TEXT PRIMARY KEY,
@@ -34,12 +39,7 @@ pub fn server_cache_path() -> PathBuf {
 /// (path, hash) messages. Returns the initial map and a sender to use for persist.
 /// On any error (open, load, or spawn), returns empty map and None sender so the
 /// server still runs without persistence.
-pub fn load_and_spawn_persist(
-    db_path: &Path,
-) -> (
-    HashMap<PathBuf, [u8; BLAKE3_LEN]>,
-    Option<mpsc::Sender<(PathBuf, [u8; BLAKE3_LEN])>>,
-) {
+pub fn load_and_spawn_persist(db_path: &Path) -> (HashCache, Option<PersistSender>) {
     let (tx, rx) = mpsc::channel::<(PathBuf, [u8; BLAKE3_LEN])>();
     let path_for_thread = db_path.to_path_buf();
 

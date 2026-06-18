@@ -43,7 +43,7 @@ impl TransferProgress {
     pub fn handle(&self) -> ProgressHandle {
         ProgressHandle {
             transferred: Arc::clone(&self.transferred),
-            progress_bar: self.progress_bar.as_ref().map(|pb| pb.clone()),
+            progress_bar: self.progress_bar.clone(),
         }
     }
 

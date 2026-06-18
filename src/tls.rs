@@ -16,14 +16,10 @@ mod imp {
     use std::fs;
     use std::io::BufReader;
 
-    fn ca_and_certs() -> Result<
-        (
-            rcgen::Certificate,
-            (Vec<u8>, rcgen::Certificate), // (signed_der, cert with key)
-            (Vec<u8>, rcgen::Certificate),
-        ),
-        TransferError,
-    > {
+    /// A leaf certificate: its CA-signed DER bytes paired with the rcgen cert (which holds the key).
+    type SignedCert = (Vec<u8>, rcgen::Certificate);
+
+    fn ca_and_certs() -> Result<(rcgen::Certificate, SignedCert, SignedCert), TransferError> {
         use rcgen::CertificateParams;
 
         let mut ca_params = CertificateParams::new(vec!["shift-ca".to_string()]);
@@ -93,7 +89,7 @@ mod imp {
         let certs = rustls_pemfile::certs(&mut reader)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| TransferError::ProtocolError(format!("PEM cert: {}", e)))?;
-        Ok(certs.into_iter().map(CertificateDer::from).collect())
+        Ok(certs.into_iter().collect())
     }
 
     fn load_pem_key(path: &Path) -> Result<PrivateKeyDer<'static>, TransferError> {
@@ -102,7 +98,7 @@ mod imp {
         let key = rustls_pemfile::private_key(&mut reader)
             .map_err(|e| TransferError::ProtocolError(format!("PEM key: {}", e)))?
             .ok_or_else(|| TransferError::ProtocolError("No private key in file".to_string()))?;
-        Ok(PrivateKeyDer::from(key))
+        Ok(key)
     }
 
     /// Build server config with mutual TLS: server cert from dir, client certs verified by CA in dir.

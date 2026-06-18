@@ -11,17 +11,14 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 /// Platform for capability reporting (0=unknown, 1=linux, 2=windows).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum Platform {
+    #[default]
     Unknown = 0,
     Linux = 1,
     Windows = 2,
 }
 
-impl Default for Platform {
-    fn default() -> Self {
-        Self::Unknown
-    }
-}
 
 /// A bidirectional stream with shutdown. Implementors must also implement AsyncRead + AsyncWrite + Unpin.
 #[async_trait]
@@ -106,7 +103,10 @@ use socket2::{Domain, Socket, Type};
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream};
 
 /// Inner stream type: plain TCP or TLS-wrapped (when tls feature and tls_cert_dir set).
+// One instance per connection; the TLS variant is larger but boxing it would add a
+// heap indirection on every poll of the hot I/O path for no practical benefit.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum TcpOrTlsStream {
     Plain(TokioTcpStream),
     #[cfg(feature = "tls")]

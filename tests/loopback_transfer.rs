@@ -5,6 +5,12 @@
 //! - `test_loopback_tcp_update_skip_unchanged`: in-process, tests --update skip when file unchanged.
 //! - `test_loopback_detects_corruption`: in-process, corrupt received file then --update; verifies re-transfer (BLAKE3 / cache invalidation).
 
+// These tests each perform a real transfer that binds a range of consecutive data ports
+// (base+1..). Run concurrently they would contend for overlapping port ranges, so they share a
+// serial guard (acquired at the top of each test) and run one at a time. Holding the std guard
+// across `.await` is intentional here and harmless because each test runs on its own thread.
+#![allow(clippy::await_holding_lock)]
+
 use shift::integrity::hash_file;
 use shift::tcp_server::TcpServer;
 use shift::tcp_transfer::send_file_over_transport;
@@ -12,8 +18,18 @@ use shift::transport::create_transport;
 use shift::TransferConfig;
 use std::net::SocketAddr;
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 use tempfile::tempdir;
+
+/// Serialize the port-binding transfer tests so they never contend for data ports.
+/// Recovers from poisoning so a panicking test does not wedge the rest of the suite.
+fn serial_guard() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Pick a free port (for CLI test that starts a separate process). In-process tests use port 0 + oneshot to get the assigned port.
 fn free_port() -> u16 {
@@ -34,11 +50,13 @@ fn wait_for_port(port: u16, timeout: Duration) -> bool {
 }
 
 fn transfer_config(port: u16) -> TransferConfig {
+    // Small stream/range counts keep each test's data-port footprint tiny so back-to-back
+    // serialized tests don't collide on recently-used (TIME_WAIT) ports.
     TransferConfig {
         start_port: port,
-        num_streams: 4,
-        max_streams: 8,
-        streams_explicit: false,
+        num_streams: 2,
+        max_streams: 2,
+        streams_explicit: true,
         buffer_size: 256 * 1024,
         socket_send_buffer_size: Some(256 * 1024),
         socket_recv_buffer_size: Some(256 * 1024),
@@ -59,6 +77,7 @@ fn transfer_config(port: u16) -> TransferConfig {
 /// In-process: oneshot server (port 0) + library client. Proper close handshake so client receives HASH_OK before server returns.
 #[tokio::test]
 async fn test_loopback_tcp_transfer_end_to_end() {
+    let _serial = serial_guard();
     let out_dir = tempdir().expect("temp dir");
     let out_path = out_dir.path().to_path_buf();
     let src_dir = tempdir().expect("temp dir for src");
@@ -119,8 +138,14 @@ async fn test_loopback_tcp_transfer_end_to_end() {
 
 /// Full protocol test using the shift CLI: start server subprocess, send file, verify.
 /// Requires the binary to be built (`cargo build` or `cargo build --bin shift`).
+///
+/// Uses auto stream selection (no `--streams`), which splits this file into 128 ranges — more
+/// than the receiver's old 64-deep range-hash channel. That mismatch used to deadlock the
+/// hash-exchange (half the receives blocked on the full channel and never acked); this test
+/// guards that regression.
 #[test]
 fn test_loopback_via_cli() {
+    let _serial = serial_guard();
     let bin_path = std::env::var("CARGO_BIN_EXE_shift")
         .ok()
         .map(std::path::PathBuf::from)
@@ -227,8 +252,158 @@ metrics_enabled = true
     );
 }
 
+/// In-process pull (download): server serves a file from its output dir; client downloads it
+/// over the reverse data plane and verifies the whole-file BLAKE3 against the server-advertised hash.
+/// Full pull via the shift CLI: start a server subprocess serving a file from its output dir,
+/// then run the client in pull mode (`shift host:port:/data.bin out/`) and verify the download.
+#[test]
+fn test_loopback_pull_via_cli() {
+    let _serial = serial_guard();
+    let bin_path = std::env::var("CARGO_BIN_EXE_shift")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var("CARGO_MANIFEST_DIR")
+                .ok()
+                .map(|m| std::path::PathBuf::from(m).join("target/debug/shift"))
+        })
+        .and_then(|p| p.canonicalize().ok());
+    let bin_path = match bin_path {
+        Some(p) => p,
+        None => {
+            eprintln!("Skipping test_loopback_pull_via_cli: binary not found (run cargo build --bin shift)");
+            return;
+        }
+    };
+
+    let port = free_port();
+    let dir = tempdir().expect("temp dir");
+    let dir_path = dir.path();
+    let served_dir = dir_path.join("served");
+    std::fs::create_dir_all(&served_dir).expect("create served dir");
+
+    let config_toml = format!(
+        r#"[server]
+address = "127.0.0.1"
+port = {}
+output_directory = "served"
+max_clients = 10
+enable_compression = false
+timeout_seconds = 30
+
+[client]
+server_address = "127.0.0.1"
+server_port = {}
+enable_compression = false
+timeout_seconds = 30
+
+[security]
+auth_token = "test"
+max_connections_per_ip = 10
+
+[performance]
+simd_enabled = true
+zero_copy_enabled = true
+memory_pool_size = 2000
+connection_pool_size = 100
+compression_level = 1
+metrics_enabled = true
+"#,
+        port, port
+    );
+    std::fs::write(dir_path.join("config.toml"), config_toml).expect("write config");
+
+    let size = 48 * 1024u64;
+    let content: Vec<u8> = (0..size as usize).map(|i| (i % 251) as u8).collect();
+    std::fs::write(served_dir.join("data.bin"), &content).expect("write served file");
+    let expected_hash = hash_file(&served_dir.join("data.bin"), size).expect("hash");
+
+    let mut server = Command::new(&bin_path)
+        .args(["server"])
+        .current_dir(dir_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn server");
+
+    assert!(
+        wait_for_port(port, Duration::from_secs(5)),
+        "server did not start in time"
+    );
+
+    let out_dir = dir_path.join("out");
+    std::fs::create_dir_all(&out_dir).expect("create out dir");
+    let source = format!("127.0.0.1:{}:/data.bin", port);
+    let status = Command::new(&bin_path)
+        .args(["--streams", "4", source.as_str(), "out/"])
+        .current_dir(dir_path)
+        .status()
+        .expect("run client pull");
+
+    let _ = server.kill();
+    let _ = server.wait();
+
+    assert!(status.success(), "pull client should succeed");
+    let received = out_dir.join("data.bin");
+    assert!(received.exists(), "downloaded file should exist");
+    assert_eq!(std::fs::metadata(&received).expect("metadata").len(), size);
+    let got_hash = hash_file(&received, size).expect("hash received");
+    assert_eq!(got_hash[..], expected_hash[..], "downloaded BLAKE3 should match served file");
+}
+
+/// In-process pull (download): server serves a file from its output dir; client downloads it
+/// over the reverse data plane and verifies the whole-file BLAKE3 against the server-advertised hash.
+#[tokio::test]
+async fn test_loopback_pull_download() {
+    let _serial = serial_guard();
+    use shift::tcp_transfer::pull_file_tcp;
+
+    let server_dir = tempdir().expect("server dir");
+    let server_out = server_dir.path().to_path_buf();
+    let size = 200 * 1024u64;
+    let content: Vec<u8> = (0..size as usize).map(|i| (i % 251) as u8).collect();
+    let served = server_out.join("download_me.bin");
+    std::fs::write(&served, &content).expect("write served file");
+    let expected = hash_file(&served, size).expect("hash served");
+
+    let (port_tx, port_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = TcpServer::new(0, server_out.clone(), transfer_config(0));
+    let server_handle = tokio::spawn(async move {
+        tokio::select! {
+            _ = server.run_forever(Some(port_tx)) => {}
+            _ = shutdown_rx => {}
+        }
+    });
+    let port = port_rx.await.expect("server port");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().expect("addr");
+
+    // Download into a directory-style destination using the remote file name.
+    let dl_dir = tempdir().expect("download dir");
+    let local = dl_dir.path().join("got.bin");
+    let received = pull_file_tcp(&local, "/download_me.bin", addr, transfer_config(port), None)
+        .await
+        .expect("pull should succeed");
+    assert_eq!(received, size, "pulled byte count should match file size");
+    assert!(local.exists(), "downloaded file should exist");
+    assert_eq!(std::fs::metadata(&local).unwrap().len(), size);
+    let got = hash_file(&local, size).expect("hash downloaded");
+    assert_eq!(got[..], expected[..], "downloaded file BLAKE3 must match source");
+
+    // Pulling a non-existent file must error (and must not leave a file behind).
+    let missing = dl_dir.path().join("missing.bin");
+    let err = pull_file_tcp(&missing, "/does_not_exist.bin", addr, transfer_config(port), None).await;
+    assert!(err.is_err(), "pulling a missing file should error");
+    assert!(!missing.exists(), "no file should be created for a missing pull");
+
+    let _ = shutdown_tx.send(());
+    let _ = server_handle.await;
+}
+
 #[tokio::test]
 async fn test_loopback_tcp_update_skip_unchanged() {
+    let _serial = serial_guard();
     let out_dir = tempdir().expect("temp dir");
     let out_path = out_dir.path().to_path_buf();
     let src_dir = tempdir().expect("temp dir for src");
@@ -289,6 +464,7 @@ async fn test_loopback_tcp_update_skip_unchanged() {
 /// In-process: transfer a file, corrupt the received copy, then run --update. Server must re-transfer (not skip) because on-disk hash no longer matches; confirms BLAKE3 verification and cache invalidation.
 #[tokio::test]
 async fn test_loopback_detects_corruption() {
+    let _serial = serial_guard();
     let out_dir = tempdir().expect("temp dir");
     let out_path = out_dir.path().to_path_buf();
     let src_dir = tempdir().expect("temp dir for src");

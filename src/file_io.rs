@@ -32,7 +32,7 @@ const DISK_BLOCK_SIZE: usize = 4096;
 ///
 /// Returns a `File` handle for reading, or an error if the file cannot be opened.
 pub fn open_file_optimized(path: &Path, _file_size: u64) -> Result<File, TransferError> {
-    File::open(path).map_err(|e| TransferError::Io(e))
+    File::open(path).map_err(TransferError::Io)
 }
 
 /// Abstraction for reading at offset: either std `File` (pread/spawn_blocking) or
@@ -70,7 +70,7 @@ impl FileReader {
                     Ok::<_, TransferError>((n, vec))
                 })
                 .await
-                .map_err(|e| TransferError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))??;
+                .map_err(|e| TransferError::Io(std::io::Error::other(e)))??;
                 let n = n.min(buf.len());
                 buf[..n].copy_from_slice(&returned[..n]);
                 Ok(n)
@@ -146,7 +146,7 @@ pub fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> Result<usize, Tra
 /// Returns the aligned buffer size.
 #[cfg(target_os = "linux")]
 pub fn align_buffer_size(size: usize) -> usize {
-    ((size + DISK_BLOCK_SIZE - 1) / DISK_BLOCK_SIZE) * DISK_BLOCK_SIZE
+    size.div_ceil(DISK_BLOCK_SIZE) * DISK_BLOCK_SIZE
 }
 
 #[cfg(not(target_os = "linux"))]
