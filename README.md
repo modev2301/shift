@@ -8,7 +8,7 @@ Shift is a high-performance file transfer system for reliable, efficient data mo
 ## Features
 
 - **Push and pull** — Upload (`shift file host:/path/`) or download (`shift host:/path/file ./`), SCP-style. Pull runs over TCP.
-- **Dual transport** — QUIC (default) with TCP fallback; force TCP with `--tcp`. Same protocol on both.
+- **Dual transport** — TCP by default (reliable; warm connections are reused across ranges so a single flow stays at full window). Opt into QUIC with `--quic` for lossy/mobile links. Same protocol on both.
 - **Adaptive streams** — RTT probe caps streams on high-latency (WAN) to avoid stalls; scale-up and requeue on low RTT. No manual `--streams` needed for typical use.
 - **Parallel connections** — Multiple streams per transfer; finer range granularity (max_streams×4) for load balance and resume.
 - **End-to-end integrity** — BLAKE3 of bytes sent; server verifies and replies HASH_OK or HASH_MISMATCH (client keeps checkpoint on mismatch).
@@ -45,7 +45,7 @@ Binary: `target/release/shift`. TCP and QUIC are both built-in.
 ./target/release/shift server --config my.toml
 ```
 
-**Client:** Probes TCP and QUIC and picks the faster (preferring QUIC when it is within ~10% of TCP). Use `--tcp` to force TCP. Pull (download) always uses TCP.
+**Client:** Uses TCP by default. Add `--quic` to use QUIC (helpful on lossy or mobile links). Pull (download) always uses TCP.
 
 ```bash
 # Upload (push)
@@ -99,7 +99,8 @@ name is used; otherwise the destination is the exact target path.
 | `--force` | Transfer even if file is unchanged on receiver. |
 | `--stats` | Print per-file transfer stats (throughput, streams, RTT, ranges). |
 | `--json` | Print per-file report as JSON (for scripting/benchmarks). |
-| `--tcp` | Force TCP (no QUIC probe). |
+| `--tcp` | Force TCP (the default; explicit for scripts). |
+| `--quic` | Use QUIC instead of TCP (lossy/mobile links). |
 | `--streams N` | Use N parallel streams (default: auto). Use 4 when only 5 server ports (8080–8084) are open. |
 | `--tls` | Use mutual TLS for TCP (requires `--features tls` and cert dir). |
 | `-r`, `--recursive` | Recursive directory transfer. |

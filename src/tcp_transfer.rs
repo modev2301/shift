@@ -717,6 +717,9 @@ async fn transport_stream_worker(
 ) {
     let mut ranges_handled = 0u32;
     let mut conn: Option<Box<dyn TransportStreamTrait>> = None;
+    // TCP reuses one warm connection for many ranges; QUIC opens a fresh stream per range
+    // (cheap, and the QUIC receiver reads exactly one range per stream).
+    let reuse = opener.reuse_connection();
     loop {
         // Check BEFORE popping — a cancelled worker must not take a range (avoids duplicate pop when respawned).
         if cancel.is_cancelled() {
@@ -766,6 +769,14 @@ async fn transport_stream_worker(
                 let _ = completed_tx.send((id, range, range_hash)).await;
                 queue.complete(id);
                 ranges_handled += 1;
+                // QUIC: finish this stream so the receiver sees end-of-range, then open a fresh
+                // stream for the next range. TCP keeps the connection warm.
+                if !reuse {
+                    if let Some(mut s) = conn.take() {
+                        use tokio::io::AsyncWriteExt;
+                        let _ = s.shutdown().await;
+                    }
+                }
                 // Check after completing — before looping back; if cancelled, exit without popping again.
                 if cancel.is_cancelled() {
                     let _ = done_tx.send((id, Ok(()))).await;

@@ -57,6 +57,12 @@ pub trait StreamOpener: Send + Sync {
     /// Open one new stream. TCP: connect to next data port; QUIC: open_bi on the connection.
     async fn open_stream(&self) -> Result<Box<dyn Stream>, TransferError>;
     fn max_streams(&self) -> usize;
+    /// Whether a worker should keep one opened stream warm and send many ranges over it.
+    /// True for TCP (each connection is an expensive, slow-starting flow worth reusing); false for
+    /// QUIC, where streams are cheap and the receiver reads exactly one range per stream.
+    fn reuse_connection(&self) -> bool {
+        false
+    }
     /// When available (e.g. QUIC), returns (lost_packets, sent_packets) for loss-based FEC auto-trigger. Default: None.
     fn loss_stats(&self) -> Option<LossStats> {
         None
@@ -459,6 +465,10 @@ impl StreamOpener for TcpStreamOpener {
     fn max_streams(&self) -> usize {
         self.max
     }
+
+    fn reuse_connection(&self) -> bool {
+        true
+    }
 }
 
 #[async_trait]
@@ -630,55 +640,23 @@ impl Transport for TcpTransport {
 }
 
 /// Create a transport: QUIC or TCP.
-/// When `server_addr` is `Some` and `force_tcp` is false, runs bandwidth probes for both TCP and QUIC
-/// and picks QUIC if its bandwidth is within 10% of TCP (for connection migration, mobile); otherwise TCP.
-/// When `server_addr` is `None`, uses QUIC if QuicTransport::probe() succeeds, else TCP.
-pub async fn create_transport(
-    config: &TransferConfig,
-    force_tcp: bool,
-    server_addr: Option<SocketAddr>,
-) -> Box<dyn Transport> {
-    if force_tcp {
-        return Box::new(TcpTransport::new(config.clone()));
-    }
-    if let Some(addr) = server_addr {
-        let tcp_transport = TcpTransport::new(config.clone());
-        let tcp_bw = crate::tcp_transfer::probe_bandwidth_for_transport(
-            &tcp_transport as &dyn Transport,
-            addr,
-            config,
-        )
-        .await;
-        if let Ok(quic_transport) = crate::quinn_transport::QuicTransport::probe().await {
-            let quic_bw =
-                crate::tcp_transfer::probe_bandwidth_for_transport(&quic_transport as &dyn Transport, addr, config).await;
-            match (tcp_bw, quic_bw) {
-                (Some(tb), Some(qb)) if qb * 10 >= tb * 9 => {
-                    tracing::info!(
-                        tcp_bps = tb,
-                        quic_bps = qb,
-                        "Transport: QUIC (within 10% of TCP, preferred for migration/flaky links)"
-                    );
-                    return Box::new(quic_transport);
-                }
-                (Some(tb), Some(qb)) => {
-                    tracing::info!(
-                        tcp_bps = tb,
-                        quic_bps = qb,
-                        "Transport: TCP (default; not slower than scp baseline)"
-                    );
-                }
-                _ => {
-                    tracing::info!("Transport: TCP (probe failed or inconclusive)")
-                }
+/// Choose the transport. TCP is the default: it is reliable and, with warm reused connections, fast
+/// (a single TCP stream typically saturates a path, and extra short flows only add overhead). QUIC
+/// is used only when `prefer_quic` is set (CLI `--quic`) and a QUIC endpoint can be created — useful
+/// on lossy or mobile links. A cold-start bandwidth probe is too noisy to auto-pick the transport
+/// reliably (it routinely under-measures a fresh TCP flow), so we do not gamble the default on it.
+pub async fn create_transport(config: &TransferConfig, prefer_quic: bool) -> Box<dyn Transport> {
+    if prefer_quic {
+        match crate::quinn_transport::QuicTransport::probe().await {
+            Ok(quic) => {
+                tracing::info!("Transport: QUIC (requested via --quic)");
+                return Box::new(quic);
             }
-        } else {
-            tracing::info!("Transport: TCP (QUIC probe unavailable)")
+            Err(e) => {
+                tracing::warn!(error = %e, "QUIC requested but unavailable; falling back to TCP");
+            }
         }
-        return Box::new(tcp_transport);
     }
-    if let Ok(quic) = crate::quinn_transport::QuicTransport::probe().await {
-        return Box::new(quic);
-    }
+    tracing::info!("Transport: TCP");
     Box::new(TcpTransport::new(config.clone()))
 }
