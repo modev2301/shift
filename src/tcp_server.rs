@@ -664,9 +664,10 @@ impl TcpServer {
                             }
                         };
 
-                        let r = receive_range_tcp(thread_id, file, data_stream, config, None, None).await;
-                        let _ = done_tx.send(()).await;
-                        r
+                        // One warm connection may carry many ranges; signal completion per range.
+                        receive_range_tcp(thread_id, file, data_stream, config, None, move |_n: u64| {
+                            let _ = done_tx.try_send(());
+                        }).await
                     }
                     _ = shutdown_rx.recv() => Ok(0u64),
                 }

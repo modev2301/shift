@@ -96,11 +96,10 @@ use std::time::{Duration, Instant};
 use socket2::{Domain, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::debug;
 
 /// Configure TCP socket for high throughput.
 ///
@@ -426,18 +425,20 @@ where
 }
 
 /// Transfer a file range over a transport stream (TCP or QUIC). Same protocol as transfer_range_tcp.
+/// Returns (bytes_sent, BLAKE3 of the range's plaintext) — the hash is computed from the same
+/// read used to send, so the coordinator does not have to re-read the range from disk.
 #[allow(clippy::too_many_arguments)]
 async fn transfer_range_stream(
     thread_id: usize,
     range: FileRange,
     file: FileReader,
-    mut stream: Box<dyn TransportStreamTrait>,
+    stream: &mut Box<dyn TransportStreamTrait>,
     config: TransferConfig,
     progress: Option<ProgressHandle>,
     metrics_tx: Option<mpsc::Sender<StreamReport>>,
     enable_fec_auto: Option<&AtomicBool>,
     cancel: Option<&CancellationToken>,
-) -> Result<u64, TransferError> {
+) -> Result<(u64, [u8; BLAKE3_LEN]), TransferError> {
     tracing::debug!(
         thread_id,
         start = range.start,
@@ -472,6 +473,7 @@ async fn transfer_range_stream(
     let buffer_size = config.buffer_size.min(16 * 1024 * 1024);
     let mut buffer = vec![0u8; buffer_size];
     let mut total_sent = 0u64;
+    let mut hasher = blake3::Hasher::new();
 
     const SEND_RETRY_DELAY_MS: u64 = 50;
     const SEND_RETRY_MAX: u32 = 120;
@@ -489,6 +491,10 @@ async fn transfer_range_stream(
         if bytes_read == 0 {
             break;
         }
+
+        // Hash the plaintext as we read it (same bytes the receiver writes and hashes), so the
+        // coordinator never has to re-read this range from disk just to checksum it.
+        hasher.update(&buffer[..bytes_read]);
 
         if cancel.map(|c| c.is_cancelled()).unwrap_or(false) {
             return Err(TransferError::Cancelled);
@@ -583,8 +589,8 @@ async fn transfer_range_stream(
         }
     }
 
-    stream.shutdown().await
-        .map_err(|e| TransferError::NetworkError(format!("Failed to shutdown stream: {}", e)))?;
+    // Connection is left open for the worker to reuse for the next range (no per-range reconnect);
+    // the worker shuts it down once after the queue is drained.
 
     debug!(
         thread_id,
@@ -592,7 +598,7 @@ async fn transfer_range_stream(
         "Transport stream range transfer completed"
     );
 
-    Ok(total_sent)
+    Ok((total_sent, *hasher.finalize().as_bytes()))
 }
 
 /// Coordinator state for one active worker: last activity time, join handle, cancellation token, and consecutive zero-byte intervals (stall only when no progress for N intervals).
@@ -690,14 +696,17 @@ async fn tcp_stream_worker(
     let _ = done_tx.send((id, Ok(()))).await;
 }
 
-/// One transport stream worker (TCP or QUIC via opener): pulls ranges from queue, opens a new stream per range, sends, reports completion or requeues.
+/// One transport stream worker (TCP or QUIC via opener): pulls ranges from the queue and streams
+/// them over a single warm connection that it opens once and reuses for every range (no per-range
+/// reconnect, which would otherwise restart TCP slow-start each chunk and waste throughput on
+/// high-latency links). The connection is reopened only if a send fails, and is shut down cleanly
+/// once the queue is drained.
 #[allow(clippy::too_many_arguments)]
 async fn transport_stream_worker(
     id: WorkerId,
     opener: Arc<dyn StreamOpener>,
     queue: Arc<RangeQueue>,
     file: FileReader,
-    file_path: PathBuf,
     config: TransferConfig,
     progress: Option<ProgressHandle>,
     metrics_tx: mpsc::Sender<StreamReport>,
@@ -707,6 +716,7 @@ async fn transport_stream_worker(
     cancel: CancellationToken,
 ) {
     let mut ranges_handled = 0u32;
+    let mut conn: Option<Box<dyn TransportStreamTrait>> = None;
     loop {
         // Check BEFORE popping — a cancelled worker must not take a range (avoids duplicate pop when respawned).
         if cancel.is_cancelled() {
@@ -724,20 +734,22 @@ async fn transport_stream_worker(
             let _ = done_tx.send((id, Ok(()))).await;
             return;
         }
-        let stream = match opener.open_stream().await {
-            Ok(s) => s,
-            Err(e) => {
-                queue.requeue(id);
-                let _ = done_tx.send((id, Err(e))).await;
-                return;
+        // Open the connection once; reuse it for subsequent ranges.
+        if conn.is_none() {
+            match opener.open_stream().await {
+                Ok(s) => conn = Some(s as Box<dyn TransportStreamTrait>),
+                Err(e) => {
+                    queue.requeue(id);
+                    let _ = done_tx.send((id, Err(e))).await;
+                    return;
+                }
             }
-        };
-        let stream = stream as Box<dyn TransportStreamTrait>;
+        }
         let result = transfer_range_stream(
             id,
             range,
             file.clone(),
-            stream,
+            conn.as_mut().unwrap(),
             config.clone(),
             progress.clone(),
             Some(metrics_tx.clone()),
@@ -746,19 +758,11 @@ async fn transport_stream_worker(
         )
         .await;
         match result {
-            Ok(_) => {
+            Ok((_, range_hash)) => {
                 if cancel.is_cancelled() {
                     let _ = done_tx.send((id, Ok(()))).await;
                     return;
                 }
-                let range_hash = match hash_file_range_path(&file_path, range.start, range.end) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        queue.requeue(id);
-                        let _ = done_tx.send((id, Err(e))).await;
-                        return;
-                    }
-                };
                 let _ = completed_tx.send((id, range, range_hash)).await;
                 queue.complete(id);
                 ranges_handled += 1;
@@ -773,34 +777,47 @@ async fn transport_stream_worker(
                 return;
             }
             Err(e) => {
+                // Returning drops `conn`, closing the broken connection; the requeued range is
+                // retried on a fresh connection by a respawned worker.
                 queue.requeue(id);
                 let _ = done_tx.send((id, Err(e))).await;
                 return;
             }
         }
     }
+    // Queue drained: half-close the connection so the server reads a clean end-of-stream.
+    if let Some(mut s) = conn {
+        use tokio::io::AsyncWriteExt;
+        let _ = s.shutdown().await;
+    }
     tracing::debug!(worker_id = id, ranges_handled, "worker finished");
     let _ = done_tx.send((id, Ok(()))).await;
 }
 
-/// Receive a file range over a single TCP (or TLS) connection.
-/// If `range_hash_tx` is Some, BLAKE3 of this range's plaintext is sent on completion (for optional per-range verification).
-pub async fn receive_range_tcp<S>(
+/// Receive **one** framed range from `reader` and write it into `file` at the range's offsets.
+///
+/// Returns `Ok(None)` if the connection is cleanly closed before a range header arrives (i.e. the
+/// sender is done sending ranges on this connection), or `Ok(Some(bytes))` once a full range has
+/// been received. Does not fsync — the caller flushes the whole file once after all ranges. This
+/// lets one warm connection carry many ranges back-to-back instead of reconnecting per range.
+pub(crate) async fn recv_one_range<R>(
     thread_id: usize,
-    file: Arc<File>,
-    stream: S,
-    config: TransferConfig,
-    progress: Option<ProgressHandle>,
-    range_hash_tx: Option<mpsc::Sender<(FileRange, [u8; BLAKE3_LEN])>>,
-) -> Result<u64, TransferError>
+    file: &Arc<File>,
+    reader: &mut R,
+    config: &TransferConfig,
+    progress: Option<&ProgressHandle>,
+) -> Result<Option<u64>, TransferError>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    R: tokio::io::AsyncRead + Unpin,
 {
-    let (mut reader, _writer) = tokio::io::split(stream);
-
-    // Read range header: start (8) + end (8) + flags (1)
+    // Range header: start (8) + end (8) + flags (1). A clean close here = no more ranges.
     let mut start_buf = [0u8; 8];
-    reader.read_exact(&mut start_buf).await
+    match reader.read(&mut start_buf[..1]).await {
+        Ok(0) => return Ok(None),
+        Ok(_) => {}
+        Err(e) => return Err(TransferError::NetworkError(format!("Failed to read range header: {}", e))),
+    }
+    reader.read_exact(&mut start_buf[1..]).await
         .map_err(|e| TransferError::NetworkError(format!("Failed to read start offset: {}", e)))?;
     let start_offset = u64::from_le_bytes(start_buf);
 
@@ -808,15 +825,13 @@ where
     reader.read_exact(&mut end_buf).await
         .map_err(|e| TransferError::NetworkError(format!("Failed to read end offset: {}", e)))?;
     let end_offset = u64::from_le_bytes(end_buf);
-    
+
     let mut flags_buf = [0u8; 1];
     reader.read_exact(&mut flags_buf).await
         .map_err(|e| TransferError::NetworkError(format!("Failed to read flags: {}", e)))?;
     let flags = flags_buf[0];
-    let _compression_enabled = (flags & 0x01) != 0;
     let encryption_enabled = (flags & 0x02) != 0;
-    
-    // Initialize decryptor if encryption is enabled
+
     let mut decryptor: Option<Decryptor> = if encryption_enabled {
         config.encryption_key
             .map(|key| Decryptor::new(&key, thread_id as u32))
@@ -840,8 +855,6 @@ where
     let mut total_received = 0u64;
 
     let range_len = end_offset - start_offset;
-    let range = FileRange { start: start_offset, end: end_offset };
-    let mut range_hasher = range_hash_tx.is_some().then(blake3::Hasher::new);
     while offset < end_offset {
         let remaining = (end_offset - offset) as usize;
         let read_size = buffer.len().min(remaining);
@@ -851,9 +864,9 @@ where
         match reader.read_exact(&mut flag_buf).await {
             Ok(_) => {}
             Err(e) => {
-                // Sender closes stream after last chunk; treat any read error as success if we got the full range.
+                // Connection closed; treat as success only if the full range was already received.
                 if total_received >= range_len {
-                    return Ok(total_received);
+                    return Ok(Some(total_received));
                 }
                 return Err(TransferError::NetworkError(format!("Failed to read compression flag: {}", e)));
             }
@@ -924,10 +937,6 @@ where
             break;
         }
 
-        if let Some(ref mut h) = range_hasher {
-            h.update(data);
-        }
-
         // Use pwrite for thread-safe writes (Unix) or seek+write (other platforms)
         #[cfg(unix)]
         {
@@ -965,7 +974,7 @@ where
         total_received += bytes_read as u64;
         
         // Update progress if provided
-        if let Some(ref progress) = progress {
+        if let Some(progress) = progress {
             progress.update(bytes_read as u64);
         }
     }
@@ -979,28 +988,6 @@ where
         ));
     }
 
-    if let Some(tx) = range_hash_tx {
-        if let Some(h) = range_hasher {
-            let _ = tx.send((range, *h.finalize().as_bytes())).await;
-        }
-    }
-
-    // Sync file data to ensure it's written to disk
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        let fd = file.as_raw_fd();
-        unsafe {
-            libc::fsync(fd);
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        let file_mut = File::try_clone(&*file)?;
-        file_mut.sync_all()?;
-    }
-
     tracing::debug!(
         thread_id,
         bytes = total_received,
@@ -1008,7 +995,50 @@ where
         "File range reception completed"
     );
 
-    Ok(total_received)
+    Ok(Some(total_received))
+}
+
+/// Fsync a file's data to disk (called once after all ranges are written).
+fn fsync_file(file: &File) -> Result<(), TransferError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = file.as_raw_fd();
+        // SAFETY: fd is valid for the lifetime of `file`.
+        if unsafe { libc::fsync(fd) } < 0 {
+            return Err(TransferError::Io(std::io::Error::last_os_error()));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        file.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Receive ranges from a single connection until it is cleanly closed, writing each into `file`.
+/// One warm connection carries many ranges; `on_range` is called with the byte count of each
+/// completed range (used by the server to signal per-range completion). The file is fsynced once
+/// by the caller after all connections finish.
+pub async fn receive_range_tcp<S, F>(
+    thread_id: usize,
+    file: Arc<File>,
+    stream: S,
+    config: TransferConfig,
+    progress: Option<ProgressHandle>,
+    mut on_range: F,
+) -> Result<u64, TransferError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    F: FnMut(u64),
+{
+    let (mut reader, _writer) = tokio::io::split(stream);
+    let mut total = 0u64;
+    while let Some(n) = recv_one_range(thread_id, &file, &mut reader, &config, progress.as_ref()).await? {
+        total += n;
+        on_range(n);
+    }
+    Ok(total)
 }
 
 /// Receive a file range over a transport stream (QUIC or TCP). Same protocol as receive_range_tcp; only reads from stream.
@@ -2228,16 +2258,11 @@ pub async fn send_file_over_transport(
     };
     #[cfg(not(feature = "fec"))]
     let enable_fec_auto: Option<Arc<AtomicBool>> = None;
-    let transport_label = match transport.name() {
-        "quic" => "QUIC",
-        _ => "TCP",
-    };
-
     let spawn_transport_worker = |id: WorkerId,
                                  opener: &Arc<dyn StreamOpener>,
                                  queue: &Arc<RangeQueue>,
                                  file: &FileReader,
-                                 file_path_buf: &PathBuf,
+                                 _file_path_buf: &PathBuf,
                                  config: &TransferConfig,
                                  progress_handle: &ProgressHandle,
                                  metrics_tx: &mpsc::Sender<StreamReport>,
@@ -2249,7 +2274,6 @@ pub async fn send_file_over_transport(
         let opener = Arc::clone(opener);
         let queue = Arc::clone(queue);
         let file = file.clone();
-        let file_path = file_path_buf.clone();
         let config = config.clone();
         let progress = progress_handle.clone();
         let metrics_tx = metrics_tx.clone();
@@ -2257,7 +2281,7 @@ pub async fn send_file_over_transport(
         let done_tx = done_tx.clone();
         let enable_fec_auto = enable_fec_auto.clone();
         tokio::spawn(async move {
-            transport_stream_worker(id, opener, queue, file, file_path, config, Some(progress), metrics_tx, completed_tx, done_tx, enable_fec_auto, cancel_child).await
+            transport_stream_worker(id, opener, queue, file, config, Some(progress), metrics_tx, completed_tx, done_tx, enable_fec_auto, cancel_child).await
         })
     };
 
@@ -2347,24 +2371,9 @@ pub async fn send_file_over_transport(
         );
         active_workers.insert(id, WorkerState { last_active: Instant::now(), handle, cancel, consecutive_zero_intervals: 0 });
     }
-    let initial_msg = match bandwidth_bps {
-        Some(bw) => format!(
-            "{}  {}->{}  ({}ms RTT, {:.1} MB/s probe)",
-            transport_label,
-            num_workers_initial,
-            streams_peak,
-            rtt_ms,
-            bw as f64 / 1_000_000.0
-        ),
-        None => format!(
-            "{}  {}->{}  ({}ms RTT)",
-            transport_label,
-            num_workers_initial,
-            streams_peak,
-            rtt_ms
-        ),
-    };
-    progress_handle.set_message(initial_msg);
+    // The progress bar template already shows size, percent, speed and elapsed; keep the message
+    // line to the file name so the UI stays clean and transport-agnostic.
+    progress_handle.set_message(filename.clone());
 
     let mut interval = interval(Duration::from_secs(2));
     loop {
@@ -2509,36 +2518,6 @@ pub async fn send_file_over_transport(
                 }
 
                 streams_peak = streams_peak.max(active_workers.len());
-                let live_mbps = estimator.estimate_mbps();
-                let msg = if live_mbps > 0.0 {
-                    format!(
-                        "{}  {}->{}  ({}ms RTT, {:.1} MB/s)",
-                        transport_label,
-                        num_workers_initial,
-                        streams_peak,
-                        rtt_ms,
-                        live_mbps
-                    )
-                } else {
-                    match bandwidth_bps {
-                        Some(bw) => format!(
-                            "{}  {}->{}  ({}ms RTT, {:.1} MB/s probe)",
-                            transport_label,
-                            num_workers_initial,
-                            streams_peak,
-                            rtt_ms,
-                            bw as f64 / 1_000_000.0
-                        ),
-                        None => format!(
-                            "{}  {}->{}  ({}ms RTT)",
-                            transport_label,
-                            num_workers_initial,
-                            streams_peak,
-                            rtt_ms
-                        ),
-                    }
-                };
-                progress_handle.set_message(msg);
 
                 if queue.is_done() && active_workers.is_empty() {
                     break;
@@ -2628,142 +2607,6 @@ pub async fn send_file_over_transport(
     );
 
     Ok(total_sent)
-}
-
-/// Receive a file using parallel TCP connections.
-///
-/// **Integrity contract:** Pass `Some(hash)` when the sender sends the integrity hash
-/// (current protocol: 0x03 + 32 bytes). The receiver must obtain the expected hash
-/// (from the metadata exchange or out-of-band). Pass `None` only for **legacy senders**
-/// that do not send a hash (pre-integrity protocol); in that case integrity is not
-/// verified. Do not pass `None` when receiving from our own `send_file_tcp` — that
-/// bypasses integrity. See docs/INTEGRITY_DESIGN.md §10.
-pub async fn receive_file_tcp(
-    output_path: &std::path::Path,
-    base_port: u16,
-    num_connections: usize,
-    file_size: u64,
-    config: TransferConfig,
-    expected_hash: Option<[u8; BLAKE3_LEN]>,
-) -> Result<u64, TransferError> {
-    info!(
-        file = %output_path.display(),
-        size = file_size,
-        connections = num_connections,
-        "Starting TCP file reception"
-    );
-
-    // Create output file
-    let file = std::fs::File::create(output_path)?;
-    file.set_len(file_size)?;
-    let file = Arc::new(file);
-
-    // Split file into ranges (finer granularity for load balance)
-    let ranges = split_file_ranges(file_size, transfer_num_ranges(num_connections));
-    tracing::debug!(
-        num_ranges = ranges.len(),
-        num_connections,
-        file_size,
-        "receive_file_tcp split into ranges"
-    );
-
-    let (range_hash_tx, range_hash_rx) = if expected_hash.is_some() {
-        let (tx, rx) = mpsc::channel::<(FileRange, [u8; BLAKE3_LEN])>(64);
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
-
-    let mut handles = Vec::new();
-    for (thread_id, _range) in ranges.into_iter().enumerate() {
-        let file = Arc::clone(&file);
-        let config = config.clone();
-        let listen_port = base_port + thread_id as u16;
-        let range_hash_tx = range_hash_tx.clone();
-
-        let handle = tokio::spawn(async move {
-            let socket = Socket::new(Domain::IPV4, Type::STREAM, None)
-                .map_err(|e| TransferError::NetworkError(format!("Failed to create socket: {}", e)))?;
-            configure_tcp_socket(
-                &socket,
-                config.socket_send_buffer_size,
-                config.socket_recv_buffer_size,
-            )?;
-
-            let addr: SocketAddr = format!("0.0.0.0:{}", listen_port)
-                .parse()
-                .map_err(|e| TransferError::NetworkError(format!("Invalid address: {}", e)))?;
-            
-            socket.bind(&addr.into())
-                .map_err(|e| TransferError::NetworkError(format!("Failed to bind: {}", e)))?;
-
-            socket.listen(1)
-                .map_err(|e| TransferError::NetworkError(format!("Failed to listen: {}", e)))?;
-
-            socket.set_nonblocking(true)
-                .map_err(|e| TransferError::NetworkError(format!("Failed to set nonblocking: {}", e)))?;
-            
-            let std_listener = std::net::TcpListener::from(socket);
-            let listener = TcpListener::from_std(std_listener)
-                .map_err(|e| TransferError::NetworkError(format!("Failed to convert to tokio listener: {}", e)))?;
-
-            let (stream, _) = listener.accept().await
-                .map_err(|e| TransferError::NetworkError(format!("Accept failed: {}", e)))?;
-
-            receive_range_tcp(thread_id, file, stream, config, None, range_hash_tx).await
-        });
-
-        handles.push(handle);
-    }
-
-    let mut total_received = 0u64;
-    for (thread_id, handle) in handles.into_iter().enumerate() {
-        match handle.await {
-            Ok(Ok(bytes)) => {
-                total_received += bytes;
-                info!(thread_id, bytes, "Connection completed");
-            }
-            Ok(Err(e)) => {
-                drop(range_hash_tx);
-                return Err(e);
-            }
-            Err(e) => {
-                drop(range_hash_tx);
-                return Err(TransferError::NetworkError(format!("Connection panicked: {:?}", e)));
-            }
-        }
-    }
-
-    if let (Some(expected), Some(mut rx)) = (expected_hash, range_hash_rx) {
-        drop(range_hash_tx);
-        while rx.recv().await.is_some() {}
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            let f = std::fs::File::open(output_path)?;
-            let fd = f.as_raw_fd();
-            unsafe { libc::fsync(fd); }
-        }
-        #[cfg(not(unix))]
-        {
-            let f = std::fs::File::open(output_path)?;
-            f.sync_all()?;
-        }
-        let actual_hash = hash_file(output_path, file_size)?;
-        if actual_hash != expected {
-            return Err(TransferError::IntegrityCheckFailed(
-                "BLAKE3 mismatch on standalone receive".to_string(),
-            ));
-        }
-    }
-
-    info!(
-        file = %output_path.display(),
-        bytes = total_received,
-        "TCP reception completed"
-    );
-
-    Ok(total_received)
 }
 
 /// Connect to a server data port, retrying briefly while the listener is still binding.
@@ -2956,7 +2799,7 @@ pub async fn pull_file_tcp(
                     stream,
                     (*config).clone(),
                     Some(progress_handle.clone()),
-                    None,
+                    |_n: u64| {},
                 )
                 .await?;
                 bytes += n;
@@ -2991,6 +2834,8 @@ pub async fn pull_file_tcp(
             "Pull size mismatch: received {} bytes, expected {}", total, file_size
         )));
     }
+    // Flush the downloaded data to disk once, now that every range has been written.
+    fsync_file(&out_file)?;
 
     finalize(total, &mut stats)
 }
