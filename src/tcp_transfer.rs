@@ -29,6 +29,10 @@ const MAX_RECEIVE_CHUNK_SIZE: usize = 64 * 1024 * 1024;
 /// Minimum streams when using BDP from bandwidth probe (ensures we don't under-scale).
 const FALLBACK_MIN_STREAMS: usize = 8;
 
+/// Stream count to start the adaptive coordinator with when the bandwidth probe is unavailable.
+/// Kept modest: the coordinator scales up from here only if extra streams raise throughput.
+const DEFAULT_INITIAL_STREAMS: usize = 4;
+
 /// Run bandwidth probe: send PROBE + size + data, then wait for PROBE_ACK. Measures end-to-end time so result reflects real link bandwidth.
 pub(crate) async fn run_bandwidth_probe<W, R>(writer: &mut W, reader: &mut R) -> Option<u64>
 where
@@ -2062,17 +2066,31 @@ pub async fn send_file_over_transport(
     } else {
         None
     };
+    // `effective_max_streams` is the *ceiling* the adaptive coordinator may grow to. We keep it high
+    // for headroom and let scale-up (which only adds a stream when total throughput actually rises,
+    // and disables itself otherwise) settle on the right number for the link.
     let effective_max_streams = if config.use_tcp_multiplexed {
         1
-    } else if config.streams_explicit {
-        config.max_streams.max(1)
-    } else if let Some(bw) = bandwidth_bps {
-        let bdp_streams = optimal_streams_from_bdp(bw, rtt_ms, config.buffer_size, config.max_streams);
-        let streams = bdp_streams.max(FALLBACK_MIN_STREAMS).min(config.max_streams);
-        tracing::debug!(bandwidth_bps = bw, rtt_ms, bdp_streams = bdp_streams, effective_streams = streams, "probe BDP stream count");
-        streams
     } else {
         config.max_streams.max(1)
+    };
+    // `initial_streams` is where the coordinator *starts* — driven by the network (bandwidth-delay
+    // product from the probe), not the file size. A single-bottleneck link (BDP < one buffer) starts
+    // at 1 and stays low; a high-BDP path starts higher and scale-up grows it further if it helps.
+    let initial_streams = if config.use_tcp_multiplexed {
+        1
+    } else if config.streams_explicit {
+        // User asked for exactly N streams: start there and never scale (initial == ceiling).
+        effective_max_streams
+    } else if let Some(bw) = bandwidth_bps {
+        let bdp_streams =
+            optimal_streams_from_bdp(bw, rtt_ms, config.buffer_size, effective_max_streams);
+        let streams = bdp_streams.clamp(1, effective_max_streams);
+        tracing::debug!(bandwidth_bps = bw, rtt_ms, bdp_streams, initial_streams = streams, "BDP-derived initial stream count");
+        streams
+    } else {
+        // No probe: start modest and let scale-up discover the link's capacity.
+        DEFAULT_INITIAL_STREAMS.min(effective_max_streams).max(1)
     };
 
     // Collect the source-file hash now (it was computed concurrently with the setup above). Used
@@ -2250,7 +2268,7 @@ pub async fn send_file_over_transport(
     let (done_tx, mut done_rx) = mpsc::channel::<(WorkerId, Result<(), TransferError>)>(32);
     let (metrics_tx, mut metrics_rx) = mpsc::channel::<StreamReport>(256);
     let file_path_buf = file_path.to_path_buf();
-    let num_workers_initial = config.num_streams.min(num_pending).min(effective_max_streams).max(1);
+    let num_workers_initial = initial_streams.min(num_pending).min(effective_max_streams).max(1);
     let mut next_worker_id = num_workers_initial;
     let mut active_workers: std::collections::HashMap<WorkerId, WorkerState> = std::collections::HashMap::new();
     let mut completed_worker_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
