@@ -2003,14 +2003,13 @@ pub async fn send_file_over_transport(
         }
     });
 
-    // Hash the source file BEFORE opening any connections (unchanged by transfer).
-    let file_hash = tokio::task::spawn_blocking({
+    // Hash the source file concurrently with connection setup (it can't change during the transfer).
+    // Awaited just before it is first needed (CHECK_HASH or the final integrity hash), so most of the
+    // hashing overlaps the handshake/probe instead of blocking the start serially.
+    let file_hash_handle = tokio::task::spawn_blocking({
         let path = file_path.to_path_buf();
         move || hash_file(&path, file_size)
-    })
-    .await
-    .map_err(|e| TransferError::Io(std::io::Error::other(format!("{:?}", e))))?
-    ?;
+    });
 
     let (meta, opener) = transport
         .connect_for_transfer(server_addr, config.num_streams, config.max_streams)
@@ -2076,13 +2075,15 @@ pub async fn send_file_over_transport(
         config.max_streams.max(1)
     };
 
+    // Collect the source-file hash now (it was computed concurrently with the setup above). Used
+    // for both the optional CHECK_HASH skip probe and the final integrity hash — computed once.
+    let file_hash = file_hash_handle
+        .await
+        .map_err(|e| TransferError::Io(std::io::Error::other(format!("{:?}", e))))??;
+
     // --update: optional skip check (CHECK_HASH). If server has same hash, skip transfer.
     if skip_unchanged {
         let skip_start = std::time::Instant::now();
-        let path_buf = file_path.to_path_buf();
-        let file_hash = tokio::task::spawn_blocking(move || hash_file(&path_buf, file_size))
-            .await
-            .map_err(|e| TransferError::Io(std::io::Error::other(e.to_string())))??;
         writer.write_all(&[msg::CHECK_HASH]).await
             .map_err(|e| TransferError::NetworkError(format!("Failed to send CHECK_HASH: {}", e)))?;
         writer.write_all(&(filename.len() as u64).to_le_bytes()).await
